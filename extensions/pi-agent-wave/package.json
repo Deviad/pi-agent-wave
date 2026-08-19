@@ -1,0 +1,53 @@
+{
+  "name": "@dpugliese/pi-agent-wave",
+  "version": "0.1.0",
+  "description": "Observable graph delegation for Pi with Herdr-first and visible-panel transports.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-agent",
+    "delegation",
+    "multi-agent"
+  ],
+  "files": [
+    "*.ts",
+    "lib",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "pi-agent-wave-migrate": "scripts/migrate.mjs",
+    "pi-agent-wave-init": "scripts/init.mjs",
+    "pi-agent-wave-doctor": "scripts/doctor.mjs"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": [
+      "index.ts",
+      "questionnaire.ts",
+      "cmux-session.ts",
+      "model-failover.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
+    "@types/node": "22.20.1",
+    "typebox": "1.3.7",
+    "typescript": "7.0.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
