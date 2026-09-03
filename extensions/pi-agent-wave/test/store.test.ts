@@ -29,7 +29,7 @@ function start(store: GraphStore, runId: string, operationId: string): void {
 		operationId,
 		status: "running",
 		agentName: "worker",
-		transport: "panel",
+		transport: "herdr",
 		modelPolicy: next.policy.input,
 		policyDigest: next.policy.digest,
 		selectedModel: operation?.route?.chain[0],
@@ -100,6 +100,31 @@ function balancedPolicy(): ResolvedPolicy {
 }
 
 describe("SQLite state store", () => {
+	test("new stores omit panel-only agent fields", () => {
+		const { dbPath, store } = fixture();
+		const db = new Database(dbPath, { readonly: true });
+		const columns = db.query<{ name: string }, []>("PRAGMA table_info(agents)").all().map((row) => row.name);
+		expect(columns.includes("pane_id")).toBe(false);
+		db.close();
+		store.close();
+	});
+
+	test("rejects non-Herdr agent registration", () => {
+		const { store } = fixture();
+		const state = store.initRun("transport", "build", "Use Herdr");
+		const operation = store.next(state.runId).operations[0]!;
+		const registration = {
+			runId: state.runId,
+			name: "worker",
+			node: operation.node,
+			role: "thinker",
+			transport: "panel",
+			currentTask: operation.task,
+		};
+		assert.throws(() => Reflect.apply(store.registerAgent, store, [registration]), /unsupported worker transport/);
+		store.close();
+	});
+
 	test("creates a private WAL database with the required schema", () => {
 		const { dbPath, store } = fixture();
 		const db = new Database(dbPath, { readonly: true });
@@ -123,15 +148,20 @@ describe("SQLite state store", () => {
 		store.close();
 	});
 
-	test("requires an observable transport before an operation starts", () => {
+	test("requires a valid headless or Herdr transport before an operation starts", () => {
 		const { store } = fixture();
-		const state = store.initRun("visible-transport", "build", "Plan");
-		const operation = store.next(state.runId).operations[0];
-		expect(() => store.record({ runId: state.runId, operationId: operation.id, status: "running" })).toThrow("observable transport");
-		expect(() => store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "delegate" as never })).toThrow("observable transport");
-		store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "herdr" });
-		const dispatch = store.events(state.runId).find((event) => event.type === "operation_running");
-		expect(JSON.parse(dispatch?.payload_json ?? "{}").transport).toBe("herdr");
+		const headlessState = store.initRun("headless-transport", "build", "Plan");
+		const headlessOperation = store.next(headlessState.runId).operations[0];
+		expect(() => store.record({ runId: headlessState.runId, operationId: headlessOperation.id, status: "running" })).toThrow("worker transport");
+		expect(() => store.record({ runId: headlessState.runId, operationId: headlessOperation.id, status: "running", transport: "delegate" as never })).toThrow("unsupported worker transport");
+		store.record({ runId: headlessState.runId, operationId: headlessOperation.id, status: "running", transport: "headless" });
+		const headlessDispatch = store.events(headlessState.runId).find((event) => event.type === "operation_running");
+		expect(JSON.parse(headlessDispatch?.payload_json ?? "{}").transport).toBe("headless");
+		const herdrState = store.initRun("herdr-transport", "build", "Plan");
+		const herdrOperation = store.next(herdrState.runId).operations[0];
+		store.record({ runId: herdrState.runId, operationId: herdrOperation.id, status: "running", transport: "herdr" });
+		const herdrDispatch = store.events(herdrState.runId).find((event) => event.type === "operation_running");
+		expect(JSON.parse(herdrDispatch?.payload_json ?? "{}").transport).toBe("herdr");
 		store.close();
 	});
 
@@ -362,7 +392,7 @@ describe("SQLite state store", () => {
 		store.close();
 	});
 
-	test("migrates a v1 database to v2 preserving existing rows", () => {
+	test("migrates a v1 database to v5 preserving existing rows", () => {
 		const dir = mkdtempSync(join(tmpdir(), "delegate-graph-v1-"));
 		dirs.push(dir);
 		const dbPath = join(dir, "graph.db");
@@ -376,7 +406,7 @@ describe("SQLite state store", () => {
 			CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, run_id TEXT NOT NULL, operation_id TEXT, agent_id TEXT, type TEXT NOT NULL, node TEXT, from_agent TEXT, to_agent TEXT, reply_to TEXT, from_node TEXT, to_node TEXT, verdict TEXT, payload_json TEXT NOT NULL DEFAULT '{}');
 			INSERT INTO runs VALUES ('run_v1','legacy','build','Legacy task','active','2026-08-16T00:00:00.000Z','2026-08-16T00:00:00.000Z');
 			INSERT INTO operations VALUES ('op_v1','run_v1','thinker_plan',NULL,NULL,'pending',1,'[]',1,0,0,'Legacy operation',NULL,NULL,NULL,NULL,NULL,'2026-08-16T00:00:00.000Z',NULL,NULL);
-			INSERT INTO agents VALUES ('agent_v1','run_v1','thinker','thinker_plan','thinker','panel',NULL,'pane:1',NULL,'running','Legacy operation','2026-08-16T00:00:00.000Z','2026-08-16T00:00:01.000Z');
+			INSERT INTO agents VALUES ('agent_v1','run_v1','thinker','thinker_plan','thinker','herdr','dg-legacy-thinker',NULL,'workspace:tab', 'running','Legacy operation','2026-08-16T00:00:00.000Z','2026-08-16T00:00:01.000Z');
 			INSERT INTO events(ts,run_id,operation_id,agent_id,type,node,from_agent,to_agent,reply_to,from_node,to_node,verdict,payload_json) VALUES ('2026-08-16T00:00:02.000Z','run_v1','op_v1','agent_v1','legacy_event','thinker_plan','thinker','supervisor','supervisor','thinker_plan',NULL,NULL,'{"legacy":true}');
 		`);
 		v1.close();
@@ -399,7 +429,7 @@ describe("SQLite state store", () => {
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM operations WHERE id='op_v1'").get()?.selected_model).toBe(null);
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM agents WHERE id='agent_v1'").get()?.selected_model).toBe(null);
 		const version = db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get();
-		expect(version?.version).toBe(2);
+		expect(version?.version).toBe(5);
 		db.close();
 		migrated.close();
 		const reopened = new GraphStore({ dbPath });
@@ -487,7 +517,7 @@ describe("SQLite state store", () => {
 			runId: state.runId,
 			operationId: operation.id,
 			status: "running" as const,
-			transport: "panel" as const,
+			transport: "herdr" as const,
 			selectedModel: operation.route?.chain[0],
 			modelAttempt: 0,
 		};
@@ -526,7 +556,7 @@ describe("SQLite state store", () => {
 			runId: state.runId,
 			operationId: operation.id,
 			status: "running",
-			transport: "panel",
+			transport: "herdr",
 			modelPolicy: exact.input,
 			policyDigest: next.policy.digest,
 			selectedModel: exact.routes[0].chain[0],
@@ -536,7 +566,7 @@ describe("SQLite state store", () => {
 			runId: state.runId,
 			operationId: operation.id,
 			status: "running",
-			transport: "panel",
+			transport: "herdr",
 			modelPolicy: exact.input,
 			policyDigest: next.policy.digest,
 			selectedModel: "another/model",
@@ -599,6 +629,31 @@ describe("SQLite state store", () => {
 		expect(fallbackPayload.modelAttempt).toBe(1);
 		expect(fallbackPayload.retryAttempt).toBe(0);
 		expect(fallbackPayload.fallbackReason).toBe("same_model_retries_exhausted");
+		store.close();
+	});
+});
+
+describe("transport-aware agent persistence", () => {
+	test("projects complete headless and Herdr presentation identities", () => {
+		const { store } = fixture();
+		const state = store.initRun("transport-identities", "build", "Plan");
+		const operation = store.next(state.runId).operations[0]!;
+		const core = { runId: state.runId, node: operation.node, role: "thinker", currentTask: operation.task, acpAgent: "codex" as const, acpxRecordId: "session", acpxSessionId: "session", acpxState: "alive" as const, acpxAttemptKey: "attempt", agentFsSessionId: "session", agentFsDbPath: "/tmp/delta.db", acpxCancelScript: "/tmp/cancel.sh" };
+		store.registerAgent({ ...core, name: "headless-worker", transport: "headless" });
+		store.registerAgent({ ...core, name: "herdr-worker", transport: "herdr", herdrAgent: "agent", tabId: "tab", herdrPaneId: "pane" });
+		const agents = store.agents(state.runId);
+		expect(agents.find((agent) => agent.name === "headless-worker")?.presentation_identity).toEqual({ kind: "headless" });
+		expect(agents.find((agent) => agent.name === "herdr-worker")?.presentation_identity).toEqual({ kind: "herdr", agent: "agent", tabId: "tab", paneId: "pane" });
+		store.close();
+	});
+
+	test("rejects mixed and partial presentation identity", () => {
+		const { store } = fixture();
+		const state = store.initRun("transport-invalid", "build", "Plan");
+		const operation = store.next(state.runId).operations[0]!;
+		const base = { runId: state.runId, node: operation.node, role: "thinker", currentTask: operation.task };
+		assert.throws(() => store.registerAgent({ ...base, name: "mixed", transport: "headless", herdrAgent: "agent", tabId: "tab", herdrPaneId: "pane" }), /cannot contain Herdr identity/);
+		assert.throws(() => store.registerAgent({ ...base, name: "partial", transport: "herdr", herdrAgent: "agent", tabId: "tab" }), /requires agent, tab, and pane/);
 		store.close();
 	});
 });

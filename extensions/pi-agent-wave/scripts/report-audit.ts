@@ -23,10 +23,25 @@ export interface ReportClaim {
 	verification: VerificationState;
 }
 
+export interface OperationalExecution {
+	argv: string[];
+	exitCode: number;
+	source: string;
+	runId: string;
+	checkpointPath: string;
+	checkpointStatus: string;
+	resultsPath?: string;
+	candidateCount: number;
+	sourceStatus: "completed" | "budget-exhausted" | "blocked" | "preflight-failed" | "failed";
+	blocker?: string;
+	resumeArgv?: string[];
+}
+
 export interface DelegateReport {
 	schemaVersion: typeof REPORT_SCHEMA_VERSION;
 	verdict: string;
 	claims: ReportClaim[];
+	execution?: OperationalExecution;
 }
 
 export interface ReportDiagnostic {
@@ -45,6 +60,7 @@ export interface ReportAudit {
 export interface AuditOptions {
 	node?: NodeName;
 	privateRoot?: string;
+	ownedRoots?: string[];
 	normalizePermissions?: boolean;
 }
 
@@ -57,6 +73,7 @@ const ROLE_VERDICTS: Partial<Record<NodeName, readonly string[]>> = {
 	test: ["GREEN", "NOT_OK"],
 	audit: ["PASS", "FAIL"],
 	search: ["DONE"],
+	source_search: ["DONE", "BLOCKED"],
 };
 
 function diagnostic(code: string, path: string, message: string): ReportDiagnostic {
@@ -80,7 +97,7 @@ export function validateReport(value: unknown, node?: NodeName): ReportAudit {
 	const errors: ReportDiagnostic[] = [];
 	if (!isRecord(value)) return { valid: false, errors: [diagnostic("REPORT_OBJECT_REQUIRED", "$", "report must be a JSON object")] };
 
-	for (const key of unknownKeys(value, ["schemaVersion", "verdict", "claims"])) {
+	for (const key of unknownKeys(value, ["schemaVersion", "verdict", "claims", "execution"])) {
 		errors.push(diagnostic("UNKNOWN_FIELD", `$.${key}`, `unknown report field '${key}'`));
 	}
 	if (value.schemaVersion !== REPORT_SCHEMA_VERSION) {
@@ -128,7 +145,37 @@ export function validateReport(value: unknown, node?: NodeName): ReportAudit {
 		});
 	}
 
-	const report = errors.length === 0 ? value as unknown as DelegateReport : undefined;
+	let execution: OperationalExecution | undefined;
+	if (node === "source_search") {
+		const candidate = isRecord(value.execution) ? value.execution : undefined;
+		if (!candidate) {
+			errors.push(diagnostic("EXECUTION_REQUIRED", "$.execution", "source_search requires task-specific execution proof"));
+		} else {
+			for (const key of unknownKeys(candidate, ["argv", "exitCode", "source", "runId", "checkpointPath", "checkpointStatus", "resultsPath", "candidateCount", "sourceStatus", "blocker", "resumeArgv"])) {
+				errors.push(diagnostic("EXECUTION_FIELD", `$.execution.${key}`, "unknown execution field"));
+			}
+			for (const field of ["source", "runId", "checkpointPath", "checkpointStatus", "sourceStatus"] as const) {
+				if (!nonEmptyString(candidate[field])) errors.push(diagnostic("EXECUTION_FIELD", `$.execution.${field}`, "must be a non-empty string"));
+			}
+			if (candidate.resultsPath !== undefined && !nonEmptyString(candidate.resultsPath)) errors.push(diagnostic("EXECUTION_FIELD", "$.execution.resultsPath", "must be a non-empty string when provided"));
+			if (!Array.isArray(candidate.argv) || !candidate.argv.length || candidate.argv.some((item) => !nonEmptyString(item))) errors.push(diagnostic("EXECUTION_ARGV", "$.execution.argv", "must be a non-empty argv string array"));
+			if (!Number.isInteger(candidate.exitCode)) errors.push(diagnostic("EXECUTION_EXIT", "$.execution.exitCode", "must be an integer"));
+			if (!Number.isInteger(candidate.candidateCount) || Number(candidate.candidateCount) < 0) errors.push(diagnostic("EXECUTION_COUNT", "$.execution.candidateCount", "must be a non-negative integer"));
+			if (Number(candidate.candidateCount) > 0 && !nonEmptyString(candidate.resultsPath)) errors.push(diagnostic("EXECUTION_RESULTS", "$.execution.resultsPath", "candidate-producing execution requires a results path"));
+			const sourceStatus = String(candidate.sourceStatus ?? "");
+			if (!["completed", "budget-exhausted", "blocked", "preflight-failed", "failed"].includes(sourceStatus)) errors.push(diagnostic("EXECUTION_STATUS", "$.execution.sourceStatus", "unsupported source status"));
+			if (verdict === "DONE" && (candidate.exitCode !== 0 || sourceStatus !== "completed")) errors.push(diagnostic("EXECUTION_DONE", "$.execution", "DONE requires exit 0 and completed source status"));
+			if (verdict === "BLOCKED") {
+				if (!nonEmptyString(candidate.blocker) || !String(candidate.blocker).toLowerCase().includes(String(candidate.source ?? "").toLowerCase())) errors.push(diagnostic("EXECUTION_BLOCKER", "$.execution.blocker", "BLOCKED requires blocker evidence naming the source"));
+				if (sourceStatus === "budget-exhausted" && (!Array.isArray(candidate.resumeArgv) || !candidate.resumeArgv.length || candidate.resumeArgv.some((item) => !nonEmptyString(item)))) errors.push(diagnostic("EXECUTION_RESUME", "$.execution.resumeArgv", "budget exhaustion requires resume argv"));
+			}
+			if (!errors.some((error) => error.path.startsWith("$.execution"))) execution = candidate as unknown as OperationalExecution;
+		}
+	} else if (node !== undefined && value.execution !== undefined) {
+		errors.push(diagnostic("EXECUTION_UNEXPECTED", "$.execution", "execution proof is only valid for source_search"));
+	}
+
+	const report = errors.length === 0 ? { ...(value as unknown as DelegateReport), ...(execution ? { execution } : {}) } : undefined;
 	return { valid: errors.length === 0, verdict, report, errors };
 }
 
@@ -157,7 +204,28 @@ export async function auditReport(path: string, options: AuditOptions = {}): Pro
 		} catch (error) {
 			return { valid: false, errors: [diagnostic("JSON_PARSE", "$", error instanceof Error ? error.message : String(error))] };
 		}
-		return validateReport(parsed, options.node);
+		const validated = validateReport(parsed, options.node);
+		if (validated.valid && validated.report?.execution && validated.verdict === "DONE" && options.ownedRoots?.length) {
+			const errors = [...validated.errors];
+			const roots = await Promise.all(options.ownedRoots.map(async (root) => realpath(resolve(root)).catch(() => resolve(root))));
+			const artifacts: Array<["checkpointPath" | "resultsPath", string]> = [["checkpointPath", validated.report.execution.checkpointPath]];
+			if (validated.report.execution.resultsPath) artifacts.push(["resultsPath", validated.report.execution.resultsPath]);
+			for (const [field, candidate] of artifacts) {
+				const metadata = await lstat(resolve(candidate)).catch(() => undefined);
+				if (!metadata?.isFile()) {
+					errors.push(diagnostic("EXECUTION_ARTIFACT", `$.execution.${field}`, "completed execution artifact does not exist as a regular file"));
+					continue;
+				}
+				const physical = await realpath(resolve(candidate));
+				if (!roots.some((root) => pathInside(root, physical))) errors.push(diagnostic("EXECUTION_PATH_OWNERSHIP", `$.execution.${field}`, "execution artifact is outside declared writable roots"));
+			}
+			if (!validated.report.execution.resultsPath && validated.report.execution.candidateCount === 0) {
+				const checkpoint = JSON.parse(await readFile(validated.report.execution.checkpointPath, "utf8").catch(() => "null")) as { jobsSaved?: unknown } | null;
+				if (checkpoint?.jobsSaved !== 0) errors.push(diagnostic("EXECUTION_RESULTS", "$.execution.resultsPath", "missing results path requires checkpoint jobsSaved equal to zero"));
+			}
+			if (errors.length) return { valid: false, errors };
+		}
+		return validated;
 	} catch (error) {
 		return { valid: false, errors: [diagnostic("REPORT_UNAVAILABLE", "$", error instanceof Error ? error.message : String(error))] };
 	}

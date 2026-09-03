@@ -1,72 +1,173 @@
-# pi-agent-wave - A development and research harness for Pi agent workflows, with built-in observability.
+# pi-agent-wave
 
-This repository develops `@dpugliese/pi-agent-wave`, a Pi package for observable graph delegation. The distributable package lives in [`extensions/pi-agent-wave/`](extensions/pi-agent-wave/).
+pi-agent-wave adds reliable multi-agent orchestration to Pi. JetBrains Air can launch Pi through ACP and control delegated work while pi-agent-wave runs Pi, Codex, and Claude workers through ACPX inside AgentFS sandboxes. Herdr is optional.
 
-The package preserves the existing `/delegate`, `/graph`, and `delegate_graph` APIs and includes the questionnaire, cmux-session, and native model-failover companions. Herdr remains an external, preferred transport; the package falls back to its visible panel transport when Herdr is unavailable.
+## Why use it?
 
-## Repository layout
+- **Control Pi from Air.** Air owns the `pi-acp` session; pi-agent-wave returns structured progress, status, questions, cancellation, and results through Pi.
+- **Keep complex work ordered.** A graph prevents review or testing from starting before its dependencies finish.
+- **Isolate every attempt.** Each ACPX worker receives its own AgentFS copy-on-write sandbox and exports only audited owned paths.
+- **Require proof.** Reports, process state, ACPX state, graph state, cleanup, and ledger evidence must agree before settlement.
+- **Keep presentation optional.** Headless mode needs no Herdr process or workspace. Existing Herdr tabs and focus remain available when Herdr is active.
 
-- `extensions/pi-agent-wave/` — package source, manifest, user documentation, license, migration utility, and package-local helpers.
-- `extensions/pi-agent-wave/test/` — graph, portability, artifact, companion, migration, initial configuration, and real installation tests.
-- `tasks/prd-package-delegate-graph.md` — canonical issue, design decisions, acceptance criteria, and verification record.
-- `agent-output/` — generated review evidence; never part of the npm artifact.
-- `.pi/agents/project-overlay.md` — pointer to the canonical development instructions in `AGENTS.md`.
+pi-agent-wave provides `/delegate`, `/graph`, the `delegate_graph` tool, ACP-safe structured questions, session metadata hooks, and model failover.
 
-For installation, configuration, the `/delegate`, `/graph`, and `/failover` command reference, `delegate_graph` automation, runtime scenarios, migration, rollback, and user-facing security guidance, see [`extensions/pi-agent-wave/README.md`](extensions/pi-agent-wave/README.md).
+## Requirements
 
-## Development setup
+- Pi `0.84.1` or `0.84.2`.
+- ACPX `0.13.2`.
+- Turso AgentFS `0.6.4`.
+- For JetBrains Air: `pi-acp` `0.0.31` and an absolute Node/npx path.
+- Optional: Herdr for visible worker tabs and focus.
 
-```bash
-cd extensions/pi-agent-wave
-npm install --ignore-scripts --no-audit --no-fund
-```
+ACPX, AgentFS, `pi-acp`, and Herdr are external runtimes and are not bundled.
 
-Dependencies are local to the package. Do not commit `node_modules/` or generated tarballs.
-
-## Verification
-
-Run the complete Node suite from the repository root:
+## 1. Install ACPX and AgentFS
 
 ```bash
-node --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts
+npm install -g acpx@0.13.2
+acpx --version
+
+agentfs --version
+# expected: agentfs v0.6.4
 ```
 
-This includes the real `npm pack` and loopback Git installation matrix for Pi `0.84.1` and `0.84.2`. It writes only to temporary directories and must clean up its repositories, processes, caches, and agent directories.
+AgentFS release downloads and checksums: https://github.com/tursodatabase/agentfs/releases/tag/v0.6.4
 
-Run the package and companion tests under Bun:
+Claude execution requires a token created by `claude setup-token` and exposed only through a mode-600 file path in `PI_CLAUDE_OAUTH_TOKEN_FILE`. The doctor reports missing or insecure configuration without printing token values.
+
+## 2. Install pi-agent-wave
+
+The npm package has not been published yet. Install from a retained local source checkout:
 
 ```bash
-bun test \
-  extensions/pi-agent-wave/test/package-manifest.test.ts \
-  extensions/pi-agent-wave/test/package-portability.test.ts \
-  extensions/pi-agent-wave/test/package-artifact.test.ts \
-  extensions/pi-agent-wave/test/package-docs.test.ts \
-  extensions/pi-agent-wave/test/package-migration.test.ts \
-  extensions/pi-agent-wave/test/questionnaire.test.ts \
-  extensions/pi-agent-wave/test/cmux-session.test.ts \
-  extensions/pi-agent-wave/test/model-failover.test.ts
+pi install ./pi-agent-wave-new-design/extensions/pi-agent-wave
 ```
 
-The real installation rehearsal is Node-only because Bun does not provide `node:sqlite`.
-
-Typecheck and inspect the npm artifact:
+After npm publication, the install command will be:
 
 ```bash
-cd extensions/pi-agent-wave
-npm run typecheck
-npm pack --dry-run --json --ignore-scripts
-npm publish --dry-run --json --ignore-scripts
+pi install npm:@dpugliese/pi-agent-wave
 ```
 
-`npm publish --dry-run` is verification only. Never run `npm publish` without explicit authorization.
+Do not use the npm command before publication.
 
-## Development rules
+Preview and apply configuration from the source checkout:
 
-- Update `tasks/prd-package-delegate-graph.md` before changing scope, approach, or acceptance criteria.
-- Keep the package rooted at `extensions/pi-agent-wave/`. Do not recreate the legacy loose-install source directory; only migration code and migration tests identify it.
-- Preserve `/delegate`, `/graph`, `delegate_graph`, graph topology, retry behavior, evidence gates, Herdr-first routing, and visible-panel fallback unless the issue explicitly changes them.
-- Keep shipped imports package-relative or declared bare peers. Do not add machine-specific paths or references outside the package root.
-- Never modify the real `~/.pi/agent/extensions/`, Pi settings, or caches during development tests.
-- Do not publish, push, apply migration to the real installation, or invent repository/homepage/bugs URLs without explicit authorization.
+```bash
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs
+```
 
-See [`AGENTS.md`](AGENTS.md) for the full contributor and agent contract.
+After npm publication, the package binaries will be `pi-agent-wave-init`, `pi-agent-wave-init apply`, and `pi-agent-wave-doctor`.
+
+The default Pi home is `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` or pass `--agent-dir` when another temporary Pi home is required.
+
+## 3. Add Pi to JetBrains Air
+
+In Air, open the agent selector and choose **Add ACP Agent**. Air opens its global `acp.json`. First obtain the absolute npx path:
+
+```bash
+command -v npx
+```
+
+Add Pi using that exact path:
+
+```json
+{
+  "agent_servers": {
+    "Pi": {
+      "command": "/absolute/path/to/npx",
+      "args": ["-y", "pi-acp@0.0.31"],
+      "env": {
+        "PI_CODING_AGENT_DIR": "/absolute/path/to/.pi/agent"
+      }
+    }
+  }
+}
+```
+
+Save `acp.json`, start a new Air task, and select **Pi**. Air launches and owns the Pi ACP process; pi-agent-wave does not claim that Air attaches to an externally owned ACPX worker session.
+
+## 4. Run from Air
+
+Ask Pi to use `delegate_graph`, for example:
+
+```text
+Use delegate_graph to implement tenant-scoped API keys. Keep me updated and ask before resolving blocked recovery choices.
+```
+
+Air receives structured tool progress and final results. Pi slash commands may not be exposed by every ACP client, so Air workflows use the equivalent `delegate_graph` operations for initialization, status, cancellation, recovery, and resume.
+
+For structured source-command workflows, see [operational search delegation](extensions/pi-agent-wave/README.md#operational-search-delegation).
+
+In a Pi terminal, the existing commands remain available:
+
+```text
+/delegate Implement tenant-scoped API keys
+/graph status <runId>
+/graph log <runId>
+```
+
+Headless workers cannot be focused. Use status and log inspection instead.
+
+## Optional: Herdr presentation
+
+Install Herdr only if visible worker tabs and focus are desired:
+
+```bash
+brew install herdr
+cd /path/to/project
+herdr
+```
+
+Start Pi inside the Herdr workspace. `auto` transport selects Herdr only when the executable and complete workspace/tab identity are present; otherwise it selects headless. Explicit `herdr` fails closed outside a valid workspace, while explicit `headless` never creates worker tabs.
+
+## Worker execution and cleanup
+
+pi-agent-wave uses **ACPX-only worker execution** through a shared transport-neutral lifecycle:
+
+- `openai-codex/*` routes use ACPX Codex, `claude-code/*` routes use ACPX Claude, and other configured models use ACPX Pi.
+- Every operation attempt gets a unique ACPX session and AgentFS overlay.
+- Writable nodes export only audited graph-owned paths. Read-only nodes discard all overlay changes.
+- Headless and Herdr adapters share planning, launch, report audit/repair, cancellation, export, settlement, and granular cleanup.
+- Headless settlement records verified headless presentation identity and never invents Herdr visibility evidence.
+- Pi execution-only supervisor reports are non-semantic. Provider credentials never enter package state or evidence.
+
+For release verification, run `node --experimental-strip-types extensions/pi-agent-wave/scripts/production-audit.ts` outside AgentFS. Reviewers consume its source-current hash-indexed evidence through ACPX `--no-terminal` without rerunning nested package or AgentFS commands.
+
+## Uninstall
+
+```bash
+pi remove ./pi-agent-wave-new-design/extensions/pi-agent-wave
+```
+
+After npm publication:
+
+```bash
+pi remove npm:@dpugliese/pi-agent-wave
+```
+
+Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs.
+
+## Security
+
+Pi extensions run with the user's system access. Review launch and configuration code before installation. pi-agent-wave packages no external runtimes, credentials, user settings, databases, or generated evidence.
+
+## Compatibility
+
+| Component | Tested version |
+| --- | --- |
+| Pi | `0.84.1`, `0.84.2` |
+| ACPX | `0.13.2` |
+| AgentFS | `0.6.4` |
+| pi-acp | `0.0.31` |
+
+JetBrains Air support requires the real installed-application rehearsal defined by `tasks/prd-air-controlled-editor-independent-orchestration.md`; no final compatibility claim is made until that proof passes.
+
+## For contributors
+
+Package source is under [`extensions/pi-agent-wave/`](extensions/pi-agent-wave/). Development rules are in [`AGENTS.md`](AGENTS.md). The active plan is [`tasks/prd-air-controlled-editor-independent-orchestration.md`](tasks/prd-air-controlled-editor-independent-orchestration.md).
+
+pi-agent-wave is available under the [MIT License](extensions/pi-agent-wave/LICENSE).

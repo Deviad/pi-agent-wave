@@ -3,3 +3,5 @@ extensions/pi-agent-wave/node_modules/
 .DS_Store
 .pi/
 agent-output/
+__pycache__/
+*.pyc

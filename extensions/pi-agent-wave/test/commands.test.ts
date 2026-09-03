@@ -12,7 +12,6 @@ import {
 	herdrAgentName,
 	herdrTabLabel,
 	modelPolicyLabel,
-	panelModelLabel,
 	shortModelName,
 } from "../herdr.ts";
 import {
@@ -24,7 +23,7 @@ import {
 	resolvePolicy,
 } from "../index.ts";
 import { parseDeferredTime, writeDeferredJob } from "../scheduler.ts";
-import { GraphStore } from "../store.ts";
+import { GraphStore, roleForNode } from "../store.ts";
 import type { ResolvedPolicy } from "../types.ts";
 
 const SOL_MODEL = "openai-codex/gpt-5.6-sol";
@@ -110,6 +109,8 @@ describe("supervisor UX", () => {
 		}
 		for (const kind of ["auto", "preset", "tier", "model"]) expect(schema).toContain(`\"${kind}\"`);
 		expect(schema).toContain("reason");
+		expect(schema.includes("panel")).toBe(false);
+		expect(schema.includes("paneId")).toBe(false);
 	});
 
 	test("status and log expose Herdr transport model identity and frozen policy fields", () => {
@@ -118,7 +119,7 @@ describe("supervisor UX", () => {
 		const next = store.next(state.runId);
 		const operation = next.operations[0]!;
 		const digest = next.policy.digest;
-		const agentId = store.registerAgent({ runId: state.runId, name: "thinker-1", node: "thinker_plan", role: "thinker", transport: "herdr", herdrAgent: "dg-ux-thinker-1", tabId: "w1:t2", policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0, currentTask: operation.task });
+		const agentId = store.registerAgent({ runId: state.runId, name: "thinker-1", node: "thinker_plan", role: "thinker", transport: "herdr", herdrAgent: "dg-ux-thinker-1", tabId: "w1:t2", herdrPaneId: "w1:p2", policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0, currentTask: operation.task });
 		store.record({ runId: state.runId, operationId: operation.id, status: "running", agentId, agentName: "thinker-1", transport: "herdr", modelPolicy: next.policy.input, policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0 });
 		const status = renderStatus(store, state.runId);
 		const log = renderLog(store, state.runId);
@@ -133,20 +134,6 @@ describe("supervisor UX", () => {
 		expect(log).toContain("attempt=1/2");
 		expect(log).toContain(`digest=${digest}`);
 		expect(log).toContain("message=Build UX");
-		store.close();
-	});
-
-	test("panel status receives the same policy, tier, model, attempt, and digest fields", () => {
-		const { store } = fixture();
-		const state = store.initRun("panel-ux", "build", "Build in panel", fallbackPolicy());
-		const next = store.next(state.runId);
-		const operation = next.operations[0]!;
-		const digest = next.policy.digest;
-		const agentId = store.registerAgent({ runId: state.runId, name: "thinker-panel", node: "thinker_plan", role: "thinker", transport: "panel", paneId: "%17", policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0, currentTask: operation.task });
-		store.record({ runId: state.runId, operationId: operation.id, status: "running", agentId, agentName: "thinker-panel", transport: "panel", modelPolicy: next.policy.input, policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0 });
-		const status = renderStatus(store, state.runId);
-		expect(status).toContain(`thinker-panel | thinker_plan | panel | Strong | reasoning | ${SOL_MODEL} | 1/2 | running`);
-		expect(status).toContain(`digest=${digest}`);
 		store.close();
 	});
 
@@ -173,7 +160,7 @@ describe("supervisor UX", () => {
 		const { store } = fixture();
 		const state = store.initRun("recovery-ux", "build", "Recover");
 		const operation = store.next(state.runId).operations[0];
-		store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "panel" });
+		store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "herdr" });
 		store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "compile error" });
 		const calls: string[][] = [];
 		const fakePi = {
@@ -206,7 +193,7 @@ describe("supervisor UX", () => {
 			const { store } = fixture();
 			const state = store.initRun(`recovery-${choice}`, "build", "Recover");
 			const operation = store.next(state.runId).operations[0];
-			store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "panel" });
+			store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "herdr" });
 			store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "compile error" });
 			const calls: string[][] = [];
 			const fakePi = {
@@ -231,6 +218,13 @@ describe("supervisor UX", () => {
 			}
 			store.close();
 		}
+	});
+
+	test("production registration maps graph nodes to persisted attempt roles", () => {
+		expect(["thinker_plan", "thinker_synthesize", "implement", "review", "test", "audit", "search"].map((node) => roleForNode(node as Parameters<typeof roleForNode>[0]))).toEqual(["thinker", "thinker", "implementer", "reviewer", "tester", "auditor", "searcher"]);
+		const source = readFileSync(join(process.cwd(), "extensions/pi-agent-wave/index.ts"), "utf8");
+		expect(source).toContain("role: roleForNode(operation.node)");
+		expect(source.includes("role: operation.node")).toBe(false);
 	});
 
 	test("Herdr identity and focus use native role names and fails explicitly outside Herdr", async () => {
@@ -392,6 +386,7 @@ describe("supervisor UX", () => {
 			transport: "herdr",
 			herdrAgent: "dg-exact-thinker-1",
 			tabId: "tab-exact",
+			herdrPaneId: "pane-exact",
 			policyDigest: next.policy.digest,
 			selectedModel: SOL_MODEL,
 			modelAttempt: 0,
@@ -456,7 +451,7 @@ exit 0
 			HERDR_WORKSPACE_ID: "w-test",
 			PATH: `${binDir}:${process.env.PATH ?? ""}`,
 		};
-		const launch = (args: string[], transientModel?: string): HerdrStartResult => {
+		const launch = (args: string[]): HerdrStartResult => {
 			const init = spawnSync("python3", [helper, "init", "command contract"], {
 				encoding: "utf8",
 				env: baseEnv,
@@ -466,7 +461,7 @@ exit 0
 			dirs.push(runDir);
 			const result = spawnSync("python3", [helper, "start", runDir, "Thinker", ...args], {
 				encoding: "utf8",
-				env: { ...baseEnv, FAKE_TRANSIENT_MODEL: transientModel ?? "" },
+				env: baseEnv,
 			});
 			assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 			return JSON.parse(result.stdout) as HerdrStartResult;
@@ -490,12 +485,12 @@ exit 0
 			const launcher = scenario.expectedAttempt === 0
 				? launch(["--model", SOL_MODEL, "--reason", "cross-contract exact lock", ...commonArgs])
 				: launch([
-					"--tier", "reasoning",
-					"--chain", `${SOL_MODEL},${FALLBACK_MODEL}`,
-					"--thinking", "high",
-					"--session", "true",
+					"--model", FALLBACK_MODEL,
+					"--reason", "frozen fallback after http-429",
+					"--model-attempt", "1",
+					"--fallback-reason", "http-429",
 					...commonArgs,
-				], SOL_MODEL);
+				]);
 			expect(launcher["policy-digest"]).toBe(next.policy.digest);
 			expect(launcher.model).toBe(scenario.expectedModel);
 			expect(launcher["model-attempt"]).toBe(scenario.expectedAttempt);
@@ -509,6 +504,7 @@ exit 0
 				transport: "herdr",
 				herdrAgent: launcher.agent,
 				tabId: launcher.tab,
+				herdrPaneId: launcher.pane,
 				policyDigest: launcher["policy-digest"],
 				selectedModel: launcher.model,
 				modelAttempt: launcher["model-attempt"],
@@ -593,8 +589,10 @@ exit 0
 			name: "fallback-thinker",
 			node: "thinker_plan",
 			role: "thinker",
-			transport: "panel",
-			paneId: "%42",
+			transport: "herdr",
+			herdrAgent: "dg-fallback-thinker",
+			tabId: "workspace:tab",
+			herdrPaneId: "workspace:pane",
 			policyDigest: digest,
 			selectedModel: SOL_MODEL,
 			modelAttempt: 0,
@@ -606,7 +604,7 @@ exit 0
 			status: "running",
 			agentId,
 			agentName: "fallback-thinker",
-			transport: "panel",
+			transport: "herdr",
 			modelPolicy: fallbackPolicy().input,
 			policyDigest: digest,
 			selectedModel: SOL_MODEL,
@@ -634,7 +632,7 @@ exit 0
 			status: "running",
 			agentId,
 			agentName: "fallback-thinker",
-			transport: "panel",
+			transport: "herdr",
 			modelPolicy: fallbackPolicy().input,
 			policyDigest: digest,
 			selectedModel: "anthropic/claude-opus-4-1",
@@ -671,11 +669,10 @@ exit 0
 		expect(roles).toEqual(["auditor", "implementer", "reviewer", "searcher", "tester", "thinker"]);
 	});
 
-	test("Herdr and panel labels include the friendly policy and selected model", () => {
+	test("Herdr labels include the friendly policy and selected model", () => {
 		expect(shortModelName(SOL_MODEL)).toBe("gpt-5.6-sol");
 		expect(modelPolicyLabel({ kind: "preset", preset: "strong" })).toBe("Strong");
 		expect(herdrTabLabel("Story One", "Implementer", 2, SOL_MODEL, "Strong")).toBe("Story One: Implementer-2 [Strong] @ gpt-5.6-sol");
-		expect(panelModelLabel("Story One", "Implementer", SOL_MODEL, "Strong")).toBe("Story One: Implementer [Strong] @ gpt-5.6-sol");
 		expect(herdrTabLabel("Story One", "Thinker")).toBe("Story One: Thinker");
 	});
 });

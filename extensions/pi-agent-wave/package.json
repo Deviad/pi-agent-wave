@@ -1,7 +1,7 @@
 {
   "name": "@dpugliese/pi-agent-wave",
   "version": "0.1.0",
-  "description": "Observable graph delegation for Pi with Herdr-first and visible-panel transports.",
+  "description": "Observable graph delegation for Pi running inside Herdr.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -13,7 +13,9 @@
   "files": [
     "*.ts",
     "lib",
-    "scripts",
+    "scripts/*.ts",
+    "scripts/*.mjs",
+    "scripts/*.py",
     "README.md",
     "LICENSE"
   ],

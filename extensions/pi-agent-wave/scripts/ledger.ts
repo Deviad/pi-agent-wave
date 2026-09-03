@@ -1,5 +1,5 @@
 #!/usr/bin/env -S node --experimental-strip-types
-import { chmod, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { auditReport, validateReport, type DelegateReport, type ReportDiagnostic } from "./report-audit.ts";
@@ -18,6 +18,7 @@ export interface LedgerAggregate {
 export interface LedgerEntry {
 	schemaVersion: typeof LEDGER_SCHEMA_VERSION;
 	sequence: number;
+	operationId?: string;
 	topic: string;
 	routing: { runId: string; tier: string; model: string };
 	outcome: LedgerOutcome;
@@ -75,6 +76,8 @@ export interface WriteLedgerOptions {
 	outcome: LedgerOutcome;
 	task: string;
 	reportPath: string;
+	operationId?: string;
+	allowInvalidReport?: boolean;
 	base?: string;
 	rejectionDiagnostics?: ReportDiagnostic[];
 	now?: Date;
@@ -85,9 +88,9 @@ export interface WriteLedgerOptions {
 export async function writeLedgerEntry(options: WriteLedgerOptions): Promise<string> {
 	if (!LEDGER_OUTCOMES.includes(options.outcome)) throw new Error(`unsupported ledger outcome ${options.outcome}`);
 	const audit = await auditReport(options.reportPath, { privateRoot: dirname(resolve(options.reportPath)) });
-	const preservesRejectedCandidate = !audit.valid && options.outcome === "failed" && rejectedCandidate(options.task);
+	const preservesRejectedCandidate = !audit.valid && options.outcome === "failed" && (rejectedCandidate(options.task) || options.allowInvalidReport === true);
 	if (!audit.report && !preservesRejectedCandidate) throw new Error(`cannot ledger an invalid report without failed rejected-candidate marking: ${JSON.stringify(audit.errors)}`);
-	if (options.outcome !== "accepted" && audit.report && positiveVerdict(audit.report.verdict) && !rejectedCandidate(options.task)) {
+	if (options.outcome !== "accepted" && audit.report && positiveVerdict(audit.report.verdict) && !rejectedCandidate(options.task) && !options.allowInvalidReport) {
 		throw new Error("failed or blocked positive verdict requires a rejected candidate task marker");
 	}
 	let rawRejected = "";
@@ -96,11 +99,25 @@ export async function writeLedgerEntry(options: WriteLedgerOptions): Promise<str
 	await mkdir(directory, { recursive: true, mode: 0o700 });
 	const lock = await acquireSequenceLock(directory);
 	try {
-		const sequence = await nextSequence(directory);
-		const path = join(directory, `${String(sequence).padStart(2, "0")}-${slug(options.topic)}.json`);
+		let replacement: { path: string; sequence: number } | undefined;
+		if (options.operationId) {
+			for (const name of await readdir(directory).catch(() => [] as string[])) {
+				if (!name.endsWith(".json")) continue;
+				const existingPath = join(directory, name);
+				const existing = JSON.parse(await readFile(existingPath, "utf8").catch(() => "null")) as Partial<LedgerEntry> | null;
+				if (existing?.operationId !== options.operationId) continue;
+				if (existing.outcome === options.outcome) return existingPath;
+				if (existing.outcome !== "failed" || !Number.isInteger(existing.sequence)) throw new Error(`operation ${options.operationId} already has settled ${existing.outcome ?? "unknown"} ledger outcome`);
+				replacement = { path: existingPath, sequence: existing.sequence as number };
+				break;
+			}
+		}
+		const sequence = replacement?.sequence ?? await nextSequence(directory);
+		const path = replacement?.path ?? join(directory, `${String(sequence).padStart(2, "0")}-${slug(options.topic)}.json`);
 		const entry: LedgerEntry = {
 			schemaVersion: LEDGER_SCHEMA_VERSION,
 			sequence,
+			...(options.operationId ? { operationId: options.operationId } : {}),
 			topic: options.topic,
 			routing: { runId: options.runId, tier: options.tier, model: options.model },
 			outcome: options.outcome,
@@ -110,7 +127,14 @@ export async function writeLedgerEntry(options: WriteLedgerOptions): Promise<str
 			...(options.rejectionDiagnostics?.length ? { rejectionDiagnostics: options.rejectionDiagnostics } : {}),
 			...(options.aggregates?.length ? { aggregates: options.aggregates } : {}),
 		};
-		await writeFile(path, `${JSON.stringify(entry, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+		const serialized = `${JSON.stringify(entry, null, 2)}\n`;
+		if (replacement) {
+			const temporary = `${path}.${process.pid}.tmp`;
+			await writeFile(temporary, serialized, { flag: "wx", mode: 0o600 });
+			await rename(temporary, path);
+		} else {
+			await writeFile(path, serialized, { flag: "wx", mode: 0o600 });
+		}
 		await chmod(path, 0o600);
 		return path;
 	} finally {
@@ -130,7 +154,7 @@ function validateEntry(value: unknown, file: string): LedgerFinding[] {
 	if (!entry.task?.trim()) findings.push({ file, code: "ENTRY_TASK", message: "task must be non-empty" });
 	const report = entry.report ? validateReport(entry.report) : { valid: false, errors: [], verdict: undefined };
 	if (entry.report) for (const error of report.errors) findings.push({ file, code: error.code, message: `${error.path}: ${error.message}` });
-	else if (entry.outcome !== "failed" || !rejectedCandidate(entry.task ?? "") || !entry.rejectedCandidate?.diagnostics?.length) {
+	else if (entry.outcome !== "failed" || (!rejectedCandidate(entry.task ?? "") && !entry.operationId) || !entry.rejectedCandidate?.diagnostics?.length) {
 		findings.push({ file, code: "REJECTED_CANDIDATE", message: "missing validated report without a complete failed rejected-candidate record" });
 	}
 	if (entry.outcome && entry.outcome !== "accepted" && report.verdict && positiveVerdict(report.verdict) && !rejectedCandidate(entry.task ?? "")) {

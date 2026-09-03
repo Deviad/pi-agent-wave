@@ -36,6 +36,15 @@ describe("package portability", () => {
 		}
 	});
 
+	test("shipped source contains no panel transport", () => {
+		for (const path of sourceFiles()) {
+			const source = readFileSync(path, "utf8");
+			const packageRelative = relative(ROOT, path);
+			expect(/\bpanel\b/i.test(source), packageRelative).toBe(false);
+			expect(source.includes("PANEL_"), packageRelative).toBe(false);
+		}
+	});
+
 	test("uses bare Pi package imports at the repaired boundaries", () => {
 		expect(readFileSync(join(ROOT, "delegation-identity.ts"), "utf8")).toContain('from "@earendil-works/pi-tui"');
 		expect(readFileSync(join(ROOT, "index.ts"), "utf8")).toContain('from "typebox"');

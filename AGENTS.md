@@ -9,7 +9,8 @@ This repository develops `@dpugliese/pi-agent-wave`. The package root is `extens
 ## Product invariants
 
 - Preserve the public `/delegate`, `/graph`, and `delegate_graph` contracts.
-- Preserve graph topology, scheduling, retries, evidence gates, model-policy behavior, Herdr-first transport selection, and visible-panel fallback unless the PRD explicitly changes them.
+- Preserve graph topology, scheduling, retries, evidence gates, and model-policy behavior unless the PRD explicitly changes them.
+- Worker execution is transport-neutral and ACPX-only. Headless operation must load with ACPX and AgentFS alone; Herdr is an optional presentation adapter selected only with complete executable/workspace identity. Implement this change only under `tasks/prd-air-controlled-editor-independent-orchestration.md` while preserving existing graph, settlement, and evidence behavior.
 - Package exactly the pi-agent-wave graph extension plus questionnaire, cmux-session, and model-failover entry points.
 - Herdr executables and Herdr-managed files remain external and must not enter the npm artifact.
 - Do not recreate the legacy loose-install source directory; only migration code and migration tests may identify it.
@@ -19,10 +20,10 @@ This repository develops `@dpugliese/pi-agent-wave`. The package root is `extens
 
 - `extensions/pi-agent-wave/*.ts` — extension entry points and runtime.
 - `extensions/pi-agent-wave/lib/` — package-private portable helpers and declarations.
-- `extensions/pi-agent-wave/scripts/` — transports, evidence tooling, policy resolution, and migration.
+- `extensions/pi-agent-wave/scripts/` — transport-neutral worker lifecycle, headless and optional Herdr adapters, evidence tooling, policy resolution, and migration.
 - `extensions/pi-agent-wave/test/` — all automated verification.
 - `extensions/pi-agent-wave/README.md` — user-facing installation and operations documentation.
-- `README.md` — repository development guide.
+- `README.md` — user-first product overview and install, run, inspection, and uninstall guide.
 - `tasks/prd-package-delegate-graph.md` — issue and acceptance proof.
 - `agent-output/` — generated evidence only; never package it.
 

@@ -1,6 +1,6 @@
 # PRD: Package Delegate Graph as `@dpugliese/pi-agent-wave`
 
-**Status:** Core packaging, migration, initial user configuration, and cross-provider HTTP 429 failover are implemented and verified. Feature acceptance and proof are recorded in `tasks/prd-cross-provider-429-failover.md`; the package remains uncommitted, unpushed, and unpublished.
+**Status:** Core packaging, migration, initial user configuration, cross-provider HTTP 429 failover, historical mandatory-Herdr enforcement, panel-transport removal, the user-first README, and operational-search delegation are implemented and verified. `tasks/prd-air-controlled-editor-independent-orchestration.md` now governs the phased change to Air/headless operation with optional Herdr presentation. Production ACPX-only worker execution is authorized by `tasks/prd-production-acpx-worker-backend.md`, following the completed validation spike in `tasks/prd-acpx-headless-worker-spike.md`; lifecycle hardening, source hardening, deterministic host audit, bundle completeness, and the final observable review all pass; final evidence is recorded in `tasks/prd-production-acpx-final-bundle-completeness.md`. Operational-search proof is recorded in `tasks/prd-operational-search-delegation.md`; other feature proof is recorded in the linked PRDs, including `tasks/prd-require-herdr.md`. The npm package remains unpublished.
 
 ## Goal
 
@@ -13,10 +13,17 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 - Existing compatibility APIs remain `/delegate`, `/graph`, and `delegate_graph`; the rename does not break these public contracts.
 - Initial package version: `0.1.0`.
 - License: MIT.
-- Repository, homepage, and issue-tracker URLs: deferred. Do not invent them; omit them until separately approved.
+- Public source repository: `https://github.com/Deviad/pi-agent-wave`. The npm package remains unpublished; do not present its install command as currently available until the registry package exists.
 - Compatibility proof: Pi `0.84.1` plus `0.84.2`, the registry release observed during planning. Do not claim compatibility beyond the tested matrix.
-- The project-local migration was explicitly applied by the user. No additional real-install mutation, npm publication, public repository creation, or push is authorized beyond repairing stale references caused by that migration.
-- This file is the package umbrella issue and scope record. Linked feature acceptance records are `tasks/prd-initial-configuration.md` and `tasks/prd-cross-provider-429-failover.md`; superseded external planning files and generated role-workflow artifacts remain excluded.
+- The project-local migration was explicitly applied by the user. No additional real-install mutation or npm publication is authorized beyond repairing stale references caused by that migration.
+- ACPX and AgentFS are mandatory worker prerequisites. Headless operation is the default when complete Herdr identity is absent; Herdr remains an optional presentation adapter and is required only when explicitly selected or auto-selected from a complete Herdr workspace.
+- ACPX `0.13.2` and Turso AgentFS `0.6.4` are mandatory external worker prerequisites. Production execution is ACPX-only inside one AgentFS copy-on-write sandbox per operation attempt, supports the ACPX Pi, Codex, and Claude agents, and owns one persistent ACPX plus AgentFS session per attempt. ACPX remains the execution/session backend and AgentFS remains the filesystem boundary under both headless and Herdr presentation adapters.
+- The package-private GraphStore schema may advance to v4 only for nullable ACPX provenance with idempotent backward migration; `/delegate`, `/graph`, `delegate_graph`, graph topology, retry policy, and evidence contracts remain public compatibility invariants.
+- Graph topology, frozen routing, retry/fallback behavior, transport-aware settlement, and evidence-ledger gates remain stable across headless and optional Herdr adapters.
+- The visible-panel transport, fallback, and legacy direct-Pi worker execution path are retired completely. Existing public command names and non-transport graph behavior remain stable.
+- Exact writable operational searches use the planned structured-command, execution-proof, automatic-ledger workflow defined by `tasks/prd-operational-search-delegation.md`; existing build and research contracts remain compatible.
+- Root `README.md` is user documentation first and must use plain, easily understandable prose. It must lead with what pi-agent-wave is, why to use it, and exact install, run, inspection, and uninstall commands.
+- This file is the package umbrella issue and scope record. Linked feature acceptance records are `tasks/prd-initial-configuration.md`, `tasks/prd-cross-provider-429-failover.md`, `tasks/prd-require-herdr.md`, `tasks/prd-operational-search-delegation.md`, `tasks/prd-acpx-headless-worker-spike.md`, `tasks/prd-production-acpx-worker-backend.md`, `tasks/prd-production-acpx-lifecycle-hardening.md`, `tasks/prd-production-acpx-final-audit.md`, `tasks/prd-production-acpx-final-source-hardening.md`, and `tasks/prd-production-acpx-final-bundle-completeness.md`, and `tasks/prd-air-controlled-editor-independent-orchestration.md`; superseded external planning files and generated role-workflow artifacts remain excluded.
 
 ## Verified packaging baseline
 
@@ -37,8 +44,10 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 4. Add package-owned entry points for questionnaire, cmux session metadata, and native model failover while excluding Herdr-managed integration files.
 5. Add a migration utility with dry-run, apply, and rollback modes tested only against temporary `PI_CODING_AGENT_DIR` trees, including repair and exact rollback of active pi-fzf route-picker command references.
 6. Add isolated npm-tarball and Git-install rehearsals for Pi `0.84.1` and `0.84.2`.
-7. Document installation, security, configuration, migration, rollback, uninstall, contents, and tested compatibility.
+7. Document what pi-agent-wave is, why users should use it, mandatory Herdr setup, package installation, operation, inspection, security, migration, rollback, uninstall, contents, and tested compatibility.
 8. Retire the obsolete Role Pipeline and cmux-agent-supervision surfaces, merge their relevant packaging requirements into this PRD, and remove their active instructions, standalone plans, generated current-project artifacts, and unused route/config remnants.
+9. Enforce Herdr at package load and remove the visible-panel transport according to `tasks/prd-require-herdr.md`.
+10. Add operational-search delegation according to `tasks/prd-operational-search-delegation.md`; its user stories, acceptance criteria, and verification section are the plan of record for that behavior.
 
 ## Affected components
 
@@ -47,7 +56,9 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 - Package-private model-routing and JSONC helpers
 - Package-owned companion extension entry points
 - Migration tooling and pi-fzf route-picker reference repair
-- Package README and MIT license
+- Root user README, package README, and MIT license
+- Herdr prerequisite validation and removal of panel runtime, types, schema fields, and tests
+- Project development contract where it describes transport invariants
 - Existing and new tests under `extensions/pi-agent-wave/test/`
 - One-time host cleanup of obsolete orchestration skills and active references
 - Current-project generated role-workflow markers, task briefs, and handoffs
@@ -77,7 +88,7 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 - [x] Shipped source has no import escaping the package root, no `/Users/spotted`, fixed Homebrew/npm-cache path, `../../npm/node_modules`, or `@mariozechner/pi-coding-agent` import. Proof: `package-portability.test.ts`.
 - [x] `delegation-identity.ts` imports `@earendil-works/pi-tui`; `index.ts` imports `typebox` by bare package name. Proof: portability test.
 - [x] Package-private JSONC/model-routing helpers resolve an explicit path or `PI_MODEL_ROUTING`, then `PI_CODING_AGENT_DIR`, without hard-coded `~/.pi/agent`. Proof: portability and route-picker tests.
-- [x] Existing Delegate Graph scheduling, routing, retries, evidence ledger, Herdr-first selection, and visible-panel fallback remain unchanged. Proof: complete existing suite after relocation.
+- [x] Existing Delegate Graph scheduling, routing, retries, evidence ledger, Herdr-first selection, and visible-panel fallback remained unchanged through the packaging baseline. This historical transport criterion is superseded by `tasks/prd-require-herdr.md`; scheduling, routing, retries, and evidence behavior remain protected. Proof: complete existing suite after relocation.
 - [x] `node --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts` passes.
 
 ### Companion extensions
@@ -86,7 +97,7 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 - [x] Questionnaire behavior works without fixed host paths. Proof: `questionnaire.test.ts`.
 - [x] Native model failover works without fixed host paths. Proof: `model-failover.test.ts`.
 - [x] cmux-present and cmux-absent metadata behavior is covered. Proof: `cmux-session.test.ts`.
-- [x] `herdr-agent-state.ts`, Herdr executables, and other Herdr-managed files are not shipped; README states that Herdr integration remains external. Proof: artifact and docs tests.
+- [x] `herdr-agent-state.ts`, Herdr executables, and other Herdr-managed files are not shipped; README states that Herdr integration remains external. Mandatory external installation and load-time enforcement are governed by `tasks/prd-require-herdr.md`. Proof: artifact and docs tests.
 
 ### Isolated installation rehearsal
 
@@ -106,7 +117,7 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 
 ### Public documentation
 
-- [x] README documents npm and Git installation, package contents, Pi/Herdr prerequisites, Herdr-first visible-panel fallback, configuration, migration, rollback, uninstall, and the `0.84.1`/`0.84.2` tested matrix. Proof: `package-docs.test.ts`.
+- [x] The package README documented the packaging baseline's npm and Git installation, package contents, Pi/Herdr prerequisites, configuration, migration, rollback, uninstall, and tested matrix. Its optional-Herdr and visible-panel-fallback wording is superseded by the user-first documentation criteria in `tasks/prd-require-herdr.md`. Proof: `package-docs.test.ts`.
 - [x] README warns that Pi extensions execute with full system access and tells users to review source before installation. Proof: docs test.
 - [x] `LICENSE` contains the MIT license and matches `package.json#license`. Proof: docs test.
 
@@ -121,7 +132,7 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 
 ## Non-goals
 
-- Redesign graph topology, scheduler, store, retry policy, ledger, model-selection UX, or transport behavior.
+- Redesign graph topology, scheduler, or store behavior unrelated to panel removal, operational-search delegation, retry policy, ledger, or model-selection UX. Mandatory-Herdr and the scoped `tasks/prd-operational-search-delegation.md` changes are the only approved transport or graph-workflow redesigns.
 - Package Herdr, cmux skills, obsolete orchestration skills, user routing settings, credentials, databases, ledgers, or generated output.
 - Add companions beyond questionnaire, cmux session integration, and native model failover.
 - Claim compatibility outside Pi `0.84.1` and `0.84.2`.
@@ -129,4 +140,4 @@ Turn the existing loose Delegate Graph extension into the standalone public Pi p
 
 ## Completion gate
 
-All listed proof commands must pass against package artifacts and temporary installations. The one-time obsolete-orchestration cleanup must also pass its absence and active-reference gates before packaging is complete. Any criterion blocked by an external prerequisite must be reported as blocked; it must not be replaced with a simulation when the real local dependency is reachable.
+All listed proof commands must pass against package artifacts and temporary installations. The one-time obsolete-orchestration cleanup must also pass its absence and active-reference gates before packaging is complete. The additional completion gates in `tasks/prd-require-herdr.md` and `tasks/prd-operational-search-delegation.md` must pass before their respective changes are complete. Any criterion blocked by an external prerequisite must be reported as blocked; it must not be replaced with a simulation when the real local dependency is reachable.

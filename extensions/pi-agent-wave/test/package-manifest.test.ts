@@ -19,7 +19,7 @@ describe("package manifest", () => {
 		});
 		expect(typeof manifest.description).toBe("string");
 		expect(manifest.description.trim()).not.toBe("");
-		expect(manifest.files).toEqual(["*.ts", "lib", "scripts", "README.md", "LICENSE"]);
+		expect(manifest.files).toEqual(["*.ts", "lib", "scripts/*.ts", "scripts/*.mjs", "scripts/*.py", "README.md", "LICENSE"]);
 		expect(manifest.pi?.extensions).toEqual(["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts"]);
 	});
 

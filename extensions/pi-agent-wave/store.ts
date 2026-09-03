@@ -1,10 +1,12 @@
 import { Database } from "./sqlite.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { decideTransition, graphDefinition } from "./graph-core.ts";
 import { classifyFailure, retryDelayMs } from "./retry.ts";
+import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
+import { headlessPresentationIdentity, herdrPresentationIdentity, parseWorkerTransportKind, type WorkerPresentationIdentity, type WorkerTransportKind } from "./lib/worker-transport.ts";
 import type {
 	EventRow,
 	FrozenPolicy,
@@ -13,6 +15,8 @@ import type {
 	NodeName,
 	OperationRow,
 	OperationStatus,
+	OperationalCommand,
+	OperationalCommandSpec,
 	PolicyRoute,
 	ResolvedPolicy,
 	RunRow,
@@ -31,7 +35,7 @@ export interface StoreOptions {
 	random?: () => number;
 }
 
-export type VisibleTransport = "herdr" | "panel";
+export type VisibleTransport = WorkerTransportKind;
 
 export interface RecordOperationInput {
 	runId: string;
@@ -67,15 +71,23 @@ export interface AgentRegistration {
 	role: string;
 	transport: VisibleTransport;
 	herdrAgent?: string;
-	paneId?: string;
 	tabId?: string;
 	policyDigest?: string;
 	selectedModel?: string;
 	modelAttempt?: number;
+	acpAgent?: AcpAgent;
+	acpxRecordId?: string;
+	acpxSessionId?: string;
+	acpxState?: AcpxState;
+	acpxAttemptKey?: string;
+	agentFsSessionId?: string;
+	agentFsDbPath?: string;
+	herdrPaneId?: string;
+	acpxCancelScript?: string;
 	currentTask: string;
 }
 
-interface AgentRow {
+interface AgentDbRow {
 	id: string;
 	run_id: string;
 	name: string;
@@ -83,15 +95,28 @@ interface AgentRow {
 	role: string;
 	transport: string;
 	herdr_agent: string | null;
-	pane_id: string | null;
 	tab_id: string | null;
 	policy_digest: string | null;
 	selected_model: string | null;
 	model_attempt: number;
+	acp_agent: string | null;
+	acpx_record_id: string | null;
+	acpx_session_id: string | null;
+	acpx_state: string | null;
+	acpx_attempt_key: string | null;
+	agentfs_session_id: string | null;
+	agentfs_db_path: string | null;
+	herdr_pane_id: string | null;
+	acpx_cancel_script: string | null;
 	status: OperationStatus;
 	current_task: string;
 	created_at: string;
 	last_activity_at: string;
+}
+
+export interface AgentRow extends AgentDbRow {
+	transport: WorkerTransportKind;
+	presentation_identity: WorkerPresentationIdentity | null;
 }
 
 interface CountRow {
@@ -131,29 +156,61 @@ function ensurePrivatePath(dbPath: string): void {
 }
 
 function nodeIsReadOnly(node: NodeName): boolean {
-	return node !== "implement";
+	return node !== "implement" && node !== "source_search";
 }
 
-function roleForNode(node: NodeName): string {
+export function roleForNode(node: NodeName): string {
 	if (node.startsWith("thinker")) return "thinker";
 	if (node === "implement") return "implementer";
 	if (node === "review") return "reviewer";
 	if (node === "test") return "tester";
 	if (node === "audit") return "auditor";
-	if (node === "search") return "searcher";
+	if (node === "search" || node === "source_search") return "searcher";
 	return "supervisor";
 }
 
-function assertDisjointOwnership(slices: SliceSpec[]): void {
+function canonicalWritablePath(path: string): string {
+	let current = resolve(path);
+	const missing: string[] = [];
+	while (!existsSync(current)) {
+		const parent = dirname(current);
+		if (parent === current) break;
+		missing.unshift(basename(current));
+		current = parent;
+	}
+	const physical = existsSync(current) ? realpathSync(current) : current;
+	return resolve(physical, ...missing);
+}
+
+function assertDisjointOwnership(slices: Array<{ id: string; ownedPaths?: string[] }>, label = "implementation slice"): void {
 	const owners = new Map<string, string>();
 	for (const slice of slices) {
-		if (!slice.ownedPaths?.length) throw new Error(`implementation slice ${slice.id} requires ownedPaths`);
+		if (!slice.ownedPaths?.length) throw new Error(`${label} ${slice.id} requires ownedPaths`);
 		for (const path of slice.ownedPaths) {
-			const previous = owners.get(path);
-			if (previous) throw new Error(`writable path ${path} is owned by both ${previous} and ${slice.id}`);
-			owners.set(path, slice.id);
+			const physical = canonicalWritablePath(path);
+			for (const [owned, previous] of owners) {
+				const candidateWithinOwned = relative(owned, physical);
+				const ownedWithinCandidate = relative(physical, owned);
+				if ((!candidateWithinOwned.startsWith("..") && candidateWithinOwned !== "") || (!ownedWithinCandidate.startsWith("..") && ownedWithinCandidate !== "") || owned === physical) {
+					throw new Error(`writable path ${path} is owned by both ${previous} and ${slice.id}`);
+				}
+			}
+			owners.set(physical, slice.id);
 		}
 	}
+}
+
+function validateOperationalCommands(commands: OperationalCommandSpec[] | undefined): OperationalCommandSpec[] {
+	if (!commands?.length) throw new Error("operations graph requires at least one structured command");
+	for (const item of commands) {
+		if (!item.id?.trim() || !item.name?.trim()) throw new Error("operational command requires id and name");
+		const command = item.command as OperationalCommand | undefined;
+		if (!command?.executable?.trim() || !command.cwd?.trim() || !Array.isArray(command.args) || command.args.some((value) => typeof value !== "string")) {
+			throw new Error(`operational command ${item.id} requires executable, argv, and cwd`);
+		}
+	}
+	assertDisjointOwnership(commands, "operational command");
+	return commands;
 }
 
 function slicesFromPayload(payload: Record<string, unknown> | undefined): SliceSpec[] {
@@ -199,7 +256,7 @@ export class GraphStore {
 			CREATE TABLE IF NOT EXISTS runs (
 				id TEXT PRIMARY KEY,
 				story TEXT NOT NULL,
-				graph_name TEXT NOT NULL CHECK(graph_name IN ('build','research')),
+				graph_name TEXT NOT NULL CHECK(graph_name IN ('build','research','operations')),
 				task TEXT NOT NULL,
 				status TEXT NOT NULL CHECK(status IN ('active','terminal','blocked','awaiting_user','deferred','cancelled')),
 				created_at TEXT NOT NULL,
@@ -219,7 +276,6 @@ export class GraphStore {
 				role TEXT NOT NULL,
 				transport TEXT NOT NULL,
 				herdr_agent TEXT,
-				pane_id TEXT,
 				tab_id TEXT,
 				status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed','blocked','cancelled')),
 				current_task TEXT NOT NULL,
@@ -239,6 +295,7 @@ export class GraphStore {
 				round INTEGER NOT NULL,
 				fix_iteration INTEGER NOT NULL,
 				transient_attempts INTEGER NOT NULL DEFAULT 0,
+				command_json TEXT,
 				task TEXT NOT NULL,
 				report_path TEXT,
 				verdict TEXT,
@@ -279,8 +336,11 @@ export class GraphStore {
 		`);
 		const version = this.schemaVersion();
 		if (version < 1) this.db.exec("INSERT INTO schema_version(version) VALUES (1)");
-		// Always inspect columns so interrupted or early partial-v2 migrations repair idempotently.
+		// Always inspect columns so interrupted migrations repair idempotently.
 		this.migrateToV2();
+		this.migrateToV3();
+		this.migrateToV4();
+		this.migrateToV5();
 	}
 
 	private schemaVersion(): number {
@@ -334,6 +394,123 @@ export class GraphStore {
 			this.db.exec("ROLLBACK");
 			throw error;
 		}
+	}
+
+	/** v3 adds operational graphs and structured command persistence. */
+	private migrateToV3(): void {
+		const version = (this.db.query<{ version: number }, []>("SELECT version FROM schema_version LIMIT 1").get() as { version: number }).version;
+		if (version >= 3) return;
+		if (!this.hasColumn("operations", "command_json")) this.db.exec("ALTER TABLE operations ADD COLUMN command_json TEXT");
+		this.db.exec("PRAGMA foreign_keys = OFF");
+		try {
+			this.db.exec("BEGIN IMMEDIATE");
+			this.db.exec(`
+				CREATE TABLE runs_v3 (
+					id TEXT PRIMARY KEY,
+					story TEXT NOT NULL,
+					graph_name TEXT NOT NULL CHECK(graph_name IN ('build','research','operations')),
+					task TEXT NOT NULL,
+					status TEXT NOT NULL CHECK(status IN ('active','terminal','blocked','awaiting_user','deferred','cancelled')),
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL,
+					policy_json TEXT NOT NULL DEFAULT '{}',
+					policy_digest TEXT NOT NULL DEFAULT ''
+				);
+				INSERT INTO runs_v3 SELECT id, story, graph_name, task, status, created_at, updated_at, policy_json, policy_digest FROM runs;
+				DROP TABLE runs;
+				ALTER TABLE runs_v3 RENAME TO runs;
+				INSERT OR REPLACE INTO schema_version(version) VALUES (3);
+				COMMIT;
+			`);
+		} catch (error) {
+			try {
+				this.db.exec("ROLLBACK");
+			} catch {
+				// The failing statement may already have ended the transaction.
+			}
+			throw error;
+		} finally {
+			this.db.exec("PRAGMA foreign_keys = ON");
+		}
+		const foreignKeyFinding = this.db.query("PRAGMA foreign_key_check").get();
+		if (foreignKeyFinding) throw new Error("v3 migration produced a foreign-key violation");
+	}
+
+	/** v4 adds nullable ACPX provenance while preserving legacy v1-v3 agents. */
+	private migrateToV4(): void {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			this.ensureColumn("agents", "acp_agent", "TEXT");
+			this.ensureColumn("agents", "acpx_record_id", "TEXT");
+			this.ensureColumn("agents", "acpx_session_id", "TEXT");
+			this.ensureColumn("agents", "acpx_state", "TEXT");
+			this.ensureColumn("agents", "acpx_attempt_key", "TEXT");
+			this.ensureColumn("agents", "agentfs_session_id", "TEXT");
+			this.ensureColumn("agents", "agentfs_db_path", "TEXT");
+			this.ensureColumn("agents", "herdr_pane_id", "TEXT");
+			this.ensureColumn("agents", "acpx_cancel_script", "TEXT");
+			const identityColumns = "acp_agent,acpx_record_id,acpx_session_id,acpx_state,acpx_attempt_key,agentfs_session_id,agentfs_db_path,acpx_cancel_script";
+			const inconsistent = this.db.query<CountRow, []>(`SELECT COUNT(*) AS count FROM agents WHERE (${identityColumns.replaceAll(",", " IS NOT NULL OR ")} IS NOT NULL) AND NOT (${identityColumns.replaceAll(",", " IS NOT NULL AND ")} IS NOT NULL)`).get()?.count ?? 0;
+			if (inconsistent) throw new Error("agents table contains inconsistent partial ACPX/AgentFS identity");
+			this.db.exec(`
+				CREATE TRIGGER IF NOT EXISTS agents_acpx_identity_insert
+				BEFORE INSERT ON agents WHEN
+					(NEW.acp_agent IS NOT NULL OR NEW.acpx_record_id IS NOT NULL OR NEW.acpx_session_id IS NOT NULL OR NEW.acpx_state IS NOT NULL OR NEW.acpx_attempt_key IS NOT NULL OR NEW.agentfs_session_id IS NOT NULL OR NEW.agentfs_db_path IS NOT NULL OR NEW.herdr_pane_id IS NOT NULL OR NEW.acpx_cancel_script IS NOT NULL)
+					AND NOT (NEW.acp_agent IS NOT NULL AND NEW.acpx_record_id IS NOT NULL AND NEW.acpx_session_id IS NOT NULL AND NEW.acpx_state IS NOT NULL AND NEW.acpx_attempt_key IS NOT NULL AND NEW.agentfs_session_id IS NOT NULL AND NEW.agentfs_db_path IS NOT NULL AND NEW.herdr_pane_id IS NOT NULL AND NEW.acpx_cancel_script IS NOT NULL)
+				BEGIN SELECT RAISE(ABORT, 'complete ACPX provenance required'); END;
+				CREATE TRIGGER IF NOT EXISTS agents_acpx_identity_update
+				BEFORE UPDATE OF acp_agent,acpx_record_id,acpx_session_id,acpx_state,acpx_attempt_key,agentfs_session_id,agentfs_db_path,herdr_pane_id,acpx_cancel_script ON agents WHEN
+					(NEW.acp_agent IS NOT NULL OR NEW.acpx_record_id IS NOT NULL OR NEW.acpx_session_id IS NOT NULL OR NEW.acpx_state IS NOT NULL OR NEW.acpx_attempt_key IS NOT NULL OR NEW.agentfs_session_id IS NOT NULL OR NEW.agentfs_db_path IS NOT NULL OR NEW.herdr_pane_id IS NOT NULL OR NEW.acpx_cancel_script IS NOT NULL)
+					AND NOT (NEW.acp_agent IS NOT NULL AND NEW.acpx_record_id IS NOT NULL AND NEW.acpx_session_id IS NOT NULL AND NEW.acpx_state IS NOT NULL AND NEW.acpx_attempt_key IS NOT NULL AND NEW.agentfs_session_id IS NOT NULL AND NEW.agentfs_db_path IS NOT NULL AND NEW.herdr_pane_id IS NOT NULL AND NEW.acpx_cancel_script IS NOT NULL)
+				BEGIN SELECT RAISE(ABORT, 'complete ACPX provenance required'); END;
+			`);
+			this.db.exec("INSERT OR REPLACE INTO schema_version(version) VALUES (4)");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
+	/** v5 makes presentation identity transport-aware without changing stored columns. */
+	private migrateToV5(): void {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const invalid = this.db.query<CountRow, []>(`
+				SELECT COUNT(*) AS count FROM agents WHERE
+					transport NOT IN ('headless','herdr')
+					OR (transport='herdr' AND acp_agent IS NOT NULL AND (herdr_agent IS NULL OR tab_id IS NULL OR herdr_pane_id IS NULL))
+					OR (transport='headless' AND (herdr_agent IS NOT NULL OR tab_id IS NOT NULL OR herdr_pane_id IS NOT NULL))
+			`).get()?.count ?? 0;
+			if (invalid) throw new Error("agents table contains invalid transport presentation identity");
+			this.db.exec(`
+				DROP TRIGGER IF EXISTS agents_acpx_identity_insert;
+				DROP TRIGGER IF EXISTS agents_acpx_identity_update;
+				CREATE TRIGGER agents_acpx_identity_insert
+				BEFORE INSERT ON agents WHEN
+					NEW.transport NOT IN ('headless','herdr')
+					OR (NEW.transport='herdr' AND (NEW.herdr_agent IS NULL OR NEW.tab_id IS NULL OR NEW.herdr_pane_id IS NULL))
+					OR (NEW.transport='headless' AND (NEW.herdr_agent IS NOT NULL OR NEW.tab_id IS NOT NULL OR NEW.herdr_pane_id IS NOT NULL))
+					OR ((NEW.acp_agent IS NOT NULL OR NEW.acpx_record_id IS NOT NULL OR NEW.acpx_session_id IS NOT NULL OR NEW.acpx_state IS NOT NULL OR NEW.acpx_attempt_key IS NOT NULL OR NEW.agentfs_session_id IS NOT NULL OR NEW.agentfs_db_path IS NOT NULL OR NEW.acpx_cancel_script IS NOT NULL)
+						AND NOT (NEW.acp_agent IS NOT NULL AND NEW.acpx_record_id IS NOT NULL AND NEW.acpx_session_id IS NOT NULL AND NEW.acpx_state IS NOT NULL AND NEW.acpx_attempt_key IS NOT NULL AND NEW.agentfs_session_id IS NOT NULL AND NEW.agentfs_db_path IS NOT NULL AND NEW.acpx_cancel_script IS NOT NULL))
+				BEGIN SELECT RAISE(ABORT, 'valid transport and complete ACPX provenance required'); END;
+				CREATE TRIGGER agents_acpx_identity_update
+				BEFORE UPDATE OF transport,herdr_agent,tab_id,herdr_pane_id,acp_agent,acpx_record_id,acpx_session_id,acpx_state,acpx_attempt_key,agentfs_session_id,agentfs_db_path,acpx_cancel_script ON agents WHEN
+					NEW.transport NOT IN ('headless','herdr')
+					OR (NEW.transport='herdr' AND (NEW.herdr_agent IS NULL OR NEW.tab_id IS NULL OR NEW.herdr_pane_id IS NULL))
+					OR (NEW.transport='headless' AND (NEW.herdr_agent IS NOT NULL OR NEW.tab_id IS NOT NULL OR NEW.herdr_pane_id IS NOT NULL))
+					OR ((NEW.acp_agent IS NOT NULL OR NEW.acpx_record_id IS NOT NULL OR NEW.acpx_session_id IS NOT NULL OR NEW.acpx_state IS NOT NULL OR NEW.acpx_attempt_key IS NOT NULL OR NEW.agentfs_session_id IS NOT NULL OR NEW.agentfs_db_path IS NOT NULL OR NEW.acpx_cancel_script IS NOT NULL)
+						AND NOT (NEW.acp_agent IS NOT NULL AND NEW.acpx_record_id IS NOT NULL AND NEW.acpx_session_id IS NOT NULL AND NEW.acpx_state IS NOT NULL AND NEW.acpx_attempt_key IS NOT NULL AND NEW.agentfs_session_id IS NOT NULL AND NEW.agentfs_db_path IS NOT NULL AND NEW.acpx_cancel_script IS NOT NULL))
+				BEGIN SELECT RAISE(ABORT, 'valid transport and complete ACPX provenance required'); END;
+			`);
+			this.db.exec("INSERT OR REPLACE INTO schema_version(version) VALUES (5)");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+		const foreignKeyFinding = this.db.query("PRAGMA foreign_key_check").get();
+		if (foreignKeyFinding) throw new Error("v5 migration produced a foreign-key violation");
 	}
 
 	private iso(): string {
@@ -394,11 +571,12 @@ export class GraphStore {
 		fixIteration: number,
 		sliceId?: string,
 		ownedPaths: string[] = [],
+		command?: OperationalCommand,
 	): string {
 		const id = `op_${randomUUID()}`;
 		this.db
-			.query(`INSERT INTO operations(id,run_id,node,slice_id,status,read_only,owned_paths_json,round,fix_iteration,task,created_at)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+			.query(`INSERT INTO operations(id,run_id,node,slice_id,status,read_only,owned_paths_json,round,fix_iteration,command_json,task,created_at)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
 			.run(
 				id,
 				runId,
@@ -409,6 +587,7 @@ export class GraphStore {
 				JSON.stringify(ownedPaths),
 				round,
 				fixIteration,
+				command ? JSON.stringify(command) : null,
 				task,
 				this.iso(),
 			);
@@ -425,9 +604,17 @@ export class GraphStore {
 	}
 
 	/** Initializes a run and freezes the selected graph definition plus its immutable policy snapshot. */
-	initRun(story: string, graph: GraphKind, task: string, policy: ResolvedPolicy = DEFAULT_AUTO_POLICY): RunState {
+	initRun(
+		story: string,
+		graph: GraphKind,
+		task: string,
+		policy: ResolvedPolicy = DEFAULT_AUTO_POLICY,
+		operationalCommands?: OperationalCommandSpec[],
+	): RunState {
 		if (!story.trim() || !task.trim()) throw new Error("story and task are required");
 		this.assertPolicy(policy);
+		const commands = graph === "operations" ? validateOperationalCommands(operationalCommands) : undefined;
+		if (graph !== "operations" && operationalCommands?.length) throw new Error("structured commands require the operations graph");
 		const runId = `run_${randomUUID()}`;
 		const definition = graphDefinition(graph);
 		const now = this.iso();
@@ -460,7 +647,11 @@ export class GraphStore {
 				now,
 			);
 			this.event({ runId, type: "run_initialized", toNode: definition.initialNode, replyTo: definition.initialNode, payload: { story, graph, task, policy: { digest, input: policy.input } } });
-			this.insertOperation(runId, definition.initialNode, task, 1, 0);
+			if (commands) {
+				for (const item of commands) this.insertOperation(runId, definition.initialNode, item.name, 1, 0, item.id, item.ownedPaths, item.command);
+			} else {
+				this.insertOperation(runId, definition.initialNode, task, 1, 0);
+			}
 			return { runId, graph, currentNode: definition.initialNode, round: 1, fixIteration: 0, status: "active" };
 		});
 	}
@@ -625,25 +816,45 @@ export class GraphStore {
 	}
 
 	registerAgent(input: AgentRegistration): string {
+		const transport = parseWorkerTransportKind(input.transport);
+		if (transport === "herdr" && (!input.herdrAgent?.trim() || !input.tabId?.trim() || !input.herdrPaneId?.trim())) throw new Error("Herdr agent registration requires agent, tab, and pane identity");
+		if (transport === "headless" && (input.herdrAgent !== undefined || input.tabId !== undefined || input.herdrPaneId !== undefined)) throw new Error("headless agent registration cannot contain Herdr identity");
+		const acpxValues = [input.acpAgent, input.acpxRecordId, input.acpxSessionId, input.acpxState, input.acpxAttemptKey, input.agentFsSessionId, input.agentFsDbPath, input.acpxCancelScript];
+		const hasAcpx = acpxValues.some((value) => value !== undefined);
+		if (hasAcpx && acpxValues.some((value) => typeof value !== "string" || !value.trim())) {
+			throw new Error("agent registration requires complete ACPX provenance");
+		}
+		if (hasAcpx) {
+			parseAcpAgent(input.acpAgent);
+			parseAcpxState(input.acpxState);
+		}
 		const id = input.id ?? `agent_${randomUUID()}`;
 		const now = this.iso();
 		this.transaction(() => {
 			this.db
-				.query(`INSERT INTO agents(id,run_id,name,node,role,transport,herdr_agent,pane_id,tab_id,policy_digest,selected_model,model_attempt,status,current_task,created_at,last_activity_at)
-					VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+				.query(`INSERT INTO agents(id,run_id,name,node,role,transport,herdr_agent,tab_id,policy_digest,selected_model,model_attempt,acp_agent,acpx_record_id,acpx_session_id,acpx_state,acpx_attempt_key,agentfs_session_id,agentfs_db_path,herdr_pane_id,acpx_cancel_script,status,current_task,created_at,last_activity_at)
+					VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 				.run(
 					id,
 					input.runId,
 					input.name,
 					input.node,
 					input.role,
-					input.transport,
+					transport,
 					input.herdrAgent ?? null,
-					input.paneId ?? null,
 					input.tabId ?? null,
 					input.policyDigest ?? null,
 					input.selectedModel ?? null,
 					input.modelAttempt ?? 0,
+					input.acpAgent ?? null,
+					input.acpxRecordId ?? null,
+					input.acpxSessionId ?? null,
+					input.acpxState ?? null,
+					input.acpxAttemptKey ?? null,
+					input.agentFsSessionId ?? null,
+					input.agentFsDbPath ?? null,
+					input.herdrPaneId ?? null,
+					input.acpxCancelScript ?? null,
 					"pending",
 					input.currentTask,
 					now,
@@ -741,9 +952,8 @@ export class GraphStore {
 
 			if (input.status === "running") {
 				if (operation.status !== "pending" && operation.status !== "running") throw new Error(`cannot run operation from ${operation.status}`);
-				if (input.transport !== "herdr" && input.transport !== "panel") {
-					throw new Error("running operation requires observable transport: herdr or panel");
-				}
+				if (input.transport === undefined) throw new Error("running operation requires worker transport");
+				parseWorkerTransportKind(input.transport);
 				this.assertDispatchPolicy(input.runId, operation, input);
 				const modelAttempt = input.modelAttempt ?? operation.model_attempt;
 				const advancedModel = modelAttempt > operation.model_attempt;
@@ -827,6 +1037,7 @@ export class GraphStore {
 					this.db
 						.query("UPDATE operations SET status='running',transient_attempts=?,classifier_reason=?,retry_reason=?,last_error=?,retry_not_before=? WHERE id=?")
 						.run(attempt, classification.reason, retryReason, input.error, notBefore, operation.id);
+					if (operation.agent_id) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
 					const policyFields = this.policyEventContext(
 						input.runId,
 						operation.node,
@@ -864,6 +1075,7 @@ export class GraphStore {
 				this.db
 					.query("UPDATE operations SET status='failed',classifier_reason=?,last_error=?,finished_at=? WHERE id=?")
 					.run(classification.reason, input.error, now, operation.id);
+				if (operation.agent_id) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
 				this.setState(input.runId, state.currentNode, state.round, state.fixIteration, "awaiting_user");
 				this.event({
 					runId: input.runId,
@@ -880,13 +1092,16 @@ export class GraphStore {
 			}
 
 			if (input.status === "blocked" || input.status === "cancelled") {
-				this.db.query("UPDATE operations SET status=?,last_error=?,finished_at=? WHERE id=?").run(
+				this.db.query("UPDATE operations SET status=?,last_error=?,report_path=?,verdict=?,finished_at=? WHERE id=?").run(
 					input.status,
 					input.error ?? null,
+					input.reportPath ?? null,
+					input.verdict?.toUpperCase() ?? null,
 					now,
 					operation.id,
 				);
 				const runStatus: RunStatus = input.status === "blocked" ? "blocked" : "cancelled";
+				if (operation.agent_id) this.db.query("UPDATE agents SET status=?,last_activity_at=? WHERE id=?").run(input.status === "blocked" ? "failed" : "cancelled", now, operation.agent_id);
 				this.setState(input.runId, state.currentNode, state.round, state.fixIteration, runStatus);
 				this.event({ runId: input.runId, type: `operation_${input.status}`, node: operation.node, operationId: operation.id, toAgent: "user", replyTo: "user" });
 				return { state: this.getState(input.runId), operation: this.getOperation(operation.id) };
@@ -947,10 +1162,21 @@ export class GraphStore {
 		});
 	}
 
+	private projectAgent(row: AgentDbRow): AgentRow {
+		const transport = parseWorkerTransportKind(row.transport);
+		const presentationIdentity = transport === "headless"
+			? headlessPresentationIdentity()
+			: row.herdr_agent && row.tab_id && row.herdr_pane_id
+				? herdrPresentationIdentity(row.herdr_agent, row.tab_id, row.herdr_pane_id)
+				: null;
+		return { ...row, transport, presentation_identity: presentationIdentity };
+	}
+
 	agents(runId?: string): AgentRow[] {
-		return runId
-			? this.db.query<AgentRow, [string]>("SELECT * FROM agents WHERE run_id=? ORDER BY created_at,id").all(runId)
-			: this.db.query<AgentRow, []>("SELECT * FROM agents ORDER BY created_at,id").all();
+		const rows = runId
+			? this.db.query<AgentDbRow, [string]>("SELECT * FROM agents WHERE run_id=? ORDER BY created_at,id").all(runId)
+			: this.db.query<AgentDbRow, []>("SELECT * FROM agents ORDER BY created_at,id").all();
+		return rows.map((row) => this.projectAgent(row));
 	}
 
 	events(runId: string, limit = 50, agent?: string): EventRow[] {

@@ -6,6 +6,7 @@ import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { requireRuntime } from "./require-runtime.ts";
 import {
 	MODEL_FAILOVER_BLOCKED,
 	MODEL_FAILOVER_RETRY,
@@ -79,6 +80,7 @@ function statusText(state: any): string {
 }
 
 export default function modelFailoverExtension(pi: any): void {
+	requireRuntime();
 	const state: any = {
 		enabled: false,
 		explicitLock: process.env.PI_FAILOVER_LOCKED === "1",

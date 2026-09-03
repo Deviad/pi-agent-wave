@@ -28,9 +28,21 @@ export const RESEARCH_GRAPH: GraphDefinition = {
 	],
 };
 
+export const OPERATIONS_GRAPH: GraphDefinition = {
+	name: "operations",
+	initialNode: "source_search",
+	nodes: [
+		{ name: "source_search", role: "searcher", fanOut: true, readOnly: false },
+		{ name: "thinker_synthesize", role: "thinker", fanOut: false, readOnly: true },
+		{ name: "audit", role: "auditor", fanOut: false, readOnly: true },
+	],
+};
+
 /** Returns the immutable graph definition stored with each run. */
 export function graphDefinition(kind: GraphKind): GraphDefinition {
-	return kind === "build" ? BUILD_GRAPH : RESEARCH_GRAPH;
+	if (kind === "build") return BUILD_GRAPH;
+	if (kind === "research") return RESEARCH_GRAPH;
+	return OPERATIONS_GRAPH;
 }
 
 function decision(
@@ -68,6 +80,25 @@ export function decideTransition(input: TransitionInput): TransitionDecision {
 				return decision(input, "terminal", "terminal", "user", "research synthesis completed");
 			default:
 				return decision(input, "blocked", input.currentNode, "user", `invalid research node ${input.currentNode}`);
+		}
+	}
+
+	if (input.graph === "operations") {
+		switch (input.currentNode) {
+			case "source_search":
+				return verdict === "DONE"
+					? decision(input, "advance", "thinker_synthesize", "thinker_synthesize", "all source searches completed")
+					: decision(input, "blocked", input.currentNode, "user", `source search verdict ${verdict ?? "missing"}`);
+			case "thinker_synthesize":
+				return verdict === "DONE"
+					? decision(input, "advance", "audit", "audit", "operational synthesis completed")
+					: decision(input, "blocked", input.currentNode, "user", `synthesis verdict ${verdict ?? "missing"}`);
+			case "audit":
+				return verdict === "PASS"
+					? decision(input, "terminal", "terminal", "user", "operational evidence audit passed")
+					: decision(input, "blocked", input.currentNode, "user", `audit verdict ${verdict ?? "missing"}`);
+			default:
+				return decision(input, "blocked", input.currentNode, "user", `invalid operations node ${input.currentNode}`);
 		}
 	}
 

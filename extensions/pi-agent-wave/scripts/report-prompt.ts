@@ -12,6 +12,7 @@ const VERDICTS: Record<NodeName, readonly string[]> = {
 	test: ["GREEN", "NOT_OK"],
 	audit: ["PASS", "FAIL"],
 	search: ["DONE"],
+	source_search: ["DONE", "BLOCKED"],
 	terminal: [],
 };
 
@@ -35,16 +36,17 @@ function example(verdict: string, verification: "verified" | "unverified" | "unv
 export function buildReportPrompt(node: NodeName, reportPath: string): string {
 	const verdicts = VERDICTS[node];
 	if (!verdicts?.length) throw new Error(`no report verdict contract for ${node}`);
-	const valid = example(verdicts[0], "verified");
-	const unverified = example(verdicts[0], "unverified");
-	const invalid = { schemaVersion: 1, verdict: verdicts[0], claims: [{ statement: "Unsupported claim", evidence: [], verification: "verified" }] };
-	const corrected = example(verdicts[0], "unverified");
+	const execution = node === "source_search" ? { execution: { argv: ["node", "/absolute/path/search.mjs", "--source", "example"], exitCode: 0, source: "example", runId: "source-run-id", checkpointPath: "/owned/run/checkpoint.json", checkpointStatus: "completed", resultsPath: "/owned/run/results.json", candidateCount: 1, sourceStatus: "completed" } } : {};
+	const valid = { ...example(verdicts[0], "verified"), ...execution };
+	const unverified = { ...example(verdicts[0], "unverified"), ...execution };
+	const invalid = { schemaVersion: 1, verdict: verdicts[0], claims: [{ statement: "Unsupported claim", evidence: [], verification: "verified" }], ...execution };
+	const corrected = { ...example(verdicts[0], "unverified"), ...execution };
 	return [
 		"Write the assigned report as JSON only. Do not use Markdown, prose outside JSON, or code fences.",
 		`Write exactly one JSON object to: ${reportPath}`,
 		"The report file is the sole verdict source and must use schemaVersion 1.",
 		`Allowed verdicts for ${node}: ${verdicts.join(", ")}.`,
-		"Required shape: {schemaVersion:1, verdict:string, claims:[{statement:string, evidence:[{kind:command|file|output|inference, source:string, detail:string}], verification:verified|unverified|unverified-recall}]}",
+		`Required shape: {schemaVersion:1, verdict:string, claims:[{statement:string, evidence:[{kind:command|file|output|inference, source:string, detail:string}], verification:verified|unverified|unverified-recall}]${node === "source_search" ? ", execution:{argv:string[],exitCode:number,source:string,runId:string,checkpointPath:string,checkpointStatus:string,resultsPath?:string,candidateCount:number,sourceStatus:string,blocker?:string,resumeArgv?:string[]}" : ""}}`,
 		"Every string and array must be non-empty. Mark memory or inference as unverified or unverified-recall; never upgrade it to verified without direct evidence.",
 		"Valid verified example:",
 		JSON.stringify(valid, null, 2),

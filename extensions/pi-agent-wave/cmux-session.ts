@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { requireRuntime } from "./require-runtime.ts";
 
 function firstString(...values: unknown[]): string | null {
   for (const value of values) {
@@ -141,6 +142,7 @@ function sendHook(subcommand: string, ctx: ExtensionContext, extra: Record<strin
 }
 
 export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
+  requireRuntime();
   pi.on("session_start", async (_event, ctx) => {
     sendHook("session-start", ctx);
   });

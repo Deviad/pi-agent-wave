@@ -8,7 +8,7 @@ export const OPERATION_STATUSES = [
 ] as const;
 
 export type OperationStatus = (typeof OPERATION_STATUSES)[number];
-export type GraphKind = "build" | "research";
+export type GraphKind = "build" | "research" | "operations";
 
 /** Friendly human-readable presets that map to concrete tiers in the shared resolver. */
 export type PolicyPreset = "cheap" | "balanced" | "strong" | "local" | "long-context";
@@ -59,8 +59,24 @@ export type NodeName =
 	| "audit"
 	| "thinker_split"
 	| "search"
+	| "source_search"
 	| "thinker_synthesize"
 	| "terminal";
+
+/** Exact process boundary for an operational worker; never render this as interpolated shell text. */
+export interface OperationalCommand {
+	executable: string;
+	args: string[];
+	cwd: string;
+}
+
+/** One independently owned command dispatched by an operational-search graph. */
+export interface OperationalCommandSpec {
+	id: string;
+	name: string;
+	command: OperationalCommand;
+	ownedPaths: string[];
+}
 
 export interface SliceSpec {
 	id: string;
@@ -141,6 +157,7 @@ export interface OperationRow {
 	transient_attempts: number;
 	model_attempt: number;
 	selected_model: string | null;
+	command_json: string | null;
 	task: string;
 	report_path: string | null;
 	verdict: string | null;

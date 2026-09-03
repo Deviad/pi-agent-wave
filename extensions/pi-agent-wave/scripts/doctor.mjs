@@ -37,6 +37,15 @@ function runNode(args, env = {}) {
 	return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
+function runExternal(command, args) {
+	const result = spawnSync(command, args, { encoding: "utf8", env: process.env, shell: false });
+	return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "", error: result.error };
+}
+
+function observedVersion(result) {
+	return `${result.stdout}${result.stderr}`.match(/\d+\.\d+\.\d+/)?.[0] ?? "unknown";
+}
+
 export function runDoctor(argv = process.argv.slice(2)) {
 	const args = parseArgs(argv);
 	const agentDir = resolveAgentDir(args.agentDir);
@@ -44,6 +53,46 @@ export function runDoctor(argv = process.argv.slice(2)) {
 	const modelsPath = resolveCatalogPath(agentDir, args.models);
 	const fzfPath = resolveFzfPath(agentDir);
 	const checks = [];
+
+	// Optional Herdr presentation capability
+	const herdr = runExternal("herdr", ["--version"]);
+	const herdrIdentityComplete = process.env.HERDR_ENV === "1" && !!process.env.HERDR_WORKSPACE_ID?.trim() && !!process.env.HERDR_TAB_ID?.trim();
+	if (herdr.error || herdr.status !== 0) checks.push(check("herdr-presentation", "warn", "optional Herdr presentation is unavailable; headless transport remains available"));
+	else if (herdrIdentityComplete) checks.push(check("herdr-presentation", "ok", "optional Herdr presentation is active"));
+	else checks.push(check("herdr-presentation", "warn", "optional Herdr presentation is installed but inactive; headless transport remains available"));
+
+	// Mandatory external execution and sandbox runtimes
+	const acpx = runExternal("acpx", ["--version"]);
+	if (acpx.error || acpx.status !== 0) checks.push(check("acpx-executable", "fail", "acpx is unavailable"));
+	else {
+		const version = observedVersion(acpx);
+		checks.push(check("acpx-executable", "ok", "acpx"));
+		checks.push(version === "0.13.2" ? check("acpx-version", "ok", version) : check("acpx-version", "fail", `expected 0.13.2, found ${version}`));
+		for (const agent of ["pi", "codex", "claude"]) {
+			const probe = runExternal("acpx", [agent, "--help"]);
+			checks.push(probe.status === 0 ? check(`acpx-${agent}-adapter`, "ok", `${agent} registered`) : check(`acpx-${agent}-adapter`, "fail", `${agent} adapter unavailable`));
+		}
+		try {
+			const tokenPath = process.env.PI_CLAUDE_OAUTH_TOKEN_FILE;
+			if (!tokenPath) throw new Error("missing");
+			const metadata = statSync(tokenPath);
+			const token = readFileSync(tokenPath, "utf8").trim();
+			checks.push(metadata.isFile() && (metadata.mode & 0o077) === 0 && token.startsWith("sk-ant-oat")
+				? check("claude-setup-token", "ok", "mode-600 token file is ready")
+				: check("claude-setup-token", "warn", "token file is invalid or not private"));
+		} catch {
+			checks.push(check("claude-setup-token", "warn", "PI_CLAUDE_OAUTH_TOKEN_FILE is not configured"));
+		}
+	}
+	const agentfs = runExternal("agentfs", ["--version"]);
+	if (agentfs.error || agentfs.status !== 0) checks.push(check("agentfs-executable", "fail", "agentfs is unavailable"));
+	else {
+		const version = observedVersion(agentfs);
+		checks.push(check("agentfs-executable", "ok", "agentfs"));
+		checks.push(version === "0.6.4" ? check("agentfs-version", "ok", version) : check("agentfs-version", "fail", `expected 0.6.4, found ${version}`));
+		const sandbox = runExternal("agentfs", ["run", "--help"]);
+		checks.push(["darwin", "linux"].includes(process.platform) && sandbox.status === 0 ? check("agentfs-platform-sandbox", "ok", process.platform) : check("agentfs-platform-sandbox", "fail", `unsupported or unavailable on ${process.platform}`));
+	}
 
 	// Agent-directory resolution
 	if (!existsSync(agentDir)) checks.push(check("agent-dir", "fail", `agent directory '${agentDir}' does not exist`));

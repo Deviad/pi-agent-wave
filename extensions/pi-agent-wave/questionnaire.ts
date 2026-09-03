@@ -5,7 +5,7 @@
  * Multiple questions: tab bar navigation between questions
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	Editor,
 	type EditorTheme,
@@ -16,6 +16,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { requireRuntime } from "./require-runtime.ts";
 
 // Types
 interface QuestionOption {
@@ -81,7 +82,112 @@ function errorResult(
 	};
 }
 
+// Human-readable rendering of the awaiting-user state for non-TUI clients (ACP/RPC,
+// e.g. IntelliJ via pi-acp). Only content[].text reaches those clients, so we must
+// not dump raw JSON there; the structured state stays in the result details.
+// Choices render as a Markdown table numbered so the user can reply with a number
+// (or letter+number when several questions are asked at once).
+function mdCell(text: string): string {
+	return text.replace(/\|/g, "\\|");
+}
+
+function letterFor(index: number): string {
+	return String.fromCharCode(65 + (index % 26));
+}
+
+function renderQuestionBlock(q: Question, prefix: string): string {
+	const title = prefix ? `**${prefix} · ${q.label}** — ${q.prompt}` : `**${q.label}** — ${q.prompt}`;
+	const rows = ["| # | Choice | Description |", "|---|--------|-------------|"];
+	q.options.forEach((option, i) => {
+		rows.push(`| ${i + 1} | ${mdCell(option.label)} | ${mdCell(option.description ?? "")} |`);
+	});
+	if (q.allowOther) rows.push(`| ${q.options.length + 1} | Other | Type your own answer |`);
+	return `${title}\n\n${rows.join("\n")}`;
+}
+
+function renderAwaitingUser(questions: Question[]): string {
+	const multi = questions.length > 1;
+	const heading = multi
+		? `Awaiting your input — answer the ${questions.length} questions below, then the task resumes.`
+		: "Awaiting your input — answer the question below, then the task resumes.";
+	const instruction = multi
+		? "Reply with one number per question, prefixed by its letter — e.g. `A2, B1` — or type your own answer."
+		: "Reply with the number of your choice, or type your own answer.";
+	const blocks: string[] = [heading, instruction];
+	questions.forEach((q, i) => blocks.push(renderQuestionBlock(q, multi ? letterFor(i) : "")));
+	return blocks.join("\n\n");
+}
+
+// Native ACP picker: present clickable options through ctx.ui.select, which pi-acp
+// renders as a requestPermission dialog, block until the user picks, and hand the
+// answers straight back to the model. Prefer this over returning the questions as
+// text, which non-TUI clients show only as a collapsed tool result that the model
+// then narrates over. Free-form "other" input is unavailable in ACP (input dialogs
+// are cancelled), so a custom answer must be typed in chat instead. A click in the
+// dialog is otherwise final, so each picker appends explicit Back / Cancel options,
+// and the answers are only sent back after an explicit Submit confirmation.
+const ACP_BACK_LABEL = "\u2190 Back";
+const ACP_CANCEL_LABEL = "\u2715 Cancel questionnaire";
+const ACP_SUBMIT_LABEL = "\u2713 Submit answers";
+
+async function runAcpPicker(
+	questions: Question[],
+	ctx: ExtensionContext,
+): Promise<{ content: { type: "text"; text: string }[]; details: QuestionnaireResult }> {
+	const answers: (Answer | undefined)[] = new Array(questions.length).fill(undefined);
+	const answered = (): Answer[] => answers.filter((a): a is Answer => a !== undefined);
+	const cancelled = (): { content: { type: "text"; text: string }[]; details: QuestionnaireResult } => ({
+		content: [{ type: "text", text: "Questionnaire cancelled." }],
+		details: { questions, answers: answered(), cancelled: true },
+	});
+	let i = 0;
+	for (;;) {
+		while (i < questions.length) {
+			const q = questions[i];
+			const labels = q.options.map((o) => o.label);
+			const choices = [...labels];
+			if (i > 0) choices.push(ACP_BACK_LABEL);
+			choices.push(ACP_CANCEL_LABEL);
+			const picked = await ctx.ui.select(q.prompt || q.label, choices);
+			if (picked === undefined || picked === ACP_CANCEL_LABEL) return cancelled();
+			if (picked === ACP_BACK_LABEL) {
+				i--;
+				continue;
+			}
+			const index = labels.indexOf(picked);
+			const option = index >= 0 ? q.options[index] : undefined;
+			answers[i] = { id: q.id, value: option?.value ?? picked, label: picked, wasCustom: false, index };
+			i++;
+		}
+		// Every question answered: require an explicit Submit before the answers are sent back.
+		const confirm = await ctx.ui.select(`Review your answers:\n\n${renderAnswerLines(answered())}`, [
+			ACP_SUBMIT_LABEL,
+			ACP_BACK_LABEL,
+			ACP_CANCEL_LABEL,
+		]);
+		if (confirm === ACP_SUBMIT_LABEL) {
+			return {
+				content: [{ type: "text", text: renderAnswerSummary(answered()) }],
+				details: { questions, answers: answered(), cancelled: false },
+			};
+		}
+		if (confirm === undefined || confirm === ACP_CANCEL_LABEL) return cancelled();
+		// Back from the review: return to the last question so answers can be changed.
+		i = Math.max(0, questions.length - 1);
+	}
+}
+
+function renderAnswerLines(answers: Answer[]): string {
+	return answers.map((a) => `- ${a.id}: ${a.value} (${a.label})`).join("\n");
+}
+
+function renderAnswerSummary(answers: Answer[]): string {
+	if (answers.length === 0) return "Questionnaire completed with no answers.";
+	return `User answered:\n${renderAnswerLines(answers)}`;
+}
+
 export default function questionnaire(pi: ExtensionAPI) {
+	requireRuntime();
 	pi.registerTool({
 		name: "questionnaire",
 		label: "Questionnaire",
@@ -90,9 +196,6 @@ export default function questionnaire(pi: ExtensionAPI) {
 		parameters: QuestionnaireParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (ctx.mode !== "tui") {
-				return errorResult("Error: UI not available (running in non-interactive mode)");
-			}
 			if (params.questions.length === 0) {
 				return errorResult("Error: No questions provided");
 			}
@@ -103,6 +206,13 @@ export default function questionnaire(pi: ExtensionAPI) {
 				label: q.label || `Q${i + 1}`,
 				allowOther: q.allowOther !== false,
 			}));
+			if (ctx.mode !== "tui") {
+				if (ctx.hasUI) {
+					return runAcpPicker(questions, ctx);
+				}
+				const awaiting = { status: "awaiting_user" as const, questions };
+				return { content: [{ type: "text" as const, text: renderAwaitingUser(questions) }], details: awaiting };
+			}
 
 			const isMulti = questions.length > 1;
 			const totalTabs = questions.length + 1; // questions + Submit
