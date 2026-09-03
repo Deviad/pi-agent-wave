@@ -12,6 +12,61 @@ pi-agent-wave adds reliable multi-agent orchestration to Pi. JetBrains Air can l
 
 pi-agent-wave provides `/delegate`, `/graph`, the `delegate_graph` tool, ACP-safe structured questions, session metadata hooks, and model failover.
 
+## How it works
+
+A **supervisor** (Pi running the `delegate_graph` tool) coordinates a run. It does not do the work itself: it pulls the next pending operation from a shared **GraphStore**, dispatches one **worker** for it, and verifies the result before the graph advances. **Workers never talk to each other directly** — every hand-off flows through the supervisor and the GraphStore event ledger.
+
+Each worker is one ACPX agent — Pi, Codex, or Claude — chosen by the run's frozen policy for that role, and it runs in its own AgentFS copy-on-write sandbox. The worker writes a private JSON report; the supervisor collects it and checks that report, process state, ACPX state, graph state, cleanup, and ledger evidence all agree before settling the operation.
+
+```mermaid
+flowchart TB
+    user["User / ACP client<br/>Air · IntelliJ · terminal"]
+
+    subgraph SUP["Supervisor: Pi running delegate_graph"]
+        next["op=next<br/>pending operation + frozen route"]
+        dispatch["op=dispatch<br/>launch one worker"]
+        collect["op=collect<br/>verify settlement evidence"]
+    end
+
+    ledger[("GraphStore<br/>run state + event ledger")]
+
+    subgraph WORK["Workers: one ACPX agent per role (Pi · Codex · Claude)"]
+        thinker["thinker<br/>plan · split · synthesize"]
+        impl["implementer<br/>write code"]
+        rev["reviewer<br/>PASS / FAIL"]
+        test["tester<br/>GREEN / NOT_OK"]
+        aud["auditor<br/>evidence PASS"]
+        search["searcher<br/>source search"]
+    end
+
+    fs["AgentFS sandbox<br/>copy-on-write, one per attempt"]
+    report["private JSON report + settlement evidence"]
+
+    user --> SUP
+    SUP <--> ledger
+    dispatch -->|"task + frozen route"| WORK
+    WORK -.->|"runs inside"| fs
+    WORK -->|"writes"| report
+    report --> collect
+    collect -->|"verdict + evidence"| ledger
+    ledger -.->|"next operation"| next
+```
+
+In the **build** graph the supervisor walks the roles in order, with review and test able to loop back to implementation:
+
+```mermaid
+flowchart LR
+    P["thinker_plan"] --> IM["implement"]
+    IM --> RV["review"]
+    RV -->|"PASS"| TS["test"]
+    RV -->|"FAIL — up to 2 fix iterations"| IM
+    TS -->|"GREEN"| AU["audit"]
+    TS -->|"NOT_OK — up to 3 rounds"| IM
+    AU -->|"PASS"| DONE(["terminal"])
+```
+
+The **research** graph is `thinker_split → search (fan-out) → thinker_synthesize`, and the **operations** graph is `source_search (fan-out) → thinker_synthesize → audit`; each ends at a terminal node once its final audit passes.
+
 ## Requirements
 
 - Pi `0.84.1` or `0.84.2`.
