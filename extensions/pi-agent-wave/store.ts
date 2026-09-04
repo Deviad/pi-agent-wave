@@ -476,6 +476,21 @@ export class GraphStore {
 	private migrateToV5(): void {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
+			// Retired pre-v5 labels named visible Herdr workers. A complete triple identifies a real Herdr worker and is
+			// kept as one; a row with no Herdr and no ACPX identity columns becomes a Herdr row with an incomplete
+			// triple, which projects a null presentation identity — readable history, never focusable or reusable.
+			// Any other retired-labelled row carries a partial identity and still fails closed below.
+			this.db.exec(`
+				UPDATE agents SET transport='herdr'
+				WHERE transport IN ('delegate','opaque-delegate')
+					AND (
+						(herdr_agent IS NOT NULL AND tab_id IS NOT NULL AND herdr_pane_id IS NOT NULL)
+						OR (herdr_agent IS NULL AND tab_id IS NULL AND herdr_pane_id IS NULL
+							AND acp_agent IS NULL AND acpx_record_id IS NULL AND acpx_session_id IS NULL
+							AND acpx_state IS NULL AND acpx_attempt_key IS NULL AND agentfs_session_id IS NULL
+							AND agentfs_db_path IS NULL AND acpx_cancel_script IS NULL)
+					)
+			`);
 			const invalid = this.db.query<CountRow, []>(`
 				SELECT COUNT(*) AS count FROM agents WHERE
 					transport NOT IN ('headless','herdr')
