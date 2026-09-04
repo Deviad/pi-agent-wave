@@ -133,6 +133,99 @@ describe("GraphStore transport-aware provenance schema v5", () => {
 		db.close();
 	});
 
+	for (const retiredTransport of ["delegate", "opaque-delegate"]) {
+		test(`normalizes retired ${retiredTransport} transport vocabulary into a readable legacy Herdr row`, () => {
+			const { dbPath, store } = fixture();
+			const state = store.initRun(`retired-${retiredTransport}`, "build", "Plan");
+			const operation = store.next(state.runId).operations[0];
+			assert.ok(operation);
+			const agentId = store.registerAgent({ runId: state.runId, name: "retired-agent", node: operation.node, role: "thinker", transport: "herdr", herdrAgent: "retired-herdr", tabId: "retired-tab", herdrPaneId: "retired-pane", currentTask: operation.task });
+			store.close();
+			const seeded = new Database(dbPath);
+			seeded.exec("DROP TRIGGER agents_acpx_identity_insert; DROP TRIGGER agents_acpx_identity_update");
+			seeded.query("UPDATE agents SET transport=?, herdr_agent=NULL, tab_id=NULL, herdr_pane_id=NULL WHERE id=?").run(retiredTransport, agentId);
+			seeded.exec(`DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES (4)`);
+			const before = seeded.query<{ transport: string }, []>("SELECT transport FROM agents WHERE id=?").get(agentId);
+			const expected = legacyTableSnapshot(seeded, "agents").rows.map((row) => ({ ...row, transport: "<retired>" }));
+			seeded.close();
+			assert.equal(before?.transport, retiredTransport);
+
+			const migrated = new GraphStore({ dbPath });
+			const agent = migrated.agents(state.runId)[0];
+			assert.equal(agent?.transport, "herdr");
+			assert.equal(agent?.presentation_identity, null);
+			assert.equal(agent?.name, "retired-agent");
+			migrated.close();
+
+			const db = new Database(dbPath, { readonly: true });
+			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 5);
+			const after = db.query<Record<string, unknown>, []>("SELECT * FROM agents ORDER BY rowid").all().map((row) => ({ ...row, transport: "<retired>" }));
+			assert.deepEqual(after, expected, `retired ${retiredTransport} row lost data during migration`);
+			assert.equal(db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM agents").get()?.count, 1);
+			assert.equal(db.query("PRAGMA foreign_key_check").get(), undefined);
+			db.close();
+
+			const reopened = new GraphStore({ dbPath });
+			assert.equal(reopened.agents(state.runId)[0]?.transport, "herdr");
+			reopened.close();
+		});
+	}
+
+	test("keeps a complete Herdr identity when reclassifying a retired transport label", () => {
+		const { dbPath, store } = fixture();
+		const state = store.initRun("retired-complete-triple", "build", "Plan");
+		const operation = store.next(state.runId).operations[0];
+		assert.ok(operation);
+		const agentId = store.registerAgent({ runId: state.runId, name: "visible-worker", node: operation.node, role: "thinker", transport: "herdr", herdrAgent: "agent", tabId: "tab", herdrPaneId: "pane-1", currentTask: operation.task });
+		store.close();
+		const seeded = new Database(dbPath);
+		seeded.exec("DROP TRIGGER agents_acpx_identity_insert; DROP TRIGGER agents_acpx_identity_update");
+		seeded.query("UPDATE agents SET transport='opaque-delegate' WHERE id=?").run(agentId);
+		seeded.exec("DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES (4)");
+		seeded.close();
+
+		const migrated = new GraphStore({ dbPath });
+		assert.deepEqual(migrated.agents(state.runId)[0]?.presentation_identity, { kind: "herdr", agent: "agent", tabId: "tab", paneId: "pane-1" });
+		migrated.close();
+	});
+
+	test("keeps failing closed when retired vocabulary hides partial ACPX provenance", () => {
+		const { dbPath, store } = fixture();
+		const state = store.initRun("retired-partial-acpx", "build", "Plan");
+		const operation = store.next(state.runId).operations[0];
+		assert.ok(operation);
+		const agentId = store.registerAgent({
+			runId: state.runId,
+			name: "corrupt",
+			node: operation.node,
+			role: "thinker",
+			transport: "herdr",
+			herdrAgent: "agent",
+			tabId: "tab",
+			currentTask: operation.task,
+			acpAgent: "pi",
+			acpxRecordId: "record-1",
+			acpxSessionId: "session-1",
+			acpxState: "alive",
+			acpxAttemptKey: "run:op:0:0",
+			agentFsSessionId: "agentfs-attempt-1",
+			agentFsDbPath: "/tmp/attempt-1/delta.db",
+			herdrPaneId: "pane-1",
+			acpxCancelScript: "/tmp/cancel-1.sh",
+		});
+		store.close();
+		const seeded = new Database(dbPath);
+		seeded.exec("DROP TRIGGER agents_acpx_identity_insert; DROP TRIGGER agents_acpx_identity_update");
+		seeded.query("UPDATE agents SET transport='delegate', herdr_pane_id=NULL WHERE id=?").run(agentId);
+		seeded.exec("DELETE FROM schema_version; INSERT INTO schema_version(version) VALUES (4)");
+		seeded.close();
+		assert.throws(() => new GraphStore({ dbPath }), /agents table contains invalid transport presentation identity/);
+		const db = new Database(dbPath, { readonly: true });
+		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 4);
+		assert.equal(db.query<{ transport: string }, []>("SELECT transport FROM agents WHERE id=?").get(agentId)?.transport, "delegate");
+		db.close();
+	});
+
 	test("rejects inconsistent partial identity already persisted at the database boundary", () => {
 		const { dbPath, store } = fixture();
 		const state = store.initRun("partial-persisted", "build", "Plan");
