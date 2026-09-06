@@ -55,14 +55,15 @@ describe("headless Pi ACP stdio lifecycle", () => {
 			"import delegate_core",
 			"root = Path(tempfile.mkdtemp())",
 			"real_home = root / 'home'; (real_home / '.pi' / 'agent').mkdir(parents=True)",
-			"(real_home / '.pi' / 'agent' / 'auth.json').write_text('{}')",
+			"(real_home / '.pi' / 'agent' / 'auth.json').write_text(json.dumps({'anthropic': {'type': 'oauth', 'access': 'a', 'refresh': 'r', 'expires': 1}}))",
 			"(real_home / '.pi' / 'agent' / 'settings.json').write_text(json.dumps({'defaultProvider': 'anthropic', 'defaultModel': 'claude-fable-5', 'defaultThinkingLevel': 'high', 'compaction': {'enabled': True}, 'retry': {'enabled': True}, 'packages': ['npm:x', '/abs/pi-agent-wave'], 'theme': 'dark', 'voice': {'enabled': True}}))",
 			"attempt = root / 'attempt'; attempt.mkdir()",
 			"acpx_home = root / 'acpx-home'; acpx_home.mkdir()",
-			"env, links = delegate_core.provider_runtime_environment(attempt, acpx_home, real_home)",
+			"class Fake: returncode = 0; stdout = json.dumps({'status': 'ready', 'provider': 'anthropic', 'authType': 'oauth'}); stderr = ''",
+			"env, links = delegate_core.provider_runtime_environment(attempt, acpx_home, real_home, 'anthropic/claude-fable-5', command_runner=lambda argv: Fake())",
 			"worker = attempt / 'providers' / 'pi-agent' / 'settings.json'",
 			"parsed = json.loads(worker.read_text())",
-			"print(json.dumps({'isSymlink': worker.is_symlink(), 'mode': oct(worker.stat().st_mode & 0o777), 'settings': parsed, 'inLinks': any(item['link'] == str(worker) for item in links), 'authLinked': (attempt / 'providers' / 'pi-agent' / 'auth.json').is_symlink()}))",
+			"print(json.dumps({'isSymlink': worker.is_symlink(), 'mode': oct(worker.stat().st_mode & 0o777), 'settings': parsed, 'inLinks': any(item['link'] == str(worker) for item in links), 'authLinked': (attempt / 'providers' / 'pi-agent' / 'auth.json').is_symlink(), 'authIsFile': (attempt / 'providers' / 'pi-agent' / 'auth.json').is_file(), 'authProviders': sorted(json.loads((attempt / 'providers' / 'pi-agent' / 'auth.json').read_text()).keys())}))",
 		].join("\n");
 		const run = spawnSync("python3", ["-c", script], { cwd: process.cwd(), encoding: "utf8", timeout: 30_000 });
 		assert.equal(run.status, 0, run.stderr);
@@ -70,7 +71,9 @@ describe("headless Pi ACP stdio lifecycle", () => {
 		assert.equal(result.isSymlink, false);
 		assert.equal(result.mode, "0o600");
 		assert.equal(result.inLinks, false);
-		assert.equal(result.authLinked, true);
+		assert.equal(result.authLinked, false, "the live credential file must never be linked into an attempt");
+		assert.equal(result.authIsFile, true);
+		assert.deepEqual(result.authProviders, ["anthropic"]);
 		assert.deepEqual(result.settings, { compaction: { enabled: true }, defaultModel: "claude-fable-5", defaultProvider: "anthropic", defaultThinkingLevel: "high", packages: [], retry: { enabled: true } });
 	});
 

@@ -22,6 +22,10 @@ const TRANSIENT_PATTERNS: Array<[RegExp, string]> = [
 	[/ETIMEDOUT|timed? out/i, "timeout"],
 	[/ECONNRESET|connection reset/i, "connection-reset"],
 	[/connection[- ]closed/i, "connection-closed"],
+	[/\bACPX worker failed\b|terminal[= ]failed|QUEUE_RUNTIME_PROMPT_FAILED/i, "worker-runtime-failure"],
+	[/provider credential target changed/i, "provider-link-churn"],
+	[/\breport-missing\b|without authoring its report/i, "worker-report-missing"],
+	[/worker preflight|no usable credential/i, "worker-credential-preflight"],
 ];
 
 /** Classifies infrastructure-shaped failures without treating semantic verdicts as retryable. */

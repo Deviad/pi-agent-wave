@@ -141,9 +141,16 @@ def read_state(run_dir: Path) -> dict[str, Any]:
     return json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
 
 
+def write_private_bytes(path: Path, data: bytes) -> None:
+    """Create the file already holding mode 600: O_CREAT mode is umask-masked, so it can never be wider."""
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+    os.chmod(path, 0o600)
+
+
 def write_private(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
-    path.chmod(0o600)
+    write_private_bytes(path, content.encode("utf-8"))
 
 
 def write_state(run_dir: Path, state: dict[str, Any]) -> None:
@@ -441,7 +448,137 @@ def worker_pi_settings(real_home: Path) -> dict[str, Any]:
     return settings
 
 
-def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: Path) -> tuple[dict[str, str], list[dict[str, str]]]:
+def provider_from_model(model: str) -> str:
+    """Provider prefix of a frozen `provider/model` identifier."""
+    return str(model or "").split("/", 1)[0]
+
+
+def provider_preflight_environment(real_home: Path) -> dict[str, str]:
+    """Environment for credential preflight: the real home and its agent dir, never the caller's exports."""
+    return {**os.environ, "HOME": str(real_home), "PI_CODING_AGENT_DIR": str(real_home / ".pi" / "agent")}
+
+
+def agent_for_model(model: str) -> str:
+    """Mirror of selectAcpAgent() in lib/acpx-select.ts; a parity test keeps the two in step."""
+    if str(model).startswith("openai-codex/"):
+        return "codex"
+    if str(model).startswith("claude-code/"):
+        return "claude"
+    return "pi"
+
+
+def preflight_agent_credentials(agent: str, provider: str, model: str, real_home: Path, command_runner: Any = run) -> str:
+    """Check the credential store the executing agent actually reads; structural and offline by design.
+
+    A live probe would cost a model call per dispatch (a one-line `codex exec` consumed ~17k tokens), so
+    revoked-but-unexpired tokens are left to the runtime guards: they surface as a transient
+    worker-runtime failure and the frozen chain advances.
+    """
+    if agent == "codex":
+        codex_home = Path(os.environ.get("CODEX_HOME") or (real_home / ".codex"))
+        auth = codex_home / "auth.json"
+        remedy = "codex logout && codex login"
+        if not auth.is_file():
+            raise DelegateError(f'worker preflight: codex agent has no credential for {model} (missing {auth}); run: {remedy}')
+        try:
+            payload = json.loads(auth.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise DelegateError(f'worker preflight: codex agent credential is unreadable for {model} ({auth}: {error}); run: {remedy}') from error
+        if not isinstance(payload, dict):
+            raise DelegateError(f'worker preflight: codex agent credential is not an object for {model} ({auth}); run: {remedy}')
+        if payload.get("OPENAI_API_KEY"):
+            return "api_key"
+        tokens = payload.get("tokens")
+        if isinstance(tokens, dict) and tokens.get("access_token"):
+            return str(payload.get("auth_mode") or "chatgpt")
+        raise DelegateError(f'worker preflight: codex agent credential for {model} has neither OPENAI_API_KEY nor tokens.access_token ({auth}); run: {remedy}')
+    if agent == "claude":
+        token_file = os.environ.get("PI_CLAUDE_OAUTH_TOKEN_FILE")
+        if token_file:
+            source = Path(token_file)
+            if source.is_file() and not source.stat().st_mode & 0o077:
+                return "token-file"
+            raise DelegateError(f'worker preflight: claude agent credential for {model} is not a mode-600 regular file ({source}); run: claude setup-token')
+        credentials = real_home / ".claude" / ".credentials.json"
+        if credentials.is_file():
+            return "credentials-file"
+        raise DelegateError(
+            f'worker preflight: claude agent has no credential for {model}; set PI_CLAUDE_OAUTH_TOKEN_FILE to a mode-600 token file or sign in so {credentials} exists'
+        )
+    auth_type, _reason = preflight_provider_credential(provider, model, real_home, command_runner=command_runner)
+    return auth_type
+
+
+def preflight_provider_credential(provider: str, model: str, real_home: Path, command_runner: Any = run) -> tuple[str, str | None]:
+    """Ask Pi whether the provider reports ready. Non-blocking: a usable credential overrides the answer."""
+    argv = ["pi", "auth", "check", "--provider", provider, "--json", "--no-refresh"]
+    try:
+        result = command_runner(argv, check=False, env=provider_preflight_environment(real_home))
+    except Exception as error:
+        return "unknown", f"check-unavailable: {error}"
+    try:
+        payload = json.loads(str(result.stdout or ""))
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    status = payload.get("status")
+    if result.returncode == 0 and status == "ready":
+        return str(payload.get("authType") or "unknown"), None
+    reason = str(payload.get("reason") or f"status={status if status is not None else 'unparseable'} exit={result.returncode}")
+    return str(payload.get("authType") or "unknown"), reason
+
+
+def materialize_pi_credentials(pi_agent_dir: Path, real_home: Path, provider: str, model: str, command_runner: Any = run) -> dict[str, str]:
+    """Write an attempt-private mode-600 auth.json for one provider; never link or rewrite the live store."""
+    auth_type, check_reason = preflight_provider_credential(provider, model, real_home, command_runner=command_runner)
+    live = real_home / ".pi" / "agent" / "auth.json"
+    entry: Any = None
+    if live.exists():
+        try:
+            stored = json.loads(live.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise DelegateError(f'worker preflight: provider "{provider}" has no usable credential for {model} (live-auth-unreadable: {error})') from error
+        if isinstance(stored, dict) and isinstance(stored.get(provider), dict):
+            entry = stored[provider]
+    if entry is None:
+        resolved = command_runner(["pi", "auth", "print-api-key", "--provider", provider], check=False, env=provider_preflight_environment(real_home))
+        value = str(resolved.stdout or "").strip()
+        if resolved.returncode != 0 or not value:
+            detail = f"check={check_reason or 'not-ready'}" if check_reason else f"check=ready({auth_type})"
+            raise DelegateError(f'worker preflight: provider "{provider}" has no usable credential for {model} ({detail}; print-api-key exit={resolved.returncode} {(resolved.stderr or "").strip()[:120]})')
+        entry = {"type": "api_key", "key": value}
+    destination = pi_agent_dir / "auth.json"
+    return materialize_credential_file(destination, json.dumps({provider: entry}, indent=2, sort_keys=True) + "\n")
+
+
+def materialize_credential_file(destination: Path, content: str) -> dict[str, str]:
+    """Write one agent credential as a private regular file and record the invariant that must survive a refresh."""
+    data = content.encode("utf-8")
+    write_private_bytes(destination, data)
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+        key_set = json.dumps(sorted(parsed.keys())) if isinstance(parsed, dict) else "unparseable"
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        key_set = "unparseable"
+    return {
+        "kind": "file",
+        "link": str(destination),
+        "keySet": key_set,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "mode": oct(destination.stat().st_mode & 0o777),
+    }
+
+
+def copy_credential_file(source: Path, destination: Path) -> dict[str, str]:
+    """Copy a live agent credential into the attempt so a refresh cannot write through to the live store."""
+    return materialize_credential_file(destination, source.read_text(encoding="utf-8"))
+
+
+def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: Path, selected_model: str = "", command_runner: Any = run) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Build the attempt-private provider view: read-only links plus one materialized Pi credential."""
+    if not selected_model:
+        raise DelegateError("provider runtime environment requires the frozen selected model")
     providers = attempt_dir / "providers"
     pi_agent_dir = providers / "pi-agent"
     codex_home = providers / "codex"
@@ -449,21 +586,31 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
     pi_agent_dir.mkdir(parents=True, mode=0o700)
     codex_home.mkdir(parents=True, mode=0o700)
     claude_home.mkdir(parents=True, mode=0o700)
+    agent = agent_for_model(selected_model)
+    provider = provider_from_model(selected_model)
+    preflight_agent_credentials(agent, provider, selected_model, real_home, command_runner=command_runner)
     links: list[dict[str, str]] = []
+    if agent == "pi":
+        links.append(materialize_pi_credentials(pi_agent_dir, real_home, provider, selected_model, command_runner=command_runner))
+    elif agent == "codex":
+        codex_auth = Path(os.environ.get("CODEX_HOME") or (real_home / ".codex")) / "auth.json"
+        links.append(copy_credential_file(codex_auth, codex_home / "auth.json"))
+    else:
+        claude_credentials = real_home / ".claude" / ".credentials.json"
+        if claude_credentials.is_file():
+            links.append(copy_credential_file(claude_credentials, claude_home / ".credentials.json"))
     for source, destination in (
-        (real_home / ".pi" / "agent" / "auth.json", pi_agent_dir / "auth.json"),
         (real_home / ".pi" / "agent" / "models.json", pi_agent_dir / "models.json"),
         (real_home / ".pi" / "agent" / "models-store.json", pi_agent_dir / "models-store.json"),
         (real_home / ".pi" / "agent" / "model-routing.jsonc", pi_agent_dir / "model-routing.jsonc"),
-        (real_home / ".codex" / "auth.json", codex_home / "auth.json"),
         (real_home / ".codex" / "config.toml", codex_home / "config.toml"),
         (real_home / ".claude.json", acpx_home / ".claude.json"),
-        (real_home / ".claude" / ".credentials.json", claude_home / ".credentials.json"),
         (real_home / ".claude" / "settings.json", claude_home / "settings.json"),
     ):
         if source.exists():
             destination.symlink_to(source)
             links.append({
+                "kind": "symlink",
                 "link": str(destination),
                 "target": str(source),
                 "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -478,6 +625,7 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
         claude_token_link = claude_home / "setup-token"
         claude_token_link.symlink_to(source)
         links.append({
+            "kind": "symlink",
             "link": str(claude_token_link),
             "target": str(source),
             "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -529,7 +677,7 @@ def prepare_acpx_attempt(
     agentfs_home = attempt_dir / "agentfs-home"
     acpx_home.mkdir(mode=0o700)
     agentfs_home.mkdir(mode=0o700)
-    provider_environment, provider_links = provider_runtime_environment(attempt_dir, acpx_home, real_home)
+    provider_environment, provider_links = provider_runtime_environment(attempt_dir, acpx_home, real_home, model)
     prompt_file = attempt_dir / "prompt.md"
     prompt = task_file.read_text(encoding="utf-8") + operational_instruction(args.command_json) + "\n" + report_contract + "\n"
     read_only = node in {"thinker_plan", "review", "test", "audit", "thinker_split", "thinker_synthesize"}
@@ -1020,6 +1168,29 @@ def export_agentfs_owned_changes(resource: dict[str, Any]) -> dict[str, Any]:
 def verify_provider_links(resource: dict[str, Any]) -> bool:
     for item in resource.get("provider_links", []):
         link = Path(str(item["link"]))
+        if item.get("kind", "symlink") == "file":
+            if link.is_symlink():
+                raise DelegateError(f"materialized provider credential became a symlink: {link}")
+            if not link.is_file():
+                raise DelegateError(f"materialized provider credential is missing: {link}")
+            if oct(link.stat().st_mode & 0o777) != item["mode"]:
+                raise DelegateError(f"materialized provider credential mode changed: {link}")
+            # The byte hash is deliberately not compared for a JSON credential store: an agent refreshes
+            # its own tokens by rewriting this private file inside the attempt, which is confined and
+            # expected. What must not change is the store's shape. A non-JSON store keeps hash equality.
+            recorded = str(item.get("keySet", "unparseable"))
+            if recorded == "unparseable":
+                if hashlib.sha256(link.read_bytes()).hexdigest() != item["sha256"]:
+                    raise DelegateError(f"materialized provider credential changed: {link}")
+                continue
+            try:
+                observed = json.loads(link.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise DelegateError(f"materialized provider credential is unreadable: {link} ({error})") from error
+            observed_keys = json.dumps(sorted(observed.keys())) if isinstance(observed, dict) else "unparseable"
+            if observed_keys != recorded:
+                raise DelegateError(f"materialized provider credential key set changed: {link}")
+            continue
         target = Path(str(item["target"]))
         if not link.is_symlink() or link.resolve() != target.resolve():
             raise DelegateError(f"provider credential link changed: {link}")
@@ -1164,8 +1335,91 @@ def run_structured_cancel(resource: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+FAILURE_DIAGNOSTIC_EVENT_LIMIT = 20
+FAILURE_DIAGNOSTIC_EVENT_CHARS = 500
+FAILURE_DIAGNOSTIC_STDERR_BYTES = 4096
+FAILURE_DIAGNOSTIC_REDACTIONS = (
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY"), "[redacted]"),
+    # Provider keys are not all Anthropic-shaped: the keychain-resolved key on the author's host is
+    # `sk-` prefixed, 114 characters, and contains dots, which the pattern above does not match.
+    (re.compile(r"\bsk-[A-Za-z0-9._~+/=-]{16,}"), "[redacted]"),
+    (re.compile(r"\b[A-Z0-9_]*(TOKEN|API_KEY|SECRET)[A-Z0-9_]*\b\s*[=:]\s*[^\s,\"]+"), "[redacted]"),
+    # ACP agents announce the signed-in account; the bundle is retained on disk, so identity is stripped too.
+    (re.compile('("(?:email|accountId|account_id)"\\s*:\\s*)"[^"]*"'), '\\1"[redacted]"'),
+)
+
+
+def redact_failure_text(value: str) -> str:
+    """Masks credential-shaped material with the production secret-scan pattern plus token assignments."""
+    for pattern, replacement in FAILURE_DIAGNOSTIC_REDACTIONS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+def _read_text_tail(path: Path, limit: int) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return redact_failure_text(text[-limit:])
+
+
+def _recent_worker_events(path: Path, limit: int) -> list[object]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    events: list[object] = []
+    for line in lines[-limit:]:
+        try:
+            events.append(json.loads(redact_failure_text(line)[:FAILURE_DIAGNOSTIC_EVENT_CHARS]))
+        except json.JSONDecodeError:
+            events.append(redact_failure_text(line[:FAILURE_DIAGNOSTIC_EVENT_CHARS]))
+    return events
+
+
+def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | None:
+    """Retain a bounded private diagnostic bundle before the attempt directory is removed."""
+    attempt_dir = Path(str(resource.get("attempt_dir", "")))
+    run_dir = Path(str(resource.get("run_dir", "")))
+    if not attempt_dir.is_dir() or not run_dir.is_dir():
+        return None
+    result: object = {}
+    result_path = attempt_dir / "worker-result.json"
+    if result_path.exists():
+        try:
+            result = json.loads(redact_failure_text(result_path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            result = {"unreadable": True}
+    terminal = result.get("terminal") if isinstance(result, dict) else None
+    bundle = {
+        "schemaVersion": 1,
+        "runId": resource.get("run_id"),
+        "operationId": resource.get("operation_id"),
+        "agentName": resource.get("agent"),
+        "node": resource.get("node"),
+        "role": resource.get("role"),
+        "acpAgent": resource.get("acp_agent"),
+        "selectedModel": resource.get("selected_model"),
+        "acpxSession": resource.get("acpx_session"),
+        "agentFsSession": resource.get("agentfs_session"),
+        "attemptKey": resource.get("acpx_attempt_key"),
+        "reason": redact_failure_text(reason)[:2000],
+        "processExitCode": result.get("processExitCode") if isinstance(result, dict) else None,
+        "terminalKind": terminal.get("kind") if isinstance(terminal, dict) else None,
+        "workerResult": result,
+        "stderrTail": _read_text_tail(attempt_dir / "worker.stderr.txt", FAILURE_DIAGNOSTIC_STDERR_BYTES),
+        "recentEvents": _recent_worker_events(attempt_dir / "worker.stdout.ndjson", FAILURE_DIAGNOSTIC_EVENT_LIMIT),
+    }
+    suffix = str(resource.get("operation_id") or attempt_dir.name)
+    path = run_dir / f"failure-{suffix}.json"
+    write_private(path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
+    return path
+
+
 def abort_acpx_attempt(resource: dict[str, Any], cancel_attempt: Any = run_structured_cancel, provider_verifier: Any = verify_provider_links, command_runner: Any = run, tab_closer: Any = close_created_tab, remove_tree: Any = None) -> list[str]:
     failures: list[str] = []
+    write_failure_diagnostics(resource, "attempt aborted before cleanup")
     try:
         cancel_attempt(resource)
     except Exception as error:

@@ -1,10 +1,11 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildEnsureArgv, buildPromptArgv, parseWorkerConfig, runAcpxWorker } from "../scripts/acpx-worker.ts";
+import { buildEnsureArgv, buildPromptArgv, isSilentTurn, parseWorkerConfig, runAcpxWorker } from "../scripts/acpx-worker.ts";
+import { parseAcpxNdjson } from "../lib/acpx-events.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FAKE_ACPX = join(HERE, "support", "fake-acpx.mjs");
@@ -45,6 +46,24 @@ function fixture(agent: "pi" | "codex" | "claude" = "codex", readOnly = false) {
 	});
 }
 
+	test("detects a silent turn from parsed events in either JSON serialization", () => {
+		const sessionId = "silent-session";
+		const prompt = { jsonrpc: "2.0", id: "1", method: "session/prompt", params: { sessionId, prompt: [] } };
+		const info = { jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "session_info_update", _meta: { piAcp: { running: true } } } } };
+		const message = { jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "42" } } } };
+		const tool = { jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "tool_call", title: "printf 42" } } };
+		const done = { jsonrpc: "2.0", id: "1", result: { stopReason: "end_turn" } };
+		const serialize = (frames: unknown[], spaced: boolean): string =>
+			frames.map((frame) => (spaced ? JSON.stringify(frame).replace(/":/g, '": ') : JSON.stringify(frame))).join("\n");
+
+		for (const spaced of [false, true]) {
+			const label = spaced ? "spaced JSON" : "compact JSON";
+			assert.equal(isSilentTurn(parseAcpxNdjson(serialize([prompt, info, done], spaced))), true, `queue-depth updates are not activity (${label})`);
+			assert.equal(isSilentTurn(parseAcpxNdjson(serialize([prompt, info, message, done], spaced))), false, `an assistant message is activity (${label})`);
+			assert.equal(isSilentTurn(parseAcpxNdjson(serialize([prompt, tool, done], spaced))), false, `a tool call is activity (${label})`);
+		}
+	});
+
 describe("production ACPX worker", () => {
 	test("builds direct ensure and strict prompt argv", () => {
 		const config = fixture();
@@ -54,6 +73,34 @@ describe("production ACPX worker", () => {
 		assert.ok(prompt.includes("--permission-policy"));
 		assert.ok(prompt.includes("gpt-5.6-sol"));
 		assert.deepEqual(prompt.slice(-5), ["codex", "--session", config.sessionName, "--file", config.promptFile]);
+	});
+
+	test("treats a silent Pi turn as a failed attempt instead of projecting a verdict", async () => {
+		const config = fixture("pi");
+		process.env.FAKE_ACPX_SILENT = "1";
+		try {
+			assert.equal(await runAcpxWorker(config), 2);
+			assert.equal(existsSync(config.reportPath), false, "a silent turn must not fabricate a report");
+			const result = JSON.parse(readFileSync(config.resultPath, "utf8"));
+			assert.equal(result.silentTurn, true);
+			assert.equal(result.piReportProjected, false);
+			assert.match(result.projectionErrors.join(" "), /worker-silent-turn/);
+		} finally {
+			delete process.env.FAKE_ACPX_SILENT;
+		}
+	});
+
+	test("keeps codex-route reports untouched by the Pi silent-turn guard", async () => {
+		const config = fixture("codex");
+		process.env.FAKE_ACPX_SILENT = "1";
+		try {
+			assert.equal(await runAcpxWorker(config), 0);
+			const result = JSON.parse(readFileSync(config.resultPath, "utf8"));
+			assert.equal(result.silentTurn, false, "the guard is Pi-only");
+			assert.equal(result.agent, "codex");
+		} finally {
+			delete process.env.FAKE_ACPX_SILENT;
+		}
 	});
 
 	test("always projects Pi reports from structured terminal facts, never assistant content", async () => {

@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { parseAcpAgent, type AcpAgent } from "../lib/acpx-types.ts";
 import { acpxModelArgument } from "../lib/acpx-select.ts";
 import { acpxPermissionPolicy } from "../lib/acpx-permissions.ts";
-import { parseAcpxNdjson, parseAcpxStatus } from "../lib/acpx-events.ts";
+import { parseAcpxNdjson, parseAcpxStatus, type AcpxLifecycleEvent } from "../lib/acpx-events.ts";
 import { validateReport } from "./report-audit.ts";
 import type { NodeName } from "../types.ts";
 
@@ -160,8 +160,19 @@ function canonicalPositiveVerdict(node: NodeName): string {
 	return "DONE";
 }
 
-function projectPiReport(config: AcpxWorkerConfig): string[] {
-	if (config.agent !== "pi" || existsSync(config.reportPath)) return [];
+/**
+ * True when a Pi worker completed its turn without any assistant or tool activity. Pi reports a failed model
+ * request (for example a keychain-backed API key that an attempt-private HOME cannot resolve) as an assistant
+ * message with empty content, so the ACP turn is indistinguishable from a successful no-op.
+ */
+const ACTIVITY_UPDATE_TYPES: readonly string[] = Object.freeze(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"]);
+
+export function isSilentTurn(events: readonly AcpxLifecycleEvent[]): boolean {
+	return !events.some((event) => event.kind === "progress" && ACTIVITY_UPDATE_TYPES.includes(event.updateType));
+}
+
+function projectPiReport(config: AcpxWorkerConfig, silentTurn: boolean): string[] {
+	if (config.agent !== "pi" || silentTurn || existsSync(config.reportPath)) return [];
 	const projected = {
 		schemaVersion: 1,
 		verdict: canonicalPositiveVerdict(config.node),
@@ -201,7 +212,8 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 	writeFileSync(config.stderrPath, prompt.stderr, { mode: 0o600 });
 	const events = parseAcpxNdjson(prompt.stdout);
 	const terminal = [...events].reverse().find((event) => event.kind === "completed" || event.kind === "cancelled" || event.kind === "failed");
-	const projectionErrors = terminal?.kind === "completed" ? projectPiReport(config) : [];
+	const silentTurn = config.agent === "pi" && terminal?.kind === "completed" && isSilentTurn(events);
+	const projectionErrors = terminal?.kind === "completed" && !silentTurn ? projectPiReport(config, silentTurn) : [];
 	const statusResult = runCaptured(config, [...commonArgs(config), config.agent, "status", "--session", config.sessionName], env);
 	let status: string = "unknown";
 	if (statusResult.exitCode === 0) status = parseAcpxStatus(statusResult.stdout);
@@ -215,16 +227,17 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 		terminal: terminal ? { kind: terminal.kind, sessionId: terminal.sessionId, requestId: terminal.requestId } : null,
 		stdoutPath: config.stdoutPath,
 		stderrPath: config.stderrPath,
-		piReportProjected: config.agent === "pi" && projectionErrors.length === 0 && existsSync(config.reportPath),
+		piReportProjected: config.agent === "pi" && !silentTurn && projectionErrors.length === 0 && existsSync(config.reportPath),
 		hostReadOnly: config.hostReadOnly,
 		discardAllChanges: config.discardAllChanges,
 		noTerminal: config.noTerminal,
 		ensureAttempts: ensure.attempts,
-		projectionErrors,
+		silentTurn,
+		projectionErrors: silentTurn ? ["worker-silent-turn: the attempt produced no assistant or tool activity; Pi records a failed model request as an empty assistant message"] : projectionErrors,
 	};
 	writeFileSync(config.resultPath, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
 	chmodSync(config.resultPath, 0o600);
-	return prompt.exitCode || (projectionErrors.length ? 2 : 0);
+	return prompt.exitCode || (silentTurn ? 2 : 0) || (projectionErrors.length ? 2 : 0);
 }
 
 async function main(): Promise<void> {
