@@ -207,7 +207,9 @@ These are Pi tools for agents, RPC clients, and headless orchestration rather th
 
 For `record` with `status: "running"`, pass the frozen `modelPolicy` and `policyDigest` from `next`, the selected model and zero-based model attempt, `transport: "herdr"`, and the Herdr agent and tab identifiers. A same-model retry uses `retryReason`; a cross-model fallback advances `modelAttempt` and uses `fallbackReason`.
 
-For `status: "completed"`, provide the private JSON `reportPath`; its schema and verdict are audited before the transition is accepted. For `status: "failed"`, provide `error`. Invalid edges, premature joins, exhausted retry budgets, and unevidenced completion fail closed.
+For `status: "completed"`, provide the private JSON `reportPath`; its schema and verdict are audited before the transition is accepted. A report carrying the Pi execution-only projection ("Supervisor projection:") is rejected for every semantic node, because it states explicitly that no semantic claim was made; redispatch the operation instead. For `status: "failed"`, provide `error`. Invalid edges, premature joins, exhausted retry budgets, and unevidenced completion fail closed.
+
+`op=collect` always converges: when the launcher cannot produce a settlement manifest, the attempt is recorded failed, the result reports `settled: false`, `recorded: "failed"`, and the path of the retained `failure-<operationId>.json` diagnostic bundle (mode 600, redacted, written before the attempt directory is removed). `op=cancel` refuses while the registered worker's ACPX state is `alive` and its launcher cancel command fails; it records `cancelled` when the state is already `no-session`.
 
 Direct initialization supports the full tagged model-policy forms used by the API: `auto`, a named preset, an explicit tier, or an exact model with a reason. `/delegate` intentionally exposes only the six picker policies listed above.
 
@@ -225,11 +227,13 @@ Worker execution is ACPX-only. Presentation transport is selected per attempt: h
 
 - `openai-codex/*` selects ACPX Codex, `claude-code/*` selects ACPX Claude, and every other valid frozen model selects ACPX Pi through the shared TypeScript attempt planner.
 - Each `(runId, operationId, modelAttempt, transientAttempt)` owns one ACPX session and one AgentFS session. Retry or fallback closes the old attempt and creates a new identity; one bounded report repair reuses the current session.
+- Before an attempt launches, the credential store of **the agent that will actually execute the model** is preflighted: `openai-codex/*` runs on the ACPX Codex agent and is checked against `CODEX_HOME/auth.json` (needs `OPENAI_API_KEY` or `tokens.access_token`; the remedy printed is `codex logout && codex login`), `claude-code/*` runs on the ACPX Claude agent and needs a mode-600 `PI_CLAUDE_OAUTH_TOKEN_FILE` or `~/.claude/.credentials.json`, and every other model runs on ACPX Pi and is preflighted with `pi auth check --provider <p> --json --no-refresh` under the supervisor's real home. Checking Pi for a Codex-routed model is not enough: the two credential stores are unrelated, and `codex login status` reports "Logged in" even when the stored refresh token has been revoked. The checks are structural and offline on purpose — a live probe costs a model call per dispatch — so a revoked-but-unexpired token is caught at runtime instead, where it arrives as a transient `worker-runtime-failure` and the chain advances. The check is advisory: a provider is blocked with `worker preflight: provider "<p>" has no usable credential for <model> (<reason>)` only when neither the live store nor `print-api-key` can produce a credential. `op=dispatch` records that block as a transient failure (`dispatched: false`, `blocked: "preflight"`) and the operation advances to the next model of its frozen chain. Credentials are then **materialized** rather than linked: `providers/pi-agent/auth.json` is a real mode-600 file holding only the selected provider's entry, copied from the live store when present and otherwise resolved with `pi auth print-api-key`. The live `auth.json` is never symlinked into an attempt, so a worker's token refresh cannot write through to it and a concurrent change to the live store cannot invalidate a running attempt. `verify_provider_links()` checks materialized files (regular, not a symlink, unchanged hash, unchanged mode) alongside the remaining read-only links. An OAuth provider absent from the live store fails the preflight instead of receiving a half-built credential, because an access token alone cannot reconstruct Pi's `refresh`/`expires` fields.
 - AgentFS runs with a repository copy-on-write base, temporary HOME, `--no-default-allows`, and one private attempt directory. Writable operations export only audited owned paths. Read-only operations record and discard all overlay changes and export zero paths.
 - Completion verifies the private settlement manifest against the registered ACPX/AgentFS attempt and its tagged headless or Herdr presentation identity, report hash, session close, provider-link integrity, export result, and private attempt-ledger audit.
 - Cancellation, focus-identity failure, abort, retry, and cleanup all execute the same persisted `acpx-cancel.ts` attempt boundary. It validates the ACPX session, record, attempt key, and AgentFS session cwd; requires structured cancel acknowledgement and the observed transition to `idle` or `no-session`; then requires `session_closed` and final `no-session`.
 - Cleanup independently audits the queue owner, ACPX session files, AgentFS mount/server/database/HOME, provider links, report-repair child, any Herdr agent/pane/tab, owned processes, and attempt directory. Any remaining resource or cleanup failure is terminal; unrelated workspace resources are never closed.
-- Pi may use an execution-only supervisor projection after process exit 0 plus structured `end_turn`; the report explicitly makes no semantic task claim. Claude reads a setup token only from a mode-600 `PI_CLAUDE_OAUTH_TOKEN_FILE` path.
+- Pi may use an execution-only supervisor projection after process exit 0 plus structured `end_turn`; the report explicitly makes no semantic task claim.
+- A Pi turn that completes with no assistant or tool activity at all is a failed attempt (`silentTurn`, exit 2, no report), not a projection: Pi records a failed model request as an empty assistant message, which most often means the provider credential is unreachable from the attempt-private home (for example a macOS keychain lookup). Such a failure is transient, so the operation advances to the next model of its frozen chain. Claude reads a setup token only from a mode-600 `PI_CLAUDE_OAUTH_TOKEN_FILE` path.
 
 JetBrains Air is supported through `pi-acp`: Air launches and owns Pi as its ACP agent, and Pi dispatches ACPX/AgentFS workers through the headless transport without requiring Herdr. pi-agent-wave does not attach Air directly to an externally owned ACPX worker session.
 
@@ -306,7 +310,17 @@ Use `delegate_graph init`, then repeat `next -> record running -> record result`
 
 ## HTTP 429 failover
 
-Delegate Graph workers automatically inherit their frozen tier, ordered model chain, role, and exact-model lock through either headless or Herdr presentation. When a provider returns HTTP 429, the interrupted operation retries on the first available authenticated model from a different provider later in that same chain.
+Delegate Graph workers automatically inherit their frozen tier, ordered model chain, role, and exact-model lock through either headless or Herdr presentation. When a worker attempt fails with an infrastructure-shaped error (HTTP 429 or 5xx, rate limit, quota, overload, timeout, connection reset or close, `ACPX worker failed` / `terminal=failed` / `QUEUE_RUNTIME_PROMPT_FAILED`, or a provider-credential link that changed mid-attempt), the operation advances to the next model of its own frozen chain once the current model's three-attempt same-model budget is spent, and the next dispatch runs that model. When the chain has no remaining model, the run parks in `awaiting_user` for `/graph resume` or `op=resolve`. The table below describes the separate main-session `/failover` machinery.
+
+| Worker situation | Behavior |
+| --- | --- |
+| Transient failure, current model still has budget | Same-model retry with backoff; `retry_reason` set, `fallback_reason` stays null. |
+| Transient failure, current model's budget spent, chain has another model | `model_attempt` advances by one, `fallback_reason` names the transient reason, the dead attempt's agent is marked failed, and `model_fallback` is logged. |
+| Transient failure on the last model of the chain | Run moves to `awaiting_user`; nothing is promoted into another tier. |
+| Exact-model lock (`--policy` model lock / `selectionSource: exact-model`) | Never advances; parks for a user decision. |
+| Semantic verdict (`FAIL`, `NOT_OK`, review rejection) | Never a fallback trigger; the graph's own repair loop handles it. |
+| Worker died mid-attempt | `op=collect` records the attempt failed and returns `settled: false` with the retained diagnostic bundle path instead of throwing. |
+| Worker never wrote its report (Pi execution-only projection) | `op=record status=completed` is rejected for every semantic node; redispatch the operation. |
 
 | Runtime scenario | Behavior |
 | --- | --- |
@@ -393,6 +407,8 @@ node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs rollba
 When pi-fzf is installed (detected from `settings.json`), the initializer merges `route` and `delegate-model` list/preview commands that target the installed package's `route-picker.ts`, leaving every unrelated command and field unchanged. When pi-fzf is absent the plan reports `skipped` and does not create `fzf.json`.
 
 ## Health check
+
+`pi-agent-wave-doctor` also reports `route-credentials`: for every model in the required tiers it names the executing agent and whether that agent's credential store is structurally usable, so a routing file full of models nobody can authenticate with fails the health check instead of failing at dispatch. Pi routes are reported usable because dispatch materializes their credential.
 
 The read-only doctor diagnoses a configuration without changing it:
 

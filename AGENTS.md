@@ -10,6 +10,12 @@ This repository develops `@dpugliese/pi-agent-wave`. The package root is `extens
 
 - Preserve the public `/delegate`, `/graph`, and `delegate_graph` contracts.
 - Preserve graph topology, scheduling, retries, evidence gates, and model-policy behavior unless the PRD explicitly changes them.
+- A Pi worker turn with no assistant or tool activity is a failed attempt, never a projected verdict.
+- A credential preflight checks the store of the agent that will execute the model (Codex, Claude, or Pi), never a different agent's store; `agent_for_model()` in `scripts/delegate_core.py`, `agentForModel()` in `scripts/doctor.mjs`, and `selectAcpAgent()` in `lib/acpx-select.ts` must agree, and a test pins all three.
+- The live `~/.pi/agent/auth.json` is never linked into a worker attempt. Provider credentials are preflighted with `pi auth check --no-refresh` and materialized as a mode-600 file for the selected provider only.
+- A positive graph verdict never originates from the supervisor projection. A Pi worker that exits without authoring its report leaves the operation to be redispatched; `op=record status=completed` rejects the projection for every semantic node.
+- Transient worker failures (429/5xx, quota, timeout, connection loss, `ACPX worker failed`, provider-link churn) advance the operation to the next model of its frozen chain once the current model's same-model budget is spent; semantic verdicts never trigger failover and exact-model locks never advance.
+- A terminated worker attempt must always settle: `op=collect` records the failure and names the retained `failure-<operationId>.json` diagnostic instead of leaving the operation running.
 - Worker execution is transport-neutral and ACPX-only. Headless operation must load with ACPX and AgentFS alone; Herdr is an optional presentation adapter selected only with complete executable/workspace identity. Implement this change only under `tasks/prd-air-controlled-editor-independent-orchestration.md` while preserving existing graph, settlement, and evidence behavior.
 - Package exactly the pi-agent-wave graph extension plus questionnaire, cmux-session, and model-failover entry points.
 - Herdr executables and Herdr-managed files remain external and must not enter the npm artifact.

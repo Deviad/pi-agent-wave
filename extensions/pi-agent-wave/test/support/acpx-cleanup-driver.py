@@ -64,6 +64,92 @@ def abort_case(case: str) -> dict[str, object]:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def diagnostics_case() -> dict[str, object]:
+    root = Path(tempfile.mkdtemp(prefix="acpx-diagnostics-driver-"))
+    owned = resource(root)
+    owned["run_id"] = "run-diagnostic"
+    owned["operation_id"] = "op-diagnostic"
+    owned["node"] = "implement"
+    owned["selected_model"] = "alibaba/some-model"
+    attempt = Path(str(owned["attempt_dir"]))
+    # Built at runtime so the repository never contains a credential-shaped literal.
+    setup_token = "sk-ant-" + "oat" + ("A" * 34)
+    bearer = "Bearer " + ("z" * 30)
+    bare_key = "sk-" + "a1." * 22 + "xyz"
+    account_email = "someone@example.com"
+    account_id = "acct-0123456789"
+    (attempt / "worker-result.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "processExitCode": 1,
+        "terminal": {"kind": "failed", "sessionId": "session-owned"},
+        "note": "token leaked here: " + setup_token,
+    }) + "\n", encoding="utf-8")
+    (attempt / "worker.stderr.txt").write_text(
+        "line one\nAuthorization: " + bearer + "\nOPENAI_API_KEY=supersecretvalue123\n" + ("e" * 9000) + "\nprovider rejected " + bare_key + "\n",
+        encoding="utf-8",
+    )
+    (attempt / "worker.stdout.ndjson").write_text(
+        "{\"kind\":\"failed\",\"detail\":\"RUNTIME QUEUE_RUNTIME_PROMPT_FAILED\"}\n"
+        + json.dumps({"method": "_auth/status_update", "params": {"authStatus": {"kind": "account", "account": {"email": account_email, "account_id": account_id, "label": "ChatGPT Prolite"}}}}) + "\n"
+        + ("{\"kind\":\"noise\"}\n" * 30),
+        encoding="utf-8",
+    )
+    def cancel(_resource: dict[str, object]) -> dict[str, object]:
+        return {"cancelled": True, "structuredCancelled": True, "closed": True, "noSession": True}
+    def remove(path: Path) -> None:
+        if path.exists():
+            shutil.rmtree(path)
+    try:
+        failures = module.abort_acpx_attempt(owned, cancel_attempt=cancel, provider_verifier=lambda _r: True, command_runner=lambda _a, **_k: subprocess.CompletedProcess([], 0, "", ""), tab_closer=lambda _r, _t: None, remove_tree=remove)
+        bundles = sorted(root.glob("failure-*.json"))
+        bundle = json.loads(bundles[0].read_text(encoding="utf-8")) if bundles else {}
+        raw = bundles[0].read_text(encoding="utf-8") if bundles else ""
+        return {
+            "case": "diagnostics",
+            "failures": failures,
+            "bundleCount": len(bundles),
+            "bundleName": bundles[0].name if bundles else None,
+            "mode": oct(bundles[0].stat().st_mode & 0o777) if bundles else None,
+            "attemptRemoved": not attempt.exists(),
+            "terminalKind": bundle.get("terminalKind"),
+            "processExitCode": bundle.get("processExitCode"),
+            "selectedModel": bundle.get("selectedModel"),
+            "operationId": bundle.get("operationId"),
+            "leakedSetupToken": setup_token in raw,
+            "leakedBearer": bearer in raw,
+            "leakedApiKeyAssignment": "supersecretvalue123" in raw,
+            "leakedBareProviderKey": bare_key in raw,
+            "leakedAccountEmail": account_email in raw,
+            "leakedAccountId": account_id in raw,
+            "eventsParseAsJson": all(isinstance(item, dict) for item in bundle.get("recentEvents", [])),
+            "redactionMarkerSeen": "[redacted]" in raw,
+            "stderrTailBytes": len(str(bundle.get("stderrTail", ""))),
+            "recentEventCount": len(bundle.get("recentEvents", [])),
+            "environmentPersisted": "worker_environment" in raw,
+        }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def absent_attempt_case() -> dict[str, object]:
+    """A settled attempt has no attempt directory, so cleanup must not write a failure bundle."""
+    root = Path(tempfile.mkdtemp(prefix="absent-attempt-"))
+    owned = resource(root)
+    Path(str(owned["attempt_dir"])).rmdir()
+    try:
+        module.abort_acpx_attempt(
+            owned,
+            cancel_attempt=lambda _r: {"cancelled": True, "structuredCancelled": True, "closed": True, "noSession": True},
+            provider_verifier=lambda _r: True,
+            command_runner=lambda _a, **_k: subprocess.CompletedProcess([], 0, "", ""),
+            tab_closer=lambda _r, _t: None,
+            remove_tree=lambda path: None,
+        )
+        return {"bundles": sorted(path.name for path in root.glob("failure-*.json"))}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def default_cancel_case() -> dict[str, object]:
     root = Path(tempfile.mkdtemp(prefix="acpx-default-cancel-"))
     owned = resource(root)
@@ -130,6 +216,8 @@ def inventory_case(case: str) -> dict[str, object]:
 
 mode, case = sys.argv[1:3]
 if mode == "abort": result = abort_case(case)
+elif mode == "diagnostics": result = diagnostics_case()
+elif mode == "absent-attempt": result = absent_attempt_case()
 elif mode == "default-cancel": result = default_cancel_case()
 elif mode == "persistence": result = persistence_case()
 elif mode == "inventory": result = inventory_case(case)

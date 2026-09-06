@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -44,6 +45,48 @@ function runExternal(command, args) {
 
 function observedVersion(result) {
 	return `${result.stdout}${result.stderr}`.match(/\d+\.\d+\.\d+/)?.[0] ?? "unknown";
+}
+
+/** Mirror of selectAcpAgent() in lib/acpx-select.ts; test/acpx-doctor.test.ts pins all three copies together. */
+export function agentForModel(model) {
+	if (String(model).startsWith("openai-codex/")) return "codex";
+	if (String(model).startsWith("claude-code/")) return "claude";
+	return "pi";
+}
+
+/**
+ * Structural, offline credential verdict for the agent that will execute `model`.
+ * Pi routes are always usable here: dispatch materializes the provider credential (US-007).
+ */
+export function inspectRouteCredential(agent, model, agentDir) {
+	if (agent === "pi") {
+		const provider = String(model).split("/")[0];
+		try {
+			const stored = JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf8"));
+			if (stored && typeof stored === "object" && stored[provider]) return { usable: true, kind: "stored" };
+		} catch { /* absent or unparseable: dispatch resolves and materializes it */ }
+		return { usable: true, kind: "materialized-at-dispatch" };
+	}
+	if (agent === "codex") {
+		const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
+		const auth = join(codexHome, "auth.json");
+		if (!existsSync(auth)) return { usable: false, reason: `no credential at ${auth}; run codex logout && codex login` };
+		let payload;
+		try { payload = JSON.parse(readFileSync(auth, "utf8")); } catch { return { usable: false, reason: `credential at ${auth} is not parseable JSON; run codex logout && codex login` }; }
+		if (payload && payload.OPENAI_API_KEY) return { usable: true, kind: "api_key" };
+		if (payload && payload.tokens && payload.tokens.access_token) return { usable: true, kind: String(payload.auth_mode || "chatgpt") };
+		return { usable: false, reason: `credential at ${auth} has neither OPENAI_API_KEY nor tokens.access_token; run codex logout && codex login` };
+	}
+	const tokenFile = process.env.PI_CLAUDE_OAUTH_TOKEN_FILE;
+	if (tokenFile) {
+		try {
+			const metadata = statSync(tokenFile);
+			if (metadata.isFile() && (metadata.mode & 0o077) === 0) return { usable: true, kind: "token-file" };
+		} catch { /* fall through to the store check */ }
+		return { usable: false, reason: "PI_CLAUDE_OAUTH_TOKEN_FILE is not a mode-600 regular file; run claude setup-token" };
+	}
+	if (existsSync(join(homedir(), ".claude", ".credentials.json"))) return { usable: true, kind: "credentials-file" };
+	return { usable: false, reason: "no Claude credential; set PI_CLAUDE_OAUTH_TOKEN_FILE to a mode-600 token file or sign in with claude" };
 }
 
 export function runDoctor(argv = process.argv.slice(2)) {
@@ -157,6 +200,23 @@ export function runDoctor(argv = process.argv.slice(2)) {
 		const nonLocalFast = localFastModels.filter((model) => !(catalog && isLocalModel(model, catalog)));
 		if (localFastModels.length > 0 && nonLocalFast.length > 0) checks.push(check("loopback", "warn", `local-fast tier contains non-local models: ${nonLocalFast.join(", ")}`));
 		else checks.push(check("loopback", "ok", localModels.size ? `local models: ${[...localModels].join(", ")}` : "no local models detected"));
+
+		// Route credentials: does the agent that will execute each chain entry have a credential store?
+		const credentialFindings = new Map();
+		for (const tier of REQUIRED_TIERS) {
+			for (const model of (Array.isArray(tiers[tier]?.models) ? tiers[tier].models : []).map(String).filter(Boolean)) {
+				const agent = agentForModel(model);
+				const verdict = inspectRouteCredential(agent, model, agentDir);
+				if (verdict.usable) continue;
+				const key = `${agent}|${verdict.reason}`;
+				const entry = credentialFindings.get(key) ?? { agent, reason: verdict.reason, models: [] };
+				if (!entry.models.includes(model)) entry.models.push(model);
+				credentialFindings.set(key, entry);
+			}
+		}
+		checks.push(credentialFindings.size
+			? check("route-credentials", "fail", [...credentialFindings.values()].map((finding) => `${finding.agent}: ${finding.reason} (${finding.models.join(", ")})`).join("; "))
+			: check("route-credentials", "ok", "every route's executing agent has a credential store"));
 	}
 
 	// pi-fzf detection and command targets

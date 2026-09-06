@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { decideTransition, graphDefinition } from "./graph-core.ts";
-import { classifyFailure, retryDelayMs } from "./retry.ts";
+import { classifyFailure, retryDelayMs, selectModelFallback, type ModelFallbackDecision } from "./retry.ts";
 import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
 import { headlessPresentationIdentity, herdrPresentationIdentity, parseWorkerTransportKind, type WorkerPresentationIdentity, type WorkerTransportKind } from "./lib/worker-transport.ts";
 import type {
@@ -953,6 +953,14 @@ export class GraphStore {
 		this.db.query("UPDATE runs SET status=?,updated_at=? WHERE id=?").run(status, now, runId);
 	}
 
+	/** Returns the next frozen chain model for a transiently exhausted attempt, or a non-advancing decision at chain end. */
+	private modelFallbackFor(runId: string, operation: OperationRow, error: string): ModelFallbackDecision {
+		const policy = this.policy(runId);
+		const route = policy.routes.find((candidate) => candidate.role === roleForNode(operation.node));
+		if (!route) return { kind: "permanent", reason: "no-frozen-route", advance: false, attempt: operation.model_attempt, model: operation.selected_model ?? "", fallbackReason: null };
+		return selectModelFallback(route.chain, operation.model_attempt, error, { exactLock: policy.input.kind === "model" });
+	}
+
 	/** Records one operation transition and atomically advances the graph when its join is complete. */
 	record(input: RecordOperationInput): RecordOperationResult {
 		return this.transaction(() => {
@@ -1085,6 +1093,39 @@ export class GraphStore {
 						state,
 						operation: this.getOperation(operation.id),
 						retry: { attempt, modelAttempt: operation.model_attempt, selectedModel: operation.selected_model, delayMs, notBefore },
+					};
+				}
+				const fallback = classification.kind === "transient"
+					? this.modelFallbackFor(input.runId, operation, input.error)
+					: null;
+				if (fallback?.advance) {
+					const delayMs = retryDelayMs(0, this.random);
+					const notBefore = new Date(this.now().getTime() + delayMs).toISOString();
+					this.db
+						.query("UPDATE operations SET status='running',model_attempt=?,selected_model=?,transient_attempts=0,classifier_reason=?,retry_reason=?,fallback_reason=?,last_error=?,retry_not_before=?,finished_at=NULL WHERE id=?")
+						.run(fallback.attempt, fallback.model, classification.reason, classification.reason, fallback.fallbackReason, input.error, notBefore, operation.id);
+					if (operation.agent_id) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
+					this.event({
+						runId: input.runId,
+						type: "model_fallback",
+						node: operation.node,
+						operationId: operation.id,
+						agentId: input.agentId,
+						fromAgent: "supervisor",
+						toAgent: input.agentName ?? roleForNode(operation.node),
+						replyTo: "supervisor",
+						payload: {
+							...this.policyEventContext(input.runId, operation.node, fallback.attempt, 0, classification.reason, fallback.fallbackReason),
+							fromModelAttempt: operation.model_attempt,
+							fromModel: operation.selected_model,
+							reasonCode: fallback.fallbackReason,
+							notBefore,
+						},
+					});
+					return {
+						state,
+						operation: this.getOperation(operation.id),
+						retry: { attempt: 0, modelAttempt: fallback.attempt, selectedModel: fallback.model, delayMs, notBefore },
 					};
 				}
 				this.db

@@ -84,7 +84,6 @@ export const REVIEW_PATHS = [
 	"extensions/pi-agent-wave/test/production-audit.test.ts",
 	"extensions/pi-agent-wave/test/production-review-bundle.test.ts",
 	"extensions/pi-agent-wave/test/commands.test.ts",
-	"extensions/pi-agent-wave/test/acpx-real-report-evidence.test.ts",
 	"extensions/pi-agent-wave/test/agentfs-sandbox.test.ts",
 	"extensions/pi-agent-wave/test/package-artifact.test.ts",
 	"extensions/pi-agent-wave/test/package-install-rehearsal.test.ts",

@@ -28,6 +28,35 @@ describe("ACPX AgentFS targeted cleanup", () => {
 		assert.equal(driver("default-cancel", "default-cancel").passed, true);
 	});
 
+	test("writes no diagnostic bundle for an attempt that already settled", () => {
+		const result = driver("absent-attempt", "absent-attempt");
+		assert.deepEqual(result.bundles, [], "a settled attempt has no attempt directory, so cleanup must not fabricate diagnostics");
+	});
+
+	test("retains a bounded redacted diagnostic bundle when an attempt aborts", () => {
+		const result = driver("diagnostics", "diagnostics");
+		assert.equal(result.bundleCount, 1, "exactly one failure bundle per aborted attempt");
+		assert.equal(result.bundleName, "failure-op-diagnostic.json");
+		assert.equal(result.mode, "0o600");
+		assert.equal(result.attemptRemoved, true, "the bundle must survive attempt-directory cleanup");
+		assert.equal(result.terminalKind, "failed");
+		assert.equal(result.processExitCode, 1);
+		assert.equal(result.selectedModel, "alibaba/some-model");
+		assert.equal(result.operationId, "op-diagnostic");
+		assert.equal(result.leakedSetupToken, false);
+		assert.equal(result.leakedBearer, false);
+		assert.equal(result.leakedApiKeyAssignment, false);
+		assert.equal(result.leakedBareProviderKey, false, "a bare sk- provider key must be redacted from retained diagnostics");
+		assert.equal(result.leakedAccountEmail, false, "account email must not be retained in diagnostics");
+		assert.equal(result.leakedAccountId, false, "account id must not be retained in diagnostics");
+		assert.equal(result.eventsParseAsJson, true, "redaction must keep event entries parseable");
+		assert.equal(result.redactionMarkerSeen, true);
+		assert.equal(result.environmentPersisted, false, "worker environment must never be retained");
+		assert.ok(Number(result.stderrTailBytes) <= 4096, `stderr tail exceeded the byte cap: ${String(result.stderrTailBytes)}`);
+		assert.ok(Number(result.recentEventCount) <= 20, `event cap exceeded: ${String(result.recentEventCount)}`);
+		assert.ok(Number(result.recentEventCount) >= 1);
+	});
+
 	test("fails closed on Herdr pane release by rejecting the remaining pane", () => {
 		assert.ok((driver("inventory", "pane").falseFields as string[]).includes("paneAbsent"));
 	});

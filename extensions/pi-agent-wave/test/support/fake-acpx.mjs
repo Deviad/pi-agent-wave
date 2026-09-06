@@ -24,7 +24,9 @@ if (args.includes("--version")) {
 	const sessionIndex = args.indexOf("--session");
 	const sessionId = sessionIndex >= 0 ? args[sessionIndex + 1] : "fixture-session";
 	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: "request-1", method: "session/prompt", params: { sessionId, prompt: [] } })}\n`);
-	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: process.env.FAKE_ACPX_ASSISTANT ?? "fixture progress" } } } })}\n`);
+	if (process.env.FAKE_ACPX_SILENT !== "1") {
+		process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: process.env.FAKE_ACPX_ASSISTANT ?? "fixture progress" } } } })}\n`);
+	}
 	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: "request-1", result: { stopReason: "end_turn" } })}\n`);
 	process.stderr.write("fixture-stderr\n");
 	process.exitCode = Number(process.env.FAKE_ACPX_EXIT ?? "0");

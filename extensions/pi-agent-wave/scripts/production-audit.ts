@@ -44,19 +44,18 @@ export interface AuditExpectations {
 }
 
 export const EXPECTED_AUDIT_SUMMARIES: AuditExpectations = Object.freeze({
-	"full-node": Object.freeze({ tests: 360, pass: 349, fail: 0, skipped: 11 }),
-	"bun-package": Object.freeze({ pass: 36, fail: 0 }),
-	pack: Object.freeze({ files: 68, externalArtifacts: 0 }),
-	publish: Object.freeze({ files: 68, externalArtifacts: 0 }),
+	"full-node": Object.freeze({ tests: 405, pass: 394, fail: 0, skipped: 11 }),
+	"bun-package": Object.freeze({ pass: 45, fail: 0 }),
+	pack: Object.freeze({ files: 69, externalArtifacts: 0 }),
+	publish: Object.freeze({ files: 69, externalArtifacts: 0 }),
 	"install-rehearsal": Object.freeze({ tests: 1, pass: 1, fail: 0, skipped: 0 }),
-	"real-report-evidence": Object.freeze({ tests: 2, pass: 2, fail: 0, skipped: 0 }),
 	"real-lifecycle-matrix": Object.freeze({ tests: 3, pass: 3, fail: 0, skipped: 0 }),
 	"real-production-matrix": Object.freeze({ tests: 3, pass: 3, fail: 0, skipped: 0 }),
 	"real-headless-matrix": Object.freeze({ tests: 3, pass: 3, fail: 0, skipped: 0 }),
 	ledger: Object.freeze({ valid: true, files: 1, findings: 0 }),
 });
 
-export const EXPECTED_AUDIT_COMMANDS = Object.freeze(["full-node", "bun-package", "typecheck", "pack", "publish", "install-rehearsal", "real-report-evidence", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix", "token-cleanup", "secret-scan", "cleanup-scan", "ledger", "diff-check"] as const);
+export const EXPECTED_AUDIT_COMMANDS = Object.freeze(["full-node", "bun-package", "typecheck", "pack", "publish", "install-rehearsal", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix", "token-cleanup", "secret-scan", "cleanup-scan", "ledger", "diff-check"] as const);
 
 export type Runner = (command: string, args: readonly string[], options: { cwd: string; env: NodeJS.ProcessEnv; encoding: "utf8"; timeout: number; shell: false }) => SpawnSyncReturns<string>;
 
@@ -73,7 +72,7 @@ function testSummary(output: string): Record<string, unknown> {
 }
 
 export function summarizeAuditOutput(name: string, output: string): Record<string, unknown> {
-	if (["full-node", "install-rehearsal", "real-report-evidence", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix"].includes(name)) return testSummary(output);
+	if (["full-node", "install-rehearsal", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix"].includes(name)) return testSummary(output);
 	if (name === "bun-package") {
 		const pass = output.match(/(\d+) pass/)?.[1];
 		const fail = output.match(/(\d+) fail/)?.[1];
@@ -106,7 +105,6 @@ export function auditCommands(root: string): AuditCommand[] {
 		{ name: "pack", executable: "npm", args: ["pack", "--dry-run", "--json", "--ignore-scripts"], cwd: packageRoot },
 		{ name: "publish", executable: "npm", args: ["publish", "--dry-run", "--json", "--ignore-scripts"], cwd: packageRoot },
 		{ name: "install-rehearsal", executable: "node", args: ["--experimental-strip-types", "--test", "extensions/pi-agent-wave/test/package-install-rehearsal.test.ts"], cwd: root },
-		{ name: "real-report-evidence", executable: "node", args: ["--experimental-strip-types", "--test", "extensions/pi-agent-wave/test/acpx-real-report-evidence.test.ts"], cwd: root },
 		{ name: "real-lifecycle-matrix", executable: "node", args: ["--experimental-strip-types", "--test", "extensions/pi-agent-wave/test/acpx-real-matrix.test.ts"], cwd: root },
 		{ name: "real-production-matrix", executable: "node", args: ["--experimental-strip-types", "--test", "extensions/pi-agent-wave/test/acpx-production-matrix.test.ts"], cwd: root },
 		{ name: "real-headless-matrix", executable: "node", args: ["--experimental-strip-types", "--test", "extensions/pi-agent-wave/test/acpx-headless-real-matrix.test.ts"], cwd: root },
@@ -119,7 +117,6 @@ export function auditCommands(root: string): AuditCommand[] {
 }
 
 function commandArtifacts(name: string): string[] {
-	if (name === "real-report-evidence") return ["agent-output/production-acpx-worker-backend/real-matrix-status.json", "agent-output/production-acpx-worker-backend/real-matrix-report.json"];
 	if (name === "ledger") return ["agent-output/production-acpx-worker-backend/delegate-ledger/"];
 	if (name === "pack" || name === "publish") return ["extensions/pi-agent-wave/package.json"];
 	return [];
@@ -217,7 +214,7 @@ export function summariesValid(commands: AuditCommandRecord[], expectations: Aud
 		const expected = expectations[command.name];
 		if (expected && Object.entries(expected).some(([key, value]) => command.summary[key] !== value)) return false;
 		if (command.exitCode !== 0) return false;
-		if (["full-node", "install-rehearsal", "real-report-evidence", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix"].includes(command.name) && (command.summary.fail !== 0 || (["real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix"].includes(command.name) && command.summary.skipped !== 0))) return false;
+		if (["full-node", "install-rehearsal", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix"].includes(command.name) && (command.summary.fail !== 0 || (["real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix"].includes(command.name) && command.summary.skipped !== 0))) return false;
 		if (command.name === "bun-package" && command.summary.fail !== 0) return false;
 		if ((command.name === "pack" || command.name === "publish") && (command.summary.externalArtifacts !== 0 || command.summary.parseError === true)) return false;
 		if (command.name === "token-cleanup" && command.summary.deleted !== true) return false;

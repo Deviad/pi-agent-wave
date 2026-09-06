@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { chmodSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { auditReport, formatDiagnostics } from "./scripts/report-audit.ts";
@@ -14,6 +14,7 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
+import { isProjectedSemanticReport, projectedAttemptFailure } from "./lib/projected-report.ts";
 import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
 import { reconcileAcpxSettlementSummary, type AcpxSettlementSummary } from "./lib/acpx-settlement.ts";
 import { validateSettlementIdentity, type SettlementIdentityExpected } from "./lib/acpx-settlement-evidence.ts";
@@ -219,6 +220,27 @@ function required(value: string | undefined, name: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Newest retained failure diagnostic bundle in one private run directory, if the launcher kept one. */
+function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
+	let entries: string[];
+	try {
+		entries = readdirSync(privateRunDir);
+	} catch {
+		return undefined;
+	}
+	let newest: { path: string; mtimeMs: number } | undefined;
+	for (const entry of entries.filter((name) => name.startsWith("failure-") && name.endsWith(".json"))) {
+		const candidate = join(privateRunDir, entry);
+		try {
+			const mtimeMs = statSync(candidate).mtimeMs;
+			if (!newest || mtimeMs >= newest.mtimeMs) newest = { path: candidate, mtimeMs };
+		} catch {
+			continue;
+		}
+	}
+	return newest?.path;
 }
 
 interface AcpxRegistrationPayload {
@@ -437,7 +459,26 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", operation.owned_paths_json, "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--report", reportPath, "--task-file", taskFile];
 					if (operation.command_json) startArgs.push("--command-json", operation.command_json);
 					const started = await execute(process.execPath, startArgs);
-					if (started.exitCode !== 0) throw new Error(started.stderr || started.stdout || "headless start failed");
+					if (started.exitCode !== 0) {
+						const startOutput = `${started.stderr ?? ""}${started.stdout ?? ""}`;
+						const preflight = /worker preflight:/.exec(startOutput);
+						if (preflight) {
+							const reason = startOutput.slice(preflight.index).split("\n")[0].trim();
+							const blocked = graphStore.record({ runId, operationId, status: "failed", error: reason });
+							progress("dispatch_blocked_by_preflight", { runId, operationId, reason, status: blocked.state.status, modelAttempt: blocked.operation.model_attempt });
+							return textResult({
+								runId,
+								operationId,
+								dispatched: false,
+								blocked: "preflight",
+								reason,
+								state: blocked.state,
+								operation: blocked.operation,
+								retry: blocked.retry ?? null,
+							});
+						}
+						throw new Error(started.stderr || started.stdout || "headless start failed");
+					}
 					const launch: unknown = JSON.parse(started.stdout);
 					if (!isRecord(launch)) throw new Error("headless start returned invalid identity");
 					const launchText = (key: string): string => {
@@ -470,7 +511,36 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						const execute = executor(pi);
 						const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
 						const waited = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", agent.transport, "--", "wait", privateRunDir, agent.name]);
-						if (waited.exitCode !== 0) throw new Error(waited.stderr || waited.stdout || "headless wait failed");
+						if (waited.exitCode !== 0) {
+							const reason = (waited.stderr || waited.stdout || "worker wait failed").trim();
+							const diagnostics = retainedFailureDiagnostics(privateRunDir);
+							let recorded;
+							try {
+								recorded = graphStore.record({
+									runId,
+									operationId,
+									status: "failed",
+									agentId: agent.id ?? undefined,
+									agentName: agent.name,
+									error: diagnostics ? `${reason}\nretained worker diagnostics: ${diagnostics}` : reason,
+								});
+							} catch (recordError) {
+								throw new Error(`${reason}${diagnostics ? `\nretained worker diagnostics: ${diagnostics}` : ""}\nand the attempt could not be recorded: ${String(recordError)}`);
+							}
+							progress("worker_attempt_failed", { runId, operationId, agentName: agent.name, diagnosticsPath: diagnostics ?? null, status: recorded.state.status });
+							return textResult({
+								runId,
+								operationId,
+								agentName: agent.name,
+								settled: false,
+								recorded: "failed",
+								reason,
+								diagnosticsPath: diagnostics ?? null,
+								state: recorded.state,
+								operation: recorded.operation,
+								retry: recorded.retry ?? null,
+							});
+						}
 						const waitedValue: unknown = JSON.parse(waited.stdout);
 						if (!isRecord(waitedValue) || typeof waitedValue.settlementEvidencePath !== "string") throw new Error("headless wait returned invalid settlement");
 						settlementEvidencePath = waitedValue.settlementEvidencePath;
@@ -479,9 +549,39 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					}
 					const reportPath = typeof settlement.reportPath === "string" ? settlement.reportPath : operation.report_path;
 					let verdict: string | null = null;
+					let report: unknown;
 					if (reportPath && existsSync(reportPath)) {
-						const report: unknown = JSON.parse(readFileSync(reportPath, "utf8"));
+						report = JSON.parse(readFileSync(reportPath, "utf8"));
 						if (isRecord(report) && typeof report.verdict === "string") verdict = report.verdict;
+					}
+					const projectedFailure = projectedAttemptFailure(operation.node, report);
+					if (projectedFailure) {
+						const diagnostics = retainedFailureDiagnostics(privateRunDir);
+						const recorded = graphStore.record({
+							runId,
+							operationId,
+							status: "failed",
+							agentId: agent.id ?? undefined,
+							agentName: agent.name,
+							error: diagnostics ? `${projectedFailure}\nretained worker diagnostics: ${diagnostics}` : projectedFailure,
+						});
+						progress("worker_attempt_failed", { runId, operationId, agentName: agent.name, reason: "report-missing", diagnosticsPath: diagnostics ?? null, status: recorded.state.status });
+						return textResult({
+							runId,
+							operationId,
+							agentName: agent.name,
+							settled: false,
+							recorded: "failed",
+							reason: projectedFailure,
+							verdict: null,
+							reportPath,
+							settlementEvidencePath,
+							cleanupEvidencePath,
+							diagnosticsPath: diagnostics ?? null,
+							state: recorded.state,
+							operation: recorded.operation,
+							retry: recorded.retry ?? null,
+						});
 					}
 					progress("worker_settled", { runId, operationId, agentName: agent.name, verdict });
 					return textResult({ runId, operationId, agentName: agent.name, reportPath, settlementEvidencePath, cleanupEvidencePath, verdict, settlement });
@@ -499,7 +599,12 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const operation = graphStore.getOperation(operationId);
 					const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
 					if (!agent) throw new Error(`running operation ${operationId} has no registered worker`);
-					await cancelRegisteredAgent([agent], agent.name, executor(pi));
+					try {
+						await cancelRegisteredAgent([agent], agent.name, executor(pi));
+					} catch (cancelError) {
+						if (agent.acpx_state !== "no-session") throw cancelError;
+						progress("cancel_of_dead_attempt", { runId, operationId, agentName: agent.name, reason: String(cancelError) });
+					}
 					const result = graphStore.record({ runId, operationId, status: "cancelled", agentId: agent.id, agentName: agent.name, transport: agent.transport });
 					progress("cancelled", { runId, operationId, agentName: agent.name, status: result.state.status });
 					return textResult(result);
@@ -548,6 +653,9 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						ownedRoots: isOperationalSource ? JSON.parse(operation.owned_paths_json) as string[] : undefined,
 					});
 					if (!audit.valid) throw new Error(`delegate report rejected: ${formatDiagnostics(audit.errors)}`);
+					if (isProjectedSemanticReport(audit.report, operation.node)) {
+						throw new Error(`delegate report rejected: projected execution-only report cannot complete the semantic ${operation.node} operation ${operationId}; the worker never authored its report, so redispatch the operation`);
+					}
 					if (status === "completed") {
 						const evidence = acpxSettlementEvidence(params.payload);
 						const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
