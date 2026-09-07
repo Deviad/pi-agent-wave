@@ -101,7 +101,7 @@ export function agentFsChanges(dbPath: string, baseDir?: string, agentFsExecutab
 			const hostPath = resolve(baseDir, path);
 			if (kind === "directory" && existsSync(hostPath) && statSync(hostPath).isDirectory()) continue;
 			if (kind === "file" && existsSync(hostPath) && statSync(hostPath).isFile()) {
-				const exported = spawnSync(agentFsExecutable, ["fs", dbPath, "cat", `/${path}`], { encoding: null, shell: false });
+				const exported = spawnSync(agentFsExecutable, ["fs", dbPath, "cat", `/${path}`], { encoding: null, shell: false, maxBuffer: Infinity });
 				if (!exported.error && exported.status === 0 && Buffer.compare(exported.stdout, readFileSync(hostPath)) === 0 && (row.mode & 0o777) === (statSync(hostPath).mode & 0o777)) continue;
 			}
 		}
@@ -152,7 +152,7 @@ export function exportOwnedAgentFsChanges(agentFsExecutable: string, dbPath: str
 	for (const change of files) {
 		const target = resolve(baseDir, change.path);
 		mkdirSync(dirname(target), { recursive: true });
-		const result = spawnSync(agentFsExecutable, ["fs", dbPath, "cat", `/${change.path}`], { encoding: null, shell: false });
+		const result = spawnSync(agentFsExecutable, ["fs", dbPath, "cat", `/${change.path}`], { encoding: null, shell: false, maxBuffer: Infinity });
 		if (result.error || result.status !== 0) throw new Error(`failed to export AgentFS path ${change.path}`);
 		writeFileSync(target, result.stdout, { mode: change.mode });
 		if (change.mode !== undefined) chmodSync(target, change.mode);

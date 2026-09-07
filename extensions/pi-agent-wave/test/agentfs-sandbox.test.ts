@@ -85,6 +85,41 @@ describe("AgentFS operation-attempt sandbox", () => {
 		assert.equal(existsSync(join(f.base, "unowned.txt")), false);
 	});
 
+	test("unchanged large files do not become ownership violations", () => {
+		const f = fixture("large-unchanged");
+		const largePath = join(f.base, "large.txt");
+		const content = Buffer.alloc(5 * 1024 * 1024, "a");
+		writeFileSync(largePath, content);
+		const ownedPaths = [join(f.base, "owned.txt")];
+		const db = runScript(f, "large-unchanged", "cat large.txt > /dev/null\nprintf 'accepted\\n' > owned.txt");
+		const audit = auditAgentFsChanges(db, f.base, ownedPaths);
+		assert.deepEqual(audit.violations, []);
+		assert.deepEqual(audit.owned.map((change) => change.path), ["owned.txt"]);
+		exportOwnedAgentFsChanges("agentfs", db, f.base, audit);
+		assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), "accepted\n");
+		assert.deepEqual(readFileSync(largePath), content);
+
+		const changedDb = runScript(f, "large-changed", "printf 'changed\\n' > large.txt\nprintf 'rejected\\n' > owned.txt");
+		const changedAudit = auditAgentFsChanges(changedDb, f.base, ownedPaths);
+		assert.ok(changedAudit.violations.some((change) => change.path === "large.txt"));
+		assert.throws(() => exportOwnedAgentFsChanges("agentfs", changedDb, f.base, changedAudit), /unowned changes/);
+		assert.deepEqual(readFileSync(largePath), content);
+		assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), "accepted\n");
+	});
+
+	test("exports large owned files byte-for-byte", () => {
+		const f = fixture("large-export");
+		const content = Buffer.alloc(5 * 1024 * 1024, "b");
+		const payload = join(f.privateDir, "payload.txt");
+		writeFileSync(payload, content);
+		const db = runScript(f, "large-export", `cp '${payload}' owned.txt`);
+		const audit = auditAgentFsChanges(db, f.base, [join(f.base, "owned.txt")]);
+		assert.deepEqual(audit.violations, []);
+		assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), "original\n");
+		exportOwnedAgentFsChanges("agentfs", db, f.base, audit);
+		assert.deepEqual(readFileSync(join(f.base, "owned.txt")), content);
+	});
+
 	test("exports only audited owned files after successful execution", () => {
 		const f = fixture("export");
 		const db = runScript(f, "attempt-export", "printf 'accepted\\n' > owned.txt");
