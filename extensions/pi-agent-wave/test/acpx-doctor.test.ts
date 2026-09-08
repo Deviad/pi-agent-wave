@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { agentForModel, inspectRouteCredential, runDoctor } from "../scripts/doctor.mjs";
 import { selectAcpAgent } from "../lib/acpx-select.ts";
@@ -24,7 +25,7 @@ describe("doctor ACPX and AgentFS readiness", () => {
 	});
 
 	test("the doctor, TypeScript selector, and Python preflight all map a model to the same agent", () => {
-		const driver = join(process.cwd(), "extensions/pi-agent-wave/test/support/provider-snapshot-driver.py");
+		const driver = fileURLToPath(new URL("./support/provider-snapshot-driver.py", import.meta.url));
 		const run = spawnSync("python3", [driver, "agent", "agent"], { cwd: process.cwd(), encoding: "utf8", timeout: 60_000 });
 		assert.equal(run.status, 0, run.stderr);
 		const python = JSON.parse(run.stdout).agents as Record<string, string>;

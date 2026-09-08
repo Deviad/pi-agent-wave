@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const directories: string[] = [];
@@ -12,7 +13,7 @@ afterEach(() => {
 
 describe("ACPX-only headless transport", () => {
 	test("headless and Herdr wrappers share one lifecycle implementation", () => {
-		const scripts = join(process.cwd(), "extensions/pi-agent-wave/scripts");
+		const scripts = fileURLToPath(new URL("../scripts", import.meta.url));
 		const core = readFileSync(join(scripts, "delegate_core.py"), "utf8");
 		for (const [name, transport] of [["headless_delegate.py", "headless"], ["herdr_delegate.py", "herdr"]] as const) {
 			const wrapper = readFileSync(join(scripts, name), "utf8");
@@ -27,12 +28,12 @@ describe("ACPX-only headless transport", () => {
 		const directory = mkdtempSync(join(tmpdir(), "acpx-headless-transport-"));
 		directories.push(directory);
 		const herdrLog = join(directory, "herdr.log");
-		const fakeAcpx = join(process.cwd(), "extensions/pi-agent-wave/test/support/fake-acpx.mjs");
+		const fakeAcpx = fileURLToPath(new URL("./support/fake-acpx.mjs", import.meta.url));
 		writeFileSync(join(directory, "acpx"), readFileSync(fakeAcpx), { mode: 0o755 });
 		chmodSync(join(directory, "acpx"), 0o755);
 		writeFileSync(join(directory, "herdr"), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${herdrLog}'\nexit 91\n`, { mode: 0o755 });
 		chmodSync(join(directory, "herdr"), 0o755);
-		const script = join(process.cwd(), "extensions/pi-agent-wave/scripts/headless_delegate.py");
+		const script = fileURLToPath(new URL("../scripts/headless_delegate.py", import.meta.url));
 		const env = { ...process.env, PATH: `${directory}:${process.env.PATH}` };
 		delete env.HERDR_ENV;
 		delete env.HERDR_WORKSPACE_ID;
