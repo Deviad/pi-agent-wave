@@ -1,14 +1,13 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
-import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // Resolved from this file, not the working directory: the same suite must fail the same way whether
 // it is started from the repository root or the package directory.
 const DRIVER = new URL("./support/acpx-cleanup-driver.py", import.meta.url).pathname;
 
-function driver(mode: "abort" | "default-cancel" | "persistence" | "inventory" | "teardown" | "closure", name: string): Record<string, unknown> {
+function driver(mode: "abort" | "default-cancel" | "persistence" | "inventory" | "teardown" | "closure" | "live", name: string): Record<string, unknown> {
 	const result = spawnSync("python3", [DRIVER, mode, name], { cwd: process.cwd(), encoding: "utf8" });
 	assert.equal(result.status, 0, result.stderr);
 	return JSON.parse(result.stdout);
@@ -58,6 +57,25 @@ describe("ACPX AgentFS targeted cleanup", () => {
 		assert.deepEqual(result.evidenceCounts, [0, 0, 0], "an incomplete teardown writes no absence evidence");
 		assert.equal(result.linkRemained, true, "the surviving link must still be there for the next pass to find");
 		assert.equal(result.targetPathLeaked, false, JSON.stringify(result));
+	});
+
+	// The process-survivor branch used to be proven only with injected `ps` text, so it could pass
+	// while the real probe matched nothing. This case spawns an actual long-lived child carrying a
+	// per-run unique session token, fails cleanup closed against it, then kills it and re-runs.
+	test("fails closed against a real running owned process and converges after it is killed", () => {
+		const result = driver("live", "live-process");
+		if (result.skipped === true) return console.log(`skipped: ${String(result.reason)}`);
+		const phaseOne = result.phaseOne as Record<string, unknown>;
+		const phaseTwo = result.phaseTwo as Record<string, unknown>;
+		assert.ok(Number(result.visibleBefore) >= 1, "the probe must see the spawned process in real ps output before cleanup runs");
+		assert.equal(phaseOne.evidence, 0, "a live owned process must never produce absence evidence");
+		assert.equal(phaseOne.exit, 1, "cleanup must fail closed while an owned process survives");
+		assert.match(String(phaseOne.output), /ownedProcessesAbsent/, JSON.stringify(phaseOne));
+		assert.equal(result.childAliveAtPhaseTwo, false);
+		assert.equal(result.psAfterKill, 0, "the driver must leave no owned process behind");
+		assert.equal(phaseTwo.exit, 0, `teardown must converge once the process is gone: ${JSON.stringify(phaseTwo)}`);
+		assert.equal(phaseTwo.evidence, 1, "the converging pass must write its absence evidence");
+		assert.equal(phaseTwo.closure, "files-and-processes-absent", "closure requires the process check to have really run");
 	});
 
 	test("reports a session as unclosed when a session file survives and nothing proved closure", () => {
@@ -136,7 +154,7 @@ describe("ACPX AgentFS targeted cleanup", () => {
 	}
 
 	test("cleanup is idempotent for an owned empty run", () => {
-		const script = join(process.cwd(), "extensions/pi-agent-wave/scripts/herdr_delegate.py");
+		const script = new URL("../scripts/herdr_delegate.py", import.meta.url).pathname;
 		const env = { ...process.env, HERDR_ENV: "1", HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID ?? "workspace", HERDR_TAB_ID: process.env.HERDR_TAB_ID ?? "tab" };
 		const init = spawnSync("python3", [script, "init", "cleanup-idempotent"], { encoding: "utf8", env });
 		assert.equal(init.status, 0, init.stderr);

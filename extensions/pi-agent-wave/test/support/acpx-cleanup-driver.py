@@ -158,6 +158,123 @@ CLI = SCRIPTS / "headless_delegate.py"
 CREDENTIAL_TARGET = "credential-target"
 
 
+def live_process_case() -> dict[str, object]:
+    """Drive the real headless CLI teardown over a real long-lived owned process.
+
+    Every other teardown case feeds the owned-process probe injected `ps` text. This one starts an
+    actual child process whose argv carries a per-run unique session token, so the probe's
+    command-line substring match runs against something `ps` really reports, and no unrelated host
+    process can decide the result. While the child lives, cleanup must fail closed and write no
+    evidence; after it is killed, the same command must converge with real absence evidence. The
+    child is terminated on every exit path.
+    """
+    session = f"dg-live-{uuid.uuid4().hex[:10]}"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+    root = Path(tempfile.mkdtemp(prefix="acpx-live-"))
+    init = subprocess.run([sys.executable, str(CLI), "init", "live-process"], capture_output=True, text=True, env=env, cwd=str(root), check=False)
+    if init.returncode != 0:
+        return {"case": "live-process", "skipped": True, "reason": (init.stderr or init.stdout).strip()[:200]}
+    run_dir = Path(init.stdout.strip())
+    agent = "dg_probe_auditor_0001"
+    attempt = run_dir / "acpx" / agent
+    acpx_home = attempt / "acpx-home"
+    agentfs_home = attempt / "agentfs-home"
+    acpx_home.mkdir(parents=True)
+    agentfs_home.mkdir(parents=True)
+    credential = acpx_home / "auth.json"
+    credential.write_text('{"alibaba":{"type":"api_key","key":"placeholder-not-a-secret"}}\n', encoding="utf-8")
+    credential.chmod(0o600)
+    launcher = attempt / "cancel-acpx.sh"
+    launcher.write_text("#!/bin/sh\nprintf '%s\\n' '{\"action\":\"cancel_attempt\"}'\n", encoding="utf-8")
+    launcher.chmod(0o700)
+    database = agentfs_home / ".agentfs" / "run" / session
+    database.mkdir(parents=True)
+    (database / "delta.db").write_bytes(b"not-a-real-db")
+    state_path = run_dir / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["resources"] = [{
+        "execution": "acpx-agentfs",
+        "run_id": "run_probe",
+        "operation_id": "op_probe",
+        "agent": agent,
+        "node": "audit",
+        "role": "auditor",
+        "acp_agent": "codex",
+        "model": "alibaba/some-model",
+        "tier": "balanced",
+        "acpx_session": session,
+        "acpx_record_id": session,
+        "acpx_attempt_key": "run:op:audit:0:0:model:codex",
+        "agentfs_session": session,
+        "agentfs_home": str(agentfs_home),
+        "acpx_home": str(acpx_home),
+        "agentfs_db_path": str(agentfs_home / f".agentfs/run/{session}/delta.db"),
+        "attempt_dir": str(attempt),
+        "worker_result": str(attempt / "worker-result.json"),
+        "acpx_cancel_script": str(launcher),
+        "provider_links": [],
+        "pane": None,
+        "tab": None,
+        "report_repair_attempts": 0,
+    }]
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    resource = state["resources"][0]
+
+    def owned_process_lines() -> list[str]:
+        probe = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=False)
+        lines = [line.strip() for line in probe.stdout.splitlines()]
+        return [line for line in lines if session in line and "herdr_delegate.py" not in line and "ps -axo" not in line]
+
+    child = None
+    try:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)", session],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        visible_before = owned_process_lines()
+        first = subprocess.run([sys.executable, str(CLI), "cleanup", str(run_dir)], capture_output=True, text=True, env=env, cwd=str(root), check=False)
+        phase_one = {
+            "exit": first.returncode,
+            "evidence": len(list(run_dir.glob("cleanup-*.json"))),
+            "output": (first.stdout + first.stderr)[:600],
+        }
+        child.kill()
+        child.wait(timeout=10)
+        child = None
+        second = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, check=False)
+        survivors = [line for line in second.stdout.splitlines() if session in line and "ps -axo" not in line]
+        third = subprocess.run([sys.executable, str(CLI), "cleanup", str(run_dir)], capture_output=True, text=True, env=env, cwd=str(root), check=False)
+        evidence = sorted(run_dir.glob("cleanup-*.json"))
+        payload = json.loads(evidence[-1].read_text(encoding="utf-8")) if evidence else {}
+        return {
+            "case": "live-process",
+            "skipped": False,
+            "session": session,
+            "visibleBefore": len(visible_before),
+            "childAlive": True,
+            "phaseOne": phase_one,
+            "childAliveAtPhaseTwo": child is not None and child.poll() is None,
+            "psAfterKill": len(survivors),
+            "phaseTwo": {
+                "exit": third.returncode,
+                "evidence": len(evidence),
+                "closure": payload.get("sessionClosureEvidence"),
+                "sessionClosed": payload.get("sessionClosed"),
+                "output": (third.stdout + third.stderr)[:600],
+            },
+        }
+    finally:
+        if child is not None:
+            child.kill()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
 def teardown_case(case: str) -> dict[str, object]:
     """Drive the real headless CLI teardown three times over real disposable resources.
 
@@ -388,6 +505,7 @@ if mode == "abort": result = abort_case(case)
 elif mode == "diagnostics": result = diagnostics_case()
 elif mode == "absent-attempt": result = absent_attempt_case()
 elif mode == "teardown": result = teardown_case(case)
+elif mode == "live": result = live_process_case()
 elif mode == "closure": result = closure_case(case)
 elif mode == "default-cancel": result = default_cancel_case()
 elif mode == "persistence": result = persistence_case()
