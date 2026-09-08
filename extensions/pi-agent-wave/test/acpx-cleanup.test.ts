@@ -4,9 +4,11 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const DRIVER = join(process.cwd(), "extensions/pi-agent-wave/test/support/acpx-cleanup-driver.py");
+// Resolved from this file, not the working directory: the same suite must fail the same way whether
+// it is started from the repository root or the package directory.
+const DRIVER = new URL("./support/acpx-cleanup-driver.py", import.meta.url).pathname;
 
-function driver(mode: "abort" | "default-cancel" | "persistence" | "inventory", name: string): Record<string, unknown> {
+function driver(mode: "abort" | "default-cancel" | "persistence" | "inventory" | "teardown" | "closure", name: string): Record<string, unknown> {
 	const result = spawnSync("python3", [DRIVER, mode, name], { cwd: process.cwd(), encoding: "utf8" });
 	assert.equal(result.status, 0, result.stderr);
 	return JSON.parse(result.stdout);
@@ -23,6 +25,54 @@ describe("ACPX AgentFS targeted cleanup", () => {
 	] as const) {
 		test(`fails closed on ${name}`, () => assert.equal(driver("abort", mode).failed, true));
 	}
+
+	test("names a remaining credential by basename only", () => {
+		const result = driver("abort", "provider-link");
+		assert.equal(result.credentialPathLeaked, false, JSON.stringify(result.failures));
+	});
+
+	test("repeated teardown over a torn-down attempt converges with written absence evidence", () => {
+		const result = driver("teardown", "repeat-teardown");
+		if (result.skipped === true) return console.log(`skipped: ${String(result.reason)}`);
+		assert.deepEqual(result.exits, [0, 0, 0], `repeat cleanup must converge: ${JSON.stringify(result)}`);
+		assert.deepEqual(result.evidenceCounts, [1, 1, 1], "every cleanup pass must record its own absence audit");
+		assert.deepEqual(result.closure, ["files-and-processes-absent"], "closure must come from an observation, never a literal");
+		assert.deepEqual(result.missingNoise, [false, false, false], "an already-absent resource must not surface as a cancel or credential error");
+		assert.equal(result.targetPathLeaked, false, "a credential target path must never reach the emitted reason");
+		assert.equal(result.attemptRemained, false);
+	});
+
+	test("partial teardown of a missing launcher and credential converges on evidence", () => {
+		const result = driver("teardown", "partial-teardown");
+		if (result.skipped === true) return console.log(`skipped: ${String(result.reason)}`);
+		assert.deepEqual(result.exits, [0, 0, 0], `a torn-down launcher and credential must not fail cleanup forever: ${JSON.stringify(result)}`);
+		assert.deepEqual(result.missingNoise, [false, false, false], "the emitted reason must not name an absent launcher or credential");
+		assert.deepEqual(result.evidenceCounts, [1, 1, 1]);
+		assert.equal(result.attemptRemained, false);
+	});
+
+	test("teardown keeps failing closed while an owned credential link survives", () => {
+		const result = driver("teardown", "survivor");
+		if (result.skipped === true) return console.log(`skipped: ${String(result.reason)}`);
+		assert.deepEqual(result.exits, [1, 1, 1], `a surviving provider link must never look like convergence: ${JSON.stringify(result)}`);
+		assert.deepEqual(result.evidenceCounts, [0, 0, 0], "an incomplete teardown writes no absence evidence");
+		assert.equal(result.linkRemained, true, "the surviving link must still be there for the next pass to find");
+		assert.equal(result.targetPathLeaked, false, JSON.stringify(result));
+	});
+
+	test("reports a session as unclosed when a session file survives and nothing proved closure", () => {
+		const result = driver("closure", "unobserved");
+		assert.equal(result.failed, true, "a surviving session file must fail the absence audit");
+		assert.match(String(result.reason), /sessionClosed/, "the audit must name the unclosed session instead of asserting closure");
+		assert.equal(result.evidenceWritten, false, "an unproven closure writes no absence evidence");
+	});
+
+	test("records which observation proved session closure", () => {
+		const result = driver("closure", "observed");
+		assert.equal(result.failed, false);
+		assert.equal(result.sessionClosed, true);
+		assert.equal(result.closure, "close-proved", "closure must name the observation, not just a boolean");
+	});
 
 	test("executes the production default structured cancellation launcher", () => {
 		assert.equal(driver("default-cancel", "default-cancel").passed, true);

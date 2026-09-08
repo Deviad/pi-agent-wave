@@ -28,9 +28,21 @@ const TRANSIENT_PATTERNS: Array<[RegExp, string]> = [
 	[/worker preflight|no usable credential/i, "worker-credential-preflight"],
 ];
 
+/**
+ * Approval and permission denials, matched before the transient scan because a
+ * denied authorization replays identically on retry and is never retryable
+ * infrastructure. This is worker-settlement classification; provider HTTP errors are
+ * classified separately in lib/model-failover-native.mjs. The two lanes must not
+ * disagree, so test/approval-block-routing.test.ts pins that a denial is permanent
+ * here and terminal there even when the provider marks the error retryable.
+ */
+const APPROVAL_BLOCK_PATTERN =
+	/permission[_ -]?denied|permission (?:request )?(?:denied|cancelled)|permission denied for (?:terminal|fs|tool)|denied (?:by|before) [^,.;\n]*(?:approval|permission)|approval (?:gate )?(?:block|block(?:ed)?|denied|rejected)/i;
+
 /** Classifies infrastructure-shaped failures without treating semantic verdicts as retryable. */
 export function classifyFailure(message: string, semanticVerdict = false): FailureClassification {
 	if (semanticVerdict) return { kind: "permanent", reason: "semantic-verdict" };
+	if (APPROVAL_BLOCK_PATTERN.test(message)) return { kind: "permanent", reason: "approval-block" };
 	for (const [pattern, reason] of TRANSIENT_PATTERNS) {
 		if (pattern.test(message)) return { kind: "transient", reason };
 	}

@@ -189,6 +189,20 @@ function projectPiReport(config: AcpxWorkerConfig, silentTurn: boolean): string[
 	return [];
 }
 
+/**
+ * acpx exits with EXIT_CODES.PERMISSION_DENIED (5) and reports `permission_denied`
+ * when every permission request in a turn was denied or cancelled, which is an
+ * approval block, not a runtime fault. retry.ts classifies the recorded signal as
+ * permanent, so a denied authorization never replays.
+ */
+const ACPX_PERMISSION_DENIED_EXIT = 5;
+const APPROVAL_BLOCK_OUTPUT = /permission[_ -]?denied|permission (?:request )?(?:denied|cancelled)|permission denied for (?:terminal|fs|tool)|denied (?:by|before) [^,.;\n]*(?:approval|permission)/i;
+
+/** True when the worker turn ended on a denied authorization rather than an infrastructure fault. */
+export function detectApprovalBlock(exitCode: number, output: string): boolean {
+	return exitCode === ACPX_PERMISSION_DENIED_EXIT || APPROVAL_BLOCK_OUTPUT.test(output);
+}
+
 /** Runs one ACPX operation-attempt session and writes a structured result for the Herdr supervisor. */
 export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 	const sandboxRoot = process.cwd();
@@ -233,6 +247,7 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 		noTerminal: config.noTerminal,
 		ensureAttempts: ensure.attempts,
 		silentTurn,
+		permissionDenied: detectApprovalBlock(prompt.exitCode, `${prompt.stdout}\n${prompt.stderr}`),
 		projectionErrors: silentTurn ? ["worker-silent-turn: the attempt produced no assistant or tool activity; Pi records a failed model request as an empty assistant message"] : projectionErrors,
 	};
 	writeFileSync(config.resultPath, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });

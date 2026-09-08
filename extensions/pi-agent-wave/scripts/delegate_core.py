@@ -12,6 +12,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -575,8 +576,20 @@ def copy_credential_file(source: Path, destination: Path) -> dict[str, str]:
     return materialize_credential_file(destination, source.read_text(encoding="utf-8"))
 
 
+def snapshot_runtime_file(source: Path, destination: Path) -> dict[str, str]:
+    """Freeze configuration or a token in a private file whose bytes must survive unchanged."""
+    data = source.read_bytes()
+    write_private_bytes(destination, data)
+    return {
+        "kind": "snapshot",
+        "link": str(destination),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "mode": oct(destination.stat().st_mode & 0o777),
+    }
+
+
 def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: Path, selected_model: str = "", command_runner: Any = run) -> tuple[dict[str, str], list[dict[str, str]]]:
-    """Build the attempt-private provider view: read-only links plus one materialized Pi credential."""
+    """Build the selected agent's private credentials and immutable runtime configuration."""
     if not selected_model:
         raise DelegateError("provider runtime environment requires the frozen selected model")
     providers = attempt_dir / "providers"
@@ -599,38 +612,29 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
         claude_credentials = real_home / ".claude" / ".credentials.json"
         if claude_credentials.is_file():
             links.append(copy_credential_file(claude_credentials, claude_home / ".credentials.json"))
-    for source, destination in (
-        (real_home / ".pi" / "agent" / "models.json", pi_agent_dir / "models.json"),
-        (real_home / ".pi" / "agent" / "models-store.json", pi_agent_dir / "models-store.json"),
-        (real_home / ".pi" / "agent" / "model-routing.jsonc", pi_agent_dir / "model-routing.jsonc"),
-        (real_home / ".codex" / "config.toml", codex_home / "config.toml"),
-        (real_home / ".claude.json", acpx_home / ".claude.json"),
-        (real_home / ".claude" / "settings.json", claude_home / "settings.json"),
-    ):
+    configuration = {
+        "pi": (
+            (real_home / ".pi" / "agent" / "models.json", pi_agent_dir / "models.json"),
+            (real_home / ".pi" / "agent" / "models-store.json", pi_agent_dir / "models-store.json"),
+            (real_home / ".pi" / "agent" / "model-routing.jsonc", pi_agent_dir / "model-routing.jsonc"),
+        ),
+        "codex": ((Path(os.environ.get("CODEX_HOME", str(real_home / ".codex"))).expanduser() / "config.toml", codex_home / "config.toml"),),
+        "claude": (
+            (real_home / ".claude.json", acpx_home / ".claude.json"),
+            (real_home / ".claude" / "settings.json", claude_home / "settings.json"),
+        ),
+    }
+    for source, destination in configuration[agent]:
         if source.exists():
-            destination.symlink_to(source)
-            links.append({
-                "kind": "symlink",
-                "link": str(destination),
-                "target": str(source),
-                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-                "mode": oct(source.stat().st_mode & 0o777),
-            })
-    claude_token_source = os.environ.get("PI_CLAUDE_OAUTH_TOKEN_FILE")
+            links.append(snapshot_runtime_file(source, destination))
+    claude_token_source = os.environ.get("PI_CLAUDE_OAUTH_TOKEN_FILE") if agent == "claude" else None
     claude_token_link: Path | None = None
     if claude_token_source:
         source = Path(claude_token_source).resolve()
         if not source.is_file() or source.stat().st_mode & 0o077:
             raise DelegateError("PI_CLAUDE_OAUTH_TOKEN_FILE must name a mode-600 regular file")
         claude_token_link = claude_home / "setup-token"
-        claude_token_link.symlink_to(source)
-        links.append({
-            "kind": "symlink",
-            "link": str(claude_token_link),
-            "target": str(source),
-            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "mode": oct(source.stat().st_mode & 0o777),
-        })
+        links.append(snapshot_runtime_file(source, claude_token_link))
     write_private(pi_agent_dir / "settings.json", json.dumps(worker_pi_settings(real_home), indent=2, sort_keys=True) + "\n")
     environment = {
         "PI_CODING_AGENT_DIR": str(pi_agent_dir),
@@ -680,7 +684,7 @@ def prepare_acpx_attempt(
     provider_environment, provider_links = provider_runtime_environment(attempt_dir, acpx_home, real_home, model)
     prompt_file = attempt_dir / "prompt.md"
     prompt = task_file.read_text(encoding="utf-8") + operational_instruction(args.command_json) + "\n" + report_contract + "\n"
-    read_only = node in {"thinker_plan", "review", "test", "audit", "thinker_split", "thinker_synthesize"}
+    read_only = args.access_mode == "read-only" if args.access_mode is not None else node not in {"implement", "source_search"}
     if args.no_terminal:
         prompt += "Terminal capability is disabled. Use ACP filesystem read/search capabilities and the private report path only; consume recorded host evidence instead of running commands.\n"
     if agent == "pi":
@@ -1000,6 +1004,24 @@ def close_settled_tab(
         raise primary_error
 
 
+ACPX_PERMISSION_DENIED_EXIT = 5  # acpx EXIT_CODES.PERMISSION_DENIED
+APPROVAL_BLOCK_TEXT = re.compile(
+    r"permission[_ \-]?denied|permission (?:request )?(?:denied|cancelled)"
+    r"|permission denied for (?:terminal|fs|tool)"
+    r"|denied (?:by|before) [^,.;\n]*(?:approval|permission)",
+    re.IGNORECASE,
+)
+
+
+def is_approval_block(result: dict[str, Any]) -> bool:
+    """True when the worker result reports a denied authorization rather than a runtime fault."""
+    if result.get("permissionDenied") is True:
+        return True
+    if str(result.get("status", "")).lower() in ("permission_denied", "access_denied"):
+        return True
+    return result.get("processExitCode") == ACPX_PERMISSION_DENIED_EXIT
+
+
 def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
     agent_name = str(resource["agent"])
     if resource.get("execution") == "acpx-agentfs":
@@ -1031,6 +1053,11 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
                 "--seq", str(int(resource.get("report_repair_attempts", 0)) + 2),
             ])
         if exit_code != 0 or terminal_kind != "completed":
+            if is_approval_block(result):
+                raise DelegateError(
+                    f"worker approval block: permission_denied exit={exit_code} terminal={terminal_kind}; "
+                    "the authorized command was denied before execution, so a retry replays the same denial"
+                )
             raise DelegateError(f"ACPX worker failed: exit={exit_code} terminal={terminal_kind}")
         return
     wait_result = run(
@@ -1158,23 +1185,38 @@ def export_agentfs_owned_changes(resource: dict[str, Any]) -> dict[str, Any]:
     snapshot_agentfs_db(resource)
     env = os.environ.copy()
     env["PI_AGENTFS_EXPORT_CONFIG"] = str(resource["export_config"])
-    run([NODE, "--experimental-strip-types", str(AGENTFS_EXPORT)], env=env)
+    completed = run([NODE, "--experimental-strip-types", str(AGENTFS_EXPORT)], env=env, check=False)
+    stderr = redact_failure_text(completed.stderr[-FAILURE_DIAGNOSTIC_STDERR_BYTES:])
+    resource["agentfs_export_process"] = {"exitCode": completed.returncode, "stderrTail": stderr}
     try:
-        return json.loads(Path(str(resource["export_result"])).read_text(encoding="utf-8"))
+        result = json.loads(Path(str(resource["export_result"])).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise DelegateError(f"invalid AgentFS export result: {error}") from error
+        raise DelegateError(f"invalid AgentFS export result (exit {completed.returncode}): {stderr or error}") from error
+    if not isinstance(result, dict) or not isinstance(result.get("violations"), list):
+        raise DelegateError(f"invalid AgentFS export result (exit {completed.returncode})")
+    if completed.returncode != 0 or result.get("exported") is not True or result["violations"]:
+        paths = ", ".join(redact_failure_text(str(change.get("path", "")))[:FAILURE_DIAGNOSTIC_EVENT_CHARS]
+                          for change in result["violations"][:FAILURE_DIAGNOSTIC_EVENT_LIMIT] if isinstance(change, dict))
+        detail = f"unowned changes ({len(result['violations'])} total): {paths}" if paths else stderr or "no successful export receipt"
+        raise DelegateError(f"AgentFS export failed (exit {completed.returncode}): {detail}")
+    return result
 
 
 def verify_provider_links(resource: dict[str, Any]) -> bool:
     for item in resource.get("provider_links", []):
         link = Path(str(item["link"]))
-        if item.get("kind", "symlink") == "file":
+        if item.get("kind", "symlink") in ("file", "snapshot"):
+            label = "runtime configuration snapshot" if item["kind"] == "snapshot" else "materialized provider credential"
             if link.is_symlink():
-                raise DelegateError(f"materialized provider credential became a symlink: {link}")
+                raise DelegateError(f"{label} became a symlink: {link}")
             if not link.is_file():
-                raise DelegateError(f"materialized provider credential is missing: {link}")
-            if oct(link.stat().st_mode & 0o777) != item["mode"]:
-                raise DelegateError(f"materialized provider credential mode changed: {link}")
+                raise DelegateError(f"{label} is missing: {link}")
+            if oct(stat.S_IMODE(link.stat().st_mode)) != item["mode"]:
+                raise DelegateError(f"{label} mode changed: {link}")
+            if item["kind"] == "snapshot":
+                if hashlib.sha256(link.read_bytes()).hexdigest() != item["sha256"]:
+                    raise DelegateError(f"{label} changed: {link}")
+                continue
             # The byte hash is deliberately not compared for a JSON credential store: an agent refreshes
             # its own tokens by rewriting this private file inside the attempt, which is confined and
             # expected. What must not change is the store's shape. A non-JSON store keeps hash equality.
@@ -1378,6 +1420,28 @@ def _recent_worker_events(path: Path, limit: int) -> list[object]:
     return events
 
 
+def export_failure_summary(result_path: Path) -> dict[str, object] | None:
+    """Retains export disposition and bounded violating paths after the attempt is removed."""
+    if not result_path.is_file():
+        return None
+    try:
+        result = json.loads(redact_failure_text(result_path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return {"unreadable": True}
+    if not isinstance(result, dict) or not isinstance(result.get("violations"), list):
+        return {"unreadable": True}
+    violations = result["violations"]
+    return {
+        "exported": result.get("exported") is True,
+        "violationCount": len(violations),
+        "violations": [
+            {key: str(change.get(key, ""))[:FAILURE_DIAGNOSTIC_EVENT_CHARS] for key in ("path", "kind")}
+            for change in violations[:FAILURE_DIAGNOSTIC_EVENT_LIMIT] if isinstance(change, dict)
+        ],
+        "discardedReadOnlyChanges": result.get("discardedReadOnlyChanges", 0),
+    }
+
+
 def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | None:
     """Retain a bounded private diagnostic bundle before the attempt directory is removed."""
     attempt_dir = Path(str(resource.get("attempt_dir", "")))
@@ -1408,6 +1472,8 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
         "processExitCode": result.get("processExitCode") if isinstance(result, dict) else None,
         "terminalKind": terminal.get("kind") if isinstance(terminal, dict) else None,
         "workerResult": result,
+        "agentFsExport": export_failure_summary(Path(str(resource.get("export_result", attempt_dir / "export-result.json")))),
+        "agentFsExportProcess": resource.get("agentfs_export_process"),
         "stderrTail": _read_text_tail(attempt_dir / "worker.stderr.txt", FAILURE_DIAGNOSTIC_STDERR_BYTES),
         "recentEvents": _recent_worker_events(attempt_dir / "worker.stdout.ndjson", FAILURE_DIAGNOSTIC_EVENT_LIMIT),
     }
@@ -1417,17 +1483,31 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
     return path
 
 
+def without_target_paths(text: str) -> str:
+    """Reduce absolute path tokens to their basename so credential targets never reach a log or report."""
+    return re.sub(r"(?:/[A-Za-z0-9._:@+~-]+){2,}", lambda match: Path(match.group(0)).name, text)
+
+
 def abort_acpx_attempt(resource: dict[str, Any], cancel_attempt: Any = run_structured_cancel, provider_verifier: Any = verify_provider_links, command_runner: Any = run, tab_closer: Any = close_created_tab, remove_tree: Any = None) -> list[str]:
     failures: list[str] = []
     write_failure_diagnostics(resource, "attempt aborted before cleanup")
-    try:
-        cancel_attempt(resource)
-    except Exception as error:
-        failures.append(f"ACPX cancel/close error: {error}")
-    try:
-        provider_verifier(resource)
-    except Exception as error:
-        failures.append(f"provider link verification failed: {error}")
+    launcher = Path(str(resource.get("acpx_cancel_script", "")))
+    # A teardown only has something to cancel while the attempt launcher still exists; a repeat
+    # cleanup after a completed teardown must converge instead of reporting an absent launcher.
+    if str(resource.get("acpx_session", "")) and launcher.is_file():
+        try:
+            cancel_result = cancel_attempt(resource)
+            if isinstance(cancel_result, dict) and cancel_result.get("noSession") is True:
+                resource["session_closure"] = "cancel-proved"
+        except Exception as error:
+            failures.append(f"ACPX cancel/close error: {without_target_paths(str(error))}")
+    remaining_links = [Path(str(link.get("link") if isinstance(link, dict) else link)) for link in resource.get("provider_links", []) if str(link)]
+    # Absence is the desired teardown end state, so integrity is only verified while a link is still there.
+    if any(os.path.lexists(link) for link in remaining_links):
+        try:
+            provider_verifier(resource)
+        except Exception as error:
+            failures.append("provider link verification failed: " + without_target_paths(str(error)))
     if using_herdr():
         released = command_runner([
             "herdr", "pane", "release-agent", str(resource["pane"]),
@@ -1495,11 +1575,17 @@ def verify_cleanup_absence(run_dir: Path, resource: dict[str, Any], evidence_wri
     processes = run(["ps", "-axo", "pid=,command="], check=False)
     mounts = run(["mount"], check=False)
     inventory = cleanup_absence_inventory(resource, tabs_output, pane_exists, agent_exists, processes.stdout, mounts.stdout)
+    # Closure is only ever recorded from an observation: a structured cancellation that proved
+    # no-session, a verified session close, or a session that is gone from both files and processes.
+    closure = resource.get("session_closure")
+    if closure is None:
+        closure = "files-and-processes-absent" if inventory.get("acpxSessionFilesAbsent") is True and inventory.get("ownedProcessesAbsent") is True else "unproven"
     evidence = {
         "schemaVersion": 1,
         "agent": resource["agent"],
         **inventory,
-        "sessionClosed": True,
+        "sessionClosed": closure in ("cancel-proved", "close-proved", "files-and-processes-absent"),
+        "sessionClosureEvidence": closure,
     }
     required = ["tabAbsent", "paneAbsent", "agentAbsent", "queueOwnerAbsent", "acpxSessionFilesAbsent", "agentFsMountAbsent", "agentFsServerAbsent", "agentFsDatabaseAbsent", "agentFsHomeAbsent", "providerLinksAbsent", "reportRepairChildAbsent", "attemptDirectoryAbsent", "ownedProcessesAbsent", "sessionClosed"]
     failures = [key for key in required if evidence.get(key) is not True]
@@ -1533,10 +1619,13 @@ def command_wait(args: argparse.Namespace) -> None:
             settlement_evidence: Path | None = None
             if resource.get("execution") == "acpx-agentfs":
                 try:
-                    export_result = export_agentfs_owned_changes(resource)
                     presentation_observation = observe_presentation_identity(resource)
+                    if presentation_observation.get("presentationVerified") is not True or presentation_observation.get("identityMatches") is not True:
+                        raise DelegateError("worker presentation identity does not match the registered attempt")
                     close_result = close_acpx_attempt(resource)
+                    resource["session_closure"] = "close-proved"
                     provider_links_verified = verify_provider_links(resource)
+                    export_result = export_agentfs_owned_changes(resource)
                     ledger_result = write_and_audit_attempt_ledger(run_dir, resource)
                     settlement_evidence = write_settlement_evidence(run_dir, resource, export_result, close_result, ledger_result, presentation_observation, provider_links_verified)
                 except DelegateError as error:
@@ -1623,9 +1712,19 @@ def command_cleanup(args: argparse.Namespace) -> None:
         resource["tab"] for resource in read_state(run_dir)["resources"] if resource.get("tab")
     ))
     failures: list[str] = []
+    cleanup_evidence: list[str] = []
     for resource in read_state(run_dir)["resources"]:
-        if resource.get("execution") == "acpx-agentfs" and Path(str(resource.get("attempt_dir", ""))).exists():
+        if resource.get("execution") != "acpx-agentfs":
+            continue
+        # Teardown work is attempted only while an owned resource is still registered, so a repeat
+        # cleanup of a torn-down attempt does not re-report absent resources as failures. The absence
+        # audit then runs on every path, which is what makes convergence observable.
+        if Path(str(resource.get("attempt_dir", ""))).exists() or Path(str(resource.get("acpx_cancel_script", ""))).is_file():
             failures.extend(abort_acpx_attempt(resource))
+        try:
+            cleanup_evidence.append(str(verify_cleanup_absence(run_dir, resource)))
+        except DelegateError as error:
+            failures.append(str(error))
     for tab_id in tab_ids:
         try:
             close_created_tab(run_dir, tab_id)
@@ -1634,7 +1733,7 @@ def command_cleanup(args: argparse.Namespace) -> None:
     shutil.rmtree(run_dir / "acpx", ignore_errors=True)
     if failures:
         raise DelegateError("\n".join(failures))
-    print(json.dumps({"cleaned": str(run_dir)}, sort_keys=True))
+    print(json.dumps({"cleaned": str(run_dir), "cleanupEvidence": cleanup_evidence}, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1664,6 +1763,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--run-id", help="Delegate Graph run ID")
     start_parser.add_argument("--operation-id", help="Delegate Graph operation ID")
     start_parser.add_argument("--owned-paths-json", help="JSON array of graph-owned paths")
+    start_parser.add_argument("--access-mode", choices=("read-only", "owned-write"), help="persisted graph operation access mode; legacy launches default to read-only except implement/source_search")
     start_parser.add_argument("--model-attempt", type=int, default=0)
     start_parser.add_argument("--transient-attempt", type=int, default=0)
     start_parser.add_argument("--fallback-reason")
