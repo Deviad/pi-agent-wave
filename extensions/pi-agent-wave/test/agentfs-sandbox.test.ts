@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { auditAgentFsChanges, buildAgentFsInvocation, expectedAgentFsDb, exportOwnedAgentFsChanges } from "../lib/agentfs-sandbox.ts";
-import { runExport } from "../scripts/agentfs-export.ts";
+import { runExport, type ExportConfig } from "../scripts/agentfs-export.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -33,7 +33,135 @@ function runScript(f: ReturnType<typeof fixture>, sessionId: string, body: strin
 	return expectedAgentFsDb(f.home, sessionId);
 }
 
+interface PreparedAttempt {
+	exportConfig: ExportConfig;
+	workerConfig: { hostReadOnly: boolean; discardAllChanges: boolean };
+	homeDir: string;
+	sessionId: string;
+	resource: Record<string, unknown>;
+}
+
+function prepareAttempt(f: ReturnType<typeof fixture>, node: string, accessMode?: "read-only" | "owned-write"): PreparedAttempt {
+	const script = `
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import delegate_core as core
+core.ACTIVE_TRANSPORT = 'headless'
+base, private = Path(sys.argv[2]), Path(sys.argv[3])
+home = private / 'provider-home'
+(home / '.codex').mkdir(parents=True)
+(home / '.codex' / 'auth.json').write_text(json.dumps({'OPENAI_API_KEY': 'offline-fixture-not-a-credential'}))
+os.environ['HOME'] = str(home)
+os.environ['CODEX_HOME'] = str(home / '.codex')
+os.environ.pop('PI_CLAUDE_OAUTH_TOKEN_FILE', None)
+os.chdir(base)
+node, mode = sys.argv[4:6]
+model = 'openai-codex/gpt-5.6-sol'
+argv = ['start', str(private), 'searcher', '--node', node, '--model', model, '--owned-paths-json', json.dumps([str(base / 'owned.txt')])]
+if mode: argv += ['--access-mode', mode]
+args = core.build_parser().parse_args(argv)
+task = private / 'task.md'
+task.write_text('Temporary preparation fixture; do not dispatch a model.')
+resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'export-fixture'}, 'fixture-worker', model, private / 'report.json', task, node, 'fixture contract')
+resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher'})
+print(json.dumps({'exportConfig': json.loads(Path(resource['export_config']).read_text()), 'workerConfig': json.loads(Path(resource['worker_config']).read_text()), 'homeDir': resource['agentfs_home'], 'sessionId': resource['agentfs_session'], 'resource': resource}))
+`;
+	const result = spawnSync("python3", ["-c", script, join(process.cwd(), "extensions/pi-agent-wave/scripts"), f.base, f.privateDir, node, accessMode ?? ""], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+	assert.equal(result.status, 0, result.stderr);
+	const prepared: PreparedAttempt = JSON.parse(result.stdout);
+	return prepared;
+}
+
 describe("AgentFS operation-attempt sandbox", () => {
+	test("research preparation discards read-only overlay changes", () => {
+		const f = fixture("research-preparation");
+		const prepared = prepareAttempt(f, "search");
+		runScript({ ...f, home: prepared.homeDir }, prepared.sessionId, "printf 'temporary\\n' > unowned.txt");
+		assert.equal(runExport(prepared.exportConfig), 0);
+		assert.equal(prepared.workerConfig.hostReadOnly, true);
+		assert.equal(prepared.workerConfig.discardAllChanges, true);
+		const result = JSON.parse(readFileSync(prepared.exportConfig.resultPath, "utf8"));
+		assert.ok(result.discardedReadOnlyChanges > 0);
+		assert.equal(existsSync(join(f.base, "unowned.txt")), false);
+		assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), "original\n");
+	});
+
+	test("explicit access mode overrides legacy node defaults", () => {
+		for (const [node, accessMode, readOnly] of [["implement", "read-only", true], ["search", "owned-write", false]] as const) {
+			const f = fixture("explicit-access");
+			const prepared = prepareAttempt(f, node, accessMode);
+			runScript({ ...f, home: prepared.homeDir }, prepared.sessionId, "printf 'accepted\\n' > owned.txt");
+			assert.equal(prepared.workerConfig.hostReadOnly, readOnly);
+			assert.equal(prepared.workerConfig.discardAllChanges, readOnly);
+			assert.equal(prepared.exportConfig.discardAllChanges, readOnly);
+			assert.equal(runExport(prepared.exportConfig), 0);
+			assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), readOnly ? "original\n" : "accepted\n");
+		}
+	});
+
+	test("missing malformed and stale export receipts fail closed", () => {
+		for (const receipt of [null, "not JSON", JSON.stringify({ exported: true, violations: [] })]) {
+			const f = fixture("invalid-export");
+			const prepared = prepareAttempt(f, "implement");
+			const script = `
+import json, sqlite3, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import delegate_core as core
+resource = json.loads(sys.argv[2])
+db = Path(resource['agentfs_db_path'])
+db.parent.mkdir(parents=True)
+sqlite3.connect(db).close()
+receipt = json.loads(sys.argv[3])
+if receipt is not None: Path(resource['export_result']).write_text(receipt)
+try:
+ core.export_agentfs_owned_changes(resource)
+except core.DelegateError as error:
+ print(json.dumps({'error': str(error), 'exit': resource['agentfs_export_process']['exitCode']}))
+else:
+ raise AssertionError('invalid export accepted')
+`;
+			const result = spawnSync("python3", ["-c", script, join(process.cwd(), "extensions/pi-agent-wave/scripts"), JSON.stringify(prepared.resource), JSON.stringify(receipt)], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+			assert.equal(result.status, 0, result.stderr);
+			const failure = JSON.parse(result.stdout);
+			assert.equal(failure.exit, 2);
+			assert.match(failure.error, /AgentFS export/);
+			assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), "original\n");
+		}
+	});
+
+	test("export refusal retains the violating paths after attempt cleanup", () => {
+		const f = fixture("retained-refusal");
+		const prepared = prepareAttempt(f, "implement");
+		runScript({ ...f, home: prepared.homeDir }, prepared.sessionId, "printf 'rejected\\n' > owned.txt\nprintf 'violation\\n' > unowned.txt");
+		const script = `
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import delegate_core as core
+core.ACTIVE_TRANSPORT = 'headless'
+resource = json.loads(sys.argv[2])
+try:
+ core.export_agentfs_owned_changes(resource)
+except core.DelegateError as error:
+ message = str(error)
+else:
+ raise AssertionError('unowned export was accepted')
+core.abort_acpx_attempt(resource)
+bundle = json.loads(next(Path(resource['run_dir']).glob('failure-*.json')).read_text())
+print(json.dumps({'error': message, 'bundle': bundle, 'attemptRemoved': not Path(resource['attempt_dir']).exists()}))
+`;
+		const result = spawnSync("python3", ["-c", script, join(process.cwd(), "extensions/pi-agent-wave/scripts"), JSON.stringify(prepared.resource)], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+		assert.equal(result.status, 0, result.stderr);
+		const failure = JSON.parse(result.stdout);
+		assert.match(failure.error, /unowned\.txt/);
+		assert.equal(failure.attemptRemoved, true);
+		assert.deepEqual(failure.bundle.agentFsExport.violations.map((change: { path: string }) => change.path), ["unowned.txt"]);
+		assert.equal(readFileSync(join(f.base, "owned.txt"), "utf8"), "original\n");
+		assert.equal(existsSync(join(f.base, "unowned.txt")), false);
+	});
+
 	test("builds the exact no-default-allows direct argv", () => {
 		const f = fixture("argv");
 		const invocation = buildAgentFsInvocation({ sessionId: "attempt-1", baseDir: f.base, homeDir: f.home, privateDir: f.privateDir, command: "/bin/true", args: ["value"] }, { PATH: "/bin" });
