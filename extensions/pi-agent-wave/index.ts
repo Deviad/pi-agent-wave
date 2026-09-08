@@ -21,7 +21,7 @@ import { validateSettlementIdentity, type SettlementIdentityExpected } from "./l
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { selectTransport } from "./scripts/delegate.ts";
 import type { VisibleTransport } from "./store.ts";
-import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationStatus, ResolvedPolicy } from "./types.ts";
+import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, OperationStatus, ResolvedPolicy } from "./types.ts";
 
 const EXTENSION_DIR = dirname(new URL(import.meta.url).pathname);
 
@@ -241,6 +241,33 @@ function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
 		}
 	}
 	return newest?.path;
+}
+
+/**
+ * Settles an operation whose authorized command never started. There is no session to cancel, no
+ * report to collect and no attempt to replay, so the operation is recorded instead of being
+ * refused forever, and a repeated call is a no-op. Nothing is dispatched, so the frozen model
+ * policy and attempt counters stay untouched, and the reason text is permanent in retry.ts, so an
+ * unlaunched command never consumes the same-model budget or advances the frozen chain.
+ */
+function settleUnlaunchedOperation(graphStore: GraphStore, runId: string, operation: OperationRow, status: "failed" | "cancelled"): Record<string, unknown> {
+	if (operation.status !== "pending" && operation.status !== "running") return { settled: false, reason: `operation already ${operation.status}` };
+	const reason = `no worker was registered for operation ${operation.id}: the authorized command never started`;
+	const diagnosticsPath = graphStore.retainRunDiagnostic(runId, `failure-${operation.id}.json`, {
+		schemaVersion: 1,
+		cause: reason,
+		runId,
+		operationId: operation.id,
+		node: operation.node,
+		round: operation.round,
+		fixIteration: operation.fix_iteration,
+		previousStatus: operation.status,
+		modelAttempt: operation.model_attempt,
+		selectedModel: operation.selected_model,
+		settledAt: new Date().toISOString(),
+	});
+	const recorded = graphStore.record({ runId, operationId: operation.id, status, error: `${reason}\nretained diagnostics: ${diagnosticsPath}` });
+	return { settled: true, recorded: status, reason, diagnosticsPath, state: recorded.state, operation: recorded.operation };
 }
 
 interface AcpxRegistrationPayload {
@@ -497,7 +524,12 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const operationId = required(params.operationId, "operationId");
 					const operation = graphStore.getOperation(operationId);
 					const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
-					if (!agent?.acpx_cancel_script) throw new Error(`operation ${operationId} has no collectable worker`);
+					if (!agent) {
+						const settled = settleUnlaunchedOperation(graphStore, runId, operation, "failed");
+						progress("unlaunched_operation_settled", { runId, operationId, via: "collect", recorded: settled.recorded ?? operation.status, reason: settled.reason });
+						return textResult(settled);
+					}
+					if (!agent.acpx_cancel_script) throw new Error(`operation ${operationId} has no collectable worker`);
 					const privateRunDir = dirname(dirname(dirname(agent.acpx_cancel_script)));
 					const existingSettlement = readdirSync(privateRunDir).find((name) => name.startsWith("settlement-") && name.endsWith(".json"));
 					let settlement: Record<string, unknown>;
@@ -598,7 +630,11 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const operationId = required(params.operationId, "operationId");
 					const operation = graphStore.getOperation(operationId);
 					const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
-					if (!agent) throw new Error(`running operation ${operationId} has no registered worker`);
+					if (!agent) {
+						const settled = settleUnlaunchedOperation(graphStore, runId, operation, "cancelled");
+						progress("unlaunched_operation_settled", { runId, operationId, via: "cancel", recorded: settled.recorded ?? operation.status, reason: settled.reason });
+						return textResult(settled);
+					}
 					try {
 						await cancelRegisteredAgent([agent], agent.name, executor(pi));
 					} catch (cancelError) {

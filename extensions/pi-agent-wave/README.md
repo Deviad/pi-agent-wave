@@ -211,6 +211,8 @@ For `status: "completed"`, provide the private JSON `reportPath`; its schema and
 
 `op=collect` always converges: when the launcher cannot produce a settlement manifest, the attempt is recorded failed, the result reports `settled: false`, `recorded: "failed"`, and the path of the retained `failure-<operationId>.json` diagnostic bundle (mode 600, redacted, written before the attempt directory is removed). `op=cancel` refuses while the registered worker's ACPX state is `alive` and its launcher cancel command fails; it records `cancelled` when the state is already `no-session`.
 
+An operation whose worker was never registered has no session to cancel and no report to collect, so `op=collect` and `op=cancel` settle it instead of refusing: `collect` records `failed`, `cancel` records `cancelled`, and both retain a `failure-<operationId>.json` diagnostic beside the graph database (in `failures/<runId>/`, mode 600) naming the cause — the authorized command never started. A repeated call reports `settled: false` instead of erroring, the frozen model policy and its attempt counters stay untouched, and the settled run stays decidable through `op=resolve`: `decision: "retry"` reopens the operation as a fresh pending attempt and `decision: "abort"` ends the run. That reason is permanent in `retry.ts`, so an unlaunched command never spends the same-model budget or switches provider.
+
 An operation explicitly recorded with `status: "blocked"` can be resumed through `op: "resolve"` using its current `runId` and `operationId`, with `decision: "retry"`, `"defer"`, `"abort"`, or `"escalate"`. Retry preserves the operation, semantic round and frozen model policy; it records the previous report, verdict, error and worker identity in the resume event and clears those fields from the new pending attempt. A pending attempt cannot complete using the old report. Foreign or stale operations, cancelled/terminal runs and completed semantic-cap blocks cannot be reopened by recovery.
 
 Direct initialization supports the full tagged model-policy forms used by the API: `auto`, a named preset, an explicit tier, or an exact model with a reason. `/delegate` intentionally exposes only the six picker policies listed above.
@@ -324,6 +326,7 @@ Delegate Graph workers automatically inherit their frozen tier, ordered model ch
 | Exact-model lock (`--policy` model lock / `selectionSource: exact-model`) | Never advances; parks for a user decision. |
 | Semantic verdict (`FAIL`, `NOT_OK`, review rejection) | Never a fallback trigger; the graph's own repair loop handles it. |
 | Worker died mid-attempt | `op=collect` records the attempt failed and returns `settled: false` with the retained diagnostic bundle path instead of throwing. |
+| Operation never dispatched | `op=collect` or `op=cancel` settles it and retains the diagnostic; `op=resolve` with `decision: "retry"` reopens it as a fresh pending attempt. |
 | Worker never wrote its report (Pi execution-only projection) | `op=record status=completed` is rejected for every semantic node; redispatch the operation. |
 
 | Runtime scenario | Behavior |

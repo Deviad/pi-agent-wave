@@ -39,6 +39,13 @@ const TRANSIENT_PATTERNS: Array<[RegExp, string]> = [
 const APPROVAL_BLOCK_PATTERN =
 	/permission[_ -]?denied|permission (?:request )?(?:denied|cancelled)|permission denied for (?:terminal|fs|tool)|denied (?:by|before) [^,.;\n]*(?:approval|permission)|approval (?:gate )?(?:block|block(?:ed)?|denied|rejected)/i;
 
+/**
+ * A worker that was never registered left no session, no report and no attempt to replay, so
+ * retrying cannot change the outcome. Checked only after the real transport signals above, so a
+ * launch that failed with genuine infrastructure text still falls back across the frozen chain.
+ */
+const NEVER_LAUNCHED_PATTERN = /no worker was registered|command never started|worker never launched/i;
+
 /** Classifies infrastructure-shaped failures without treating semantic verdicts as retryable. */
 export function classifyFailure(message: string, semanticVerdict = false): FailureClassification {
 	if (semanticVerdict) return { kind: "permanent", reason: "semantic-verdict" };
@@ -46,6 +53,8 @@ export function classifyFailure(message: string, semanticVerdict = false): Failu
 	for (const [pattern, reason] of TRANSIENT_PATTERNS) {
 		if (pattern.test(message)) return { kind: "transient", reason };
 	}
+	// An unlaunched command has no attempt to replay, so it is permanent only when nothing transient explains it.
+	if (NEVER_LAUNCHED_PATTERN.test(message)) return { kind: "permanent", reason: "worker-never-launched" };
 	return { kind: "permanent", reason: "unclassified" };
 }
 

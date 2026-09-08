@@ -1,6 +1,6 @@
 import { Database } from "./sqlite.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { decideTransition, graphDefinition } from "./graph-core.ts";
@@ -1280,6 +1280,15 @@ export class GraphStore {
 			}
 			return this.getState(runId);
 		});
+	}
+
+	/** Retains a private post-mortem bundle beside the graph database for a run whose worker never registered. */
+	retainRunDiagnostic(runId: string, name: string, payload: Record<string, unknown>): string {
+		const path = join(dirname(this.dbPath), "failures", runId, name);
+		ensurePrivatePath(path);
+		writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+		chmodSync(path, 0o600);
+		return path;
 	}
 
 	prune(days: number): number {
