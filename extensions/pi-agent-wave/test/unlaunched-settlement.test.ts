@@ -4,7 +4,7 @@ import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Database } from "../sqlite.ts";
@@ -160,6 +160,57 @@ describe("settlement for an operation whose worker never started", () => {
 		assert.equal(abort.error, undefined, `a settled operation must be aborable: ${JSON.stringify(abort)}`);
 		assert.equal(runStatus(dbPath, runId), "cancelled", "abort ends the run");
 		assert.equal(operationRow(dbPath, operationId).status, "cancelled");
+	});
+
+	test("a run the caller got wrong is refused without writing anywhere", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "unlaunched-badrun-"));
+		dirs.push(dir);
+		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
+		// Two failures of the same kind: an unknown id, and one that walks out of the failures
+		// directory. Both must stay refusals, because the second one used to write a real file.
+		const escapeTarget = resolve(dirname(dir), `escape-${process.pid}-${Date.now()}`);
+		const escaping = `../../escape-${process.pid}-${Date.now()}`;
+		assert.ok(escaping.includes(".."), "the fixture must actually attempt to escape");
+		for (const bad of ["run_does-not-exist", escaping]) {
+			const refused = parsed(await tool.execute("collect", { op: "collect", runId: bad, operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.match(String(refused.error), /unknown run/, `a wrong run id must be refused: ${JSON.stringify(refused)}`);
+		}
+		assert.equal(existsSync(escapeTarget), false, `a refusing call must not create ${escapeTarget}`);
+		assert.equal(existsSync(join(dirname(dbPath), "failures", "run_does-not-exist")), false, "a refusal must not leave a failures directory behind");
+		assert.equal(operationRow(dbPath, operationId).status, "pending", "a refused collect leaves the operation untouched");
+		const good = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
+		assert.equal(good.error, undefined, `refusals must not break the real path: ${JSON.stringify(good)}`);
+	});
+
+	test("an operation cannot be settled under a foreign run", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "unlaunched-foreign-"));
+		dirs.push(dir);
+		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
+		const other = parsed(await tool.execute("init", { op: "init", story: "other-story", graph: "research", task: "Provide a second run to point at" }, undefined, () => {}, {} as ExtensionContext));
+		assert.equal(other.error, undefined, `the second run must initialise: ${JSON.stringify(other)}`);
+		const foreign = parsed(await tool.execute("cancel", { op: "cancel", runId: other.state.runId, operationId }, undefined, () => {}, {} as ExtensionContext));
+		assert.match(String(foreign.error), /does not belong to run/, `cross-run settlement must be refused: ${JSON.stringify(foreign)}`);
+		assert.equal(existsSync(join(dirname(dbPath), "failures", other.state.runId)), false, "a refused cross-run call must not write into the other run");
+		assert.equal(operationRow(dbPath, operationId).status, "pending");
+		assert.equal(runStatus(dbPath, runId), "active", "a foreign run must not end the run the operation belongs to");
+	});
+
+	test("a run that already left active is refused without writing anywhere", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "unlaunched-parked-"));
+		dirs.push(dir);
+		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
+		// Seeded fixture state: a parked run whose operation is still pending. Collect must refuse
+		// and write nothing, because a diagnostic nobody can record is just litter.
+		const db = new Database(dbPath);
+		try {
+			db.query("UPDATE runs SET status=? WHERE id=?").run("awaiting_user", runId);
+		} finally {
+			db.close();
+		}
+		const parked = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
+		assert.match(String(parked.error), /is awaiting_user; resolve it/, `a parked run must be refused, got ${JSON.stringify(parked)}`);
+		assert.equal(existsSync(join(dirname(dbPath), "failures", runId)), false, "a refusal must not write a diagnostic");
+		assert.equal(operationRow(dbPath, operationId).status, "pending");
 	});
 
 	test("a command that never started is not a transient failure", () => {

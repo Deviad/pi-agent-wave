@@ -252,6 +252,13 @@ function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
  */
 function settleUnlaunchedOperation(graphStore: GraphStore, runId: string, operation: OperationRow, status: "failed" | "cancelled"): Record<string, unknown> {
 	if (operation.status !== "pending" && operation.status !== "running") return { settled: false, reason: `operation already ${operation.status}` };
+	// Checked before anything is written: a mistyped runId is a refusal, not a place to put a file.
+	// Without these, an id containing `..` would materialize a diagnostic wherever it resolved, and a
+	// foreign run would settle an operation the caller has no authority over. Both refusals repeat
+	// what `record` would have said after the write, so the write only happens when it can be honoured.
+	const run = graphStore.getRun(runId);
+	if (run.id !== operation.run_id) throw new Error("operation does not belong to run");
+	if (run.status !== "active") throw new Error(`run ${runId} is ${run.status}; resolve it before recording operations`);
 	const reason = `no worker was registered for operation ${operation.id}: the authorized command never started`;
 	const diagnosticsPath = graphStore.retainRunDiagnostic(runId, `failure-${operation.id}.json`, {
 		schemaVersion: 1,

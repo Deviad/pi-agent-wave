@@ -75,8 +75,41 @@ Acceptance criteria:
 
 **Recorded observation, no cause found.** All four live `pi --print` invocations printed their final answer and were then killed by the shell timeout rather than exiting. Two of them made no tool call at all — one with the same tool allowlist, one with `--no-tools` — and no `acpx`, `agentfs` or delegate process survived any of them, so the non-exit is not attributable to this extension or to these two repairs. The cause was not established and is recorded here rather than explained away.
 
-## Non-goals
-- **Containment.** Nothing here touches the live graph database: the settlement tests point `DELEGATE_GRAPH_DB` at a temporary file, the teardown driver works inside temporary run directories, and the live-path check above re-verified the live database hash afterwards.
+## Follow-up found during review: the settlement wrote before it checked
+
+Self-review of the three commits (rather than a fresh-context worker, which this session has no
+observable transport for) turned up a regression introduced by user story 1, now fixed.
+
+`op=collect` and `op=cancel` are the only operations that never look the run up, and the new
+settlement path used the caller-supplied `runId` to build the diagnostic path *before* calling
+`record()`. The store still refused an unknown run, a foreign operation and a non-active run, but
+by then the file was already written. So a mistyped `runId` that walked out of the failures
+directory (`../../...`) created a real directory and a real mode-600 file wherever it resolved and
+then reported an error; the same happened for a valid-but-wrong run. Before user story 1 these
+calls simply threw. State was never corrupted - ownership and run-existence were still enforced
+and the operation stayed `pending` - and the writable name is always `failure-<operationId>.json`,
+so arbitrary files could not be overwritten. It was litter plus a confusing error, not a corruption
+path, but it was a filesystem effect driven by an unvalidated parameter, which the rest of the
+extension does not do.
+
+`settleUnlaunchedOperation` now checks the run first and refuses before touching the filesystem,
+reusing the store's own three preconditions. Three tests bind it: an unknown id and an escaping id
+must both refuse with nothing created, a cross-run `cancel` must refuse and must not write into
+the other run's failures directory, and a run parked in `awaiting_user` must refuse and write
+nothing. With the guard deleted all three fail (the escaping case reports the directory it
+created); with it restored the file passes 10/10 and `index.ts` was verified byte-identical to the
+pre-mutation copy. Repro, mutation output and the restored-file check: 
+`agent-output/settlement-convergence/unvalidated-runid.md`.
+
+**Gates after the fix.** Full serial suite 449 tests, 438 pass, 0 fail, 11 skipped; Bun docs and
+portability suites 12 pass, 0 fail; whitespace clean. The parallel form of the gate (without
+`--test-concurrency=1`) fails one production-audit subtest; that failure reproduces with both
+touched test files excluded, and that file passes 5/5 on its own, so it is the known concurrency
+interference already disclosed in `tasks/prd-package-delegate-graph.md`, not this change.
+
+## Containment
+
+- Nothing here touches the live graph database: the settlement tests point `DELEGATE_GRAPH_DB` at a temporary file, the teardown driver works inside temporary run directories, and the live-path check above re-verified the live database hash afterwards. Every live run used a temporary database, and no run was dispatched against a real provider.
 
 ## Non-goals
 
