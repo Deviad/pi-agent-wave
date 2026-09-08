@@ -21,13 +21,14 @@ afterEach(() => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function start(store: GraphStore, runId: string, operationId: string): void {
+function start(store: GraphStore, runId: string, operationId: string, agentId?: string): void {
 	const next = store.next(runId);
 	const operation = next.operations.find((candidate) => candidate.id === operationId);
 	store.record({
 		runId,
 		operationId,
 		status: "running",
+		agentId,
 		agentName: "worker",
 		transport: "herdr",
 		modelPolicy: next.policy.input,
@@ -280,6 +281,7 @@ describe("SQLite state store", () => {
 		start(store, state.runId, operation.id);
 		complete(store, state.runId, operation.id, "PASS");
 		expect(store.getState(state.runId).status).toBe("terminal");
+		assert.throws(() => store.resolveExhaustion(state.runId, operation.id, "retry"), /recovery decision/);
 		const results = store.events(state.runId).filter((event) => event.type === "result");
 		expect(results).toHaveLength(10);
 		for (const result of results) {
@@ -355,6 +357,88 @@ describe("SQLite state store", () => {
 		expect(resumed.status).toBe("active");
 		expect(store.next(state.runId).operations[0].id).toBe(operation.id);
 		expect(store.getOperation(operation.id).status).toBe("pending");
+		store.close();
+	});
+
+	test("recovers an explicit block without reusing its report or worker", () => {
+		const { store, dir } = fixture();
+		const state = store.initRun("approval-block", "build", "Plan", balancedPolicy());
+		const operation = store.next(state.runId).operations[0];
+		const agentId = store.registerAgent({ runId: state.runId, node: operation.node, role: "thinker", currentTask: operation.task, name: "blocked-worker", transport: "herdr", herdrAgent: "blocked-worker", tabId: "fixture-tab", herdrPaneId: "fixture-pane" });
+		start(store, state.runId, operation.id, agentId);
+		const reportPath = join(dir, "blocked-report.json");
+		store.record({ runId: state.runId, operationId: operation.id, status: "blocked", verdict: "NOT_OK", reportPath, error: "approval required" });
+		const before = store.getOperation(operation.id);
+		const policy = store.policy(state.runId);
+		store.resolveExhaustion(state.runId, operation.id, "retry");
+		const retried = store.getOperation(operation.id);
+		assert.equal(store.getState(state.runId).status, "active");
+		assert.equal(retried.status, "pending");
+		for (const key of ["agent_id", "report_path", "verdict", "finished_at"] as const) assert.equal(retried[key], null);
+		for (const key of ["id", "node", "round", "fix_iteration", "owned_paths_json", "selected_model", "model_attempt"] as const) assert.equal(retried[key], before[key]);
+		assert.deepEqual(store.policy(state.runId), policy);
+		assert.equal(retried.retry_reason, "operator-approved-retry");
+		assert.equal(retried.fallback_reason, null);
+		const event = store.events(state.runId).find((entry) => entry.type === "resume");
+		assert.ok(event);
+		assert.deepEqual(JSON.parse(event.payload_json).previousAttempt, { agentId, status: "blocked", reportPath, verdict: "NOT_OK", error: "approval required" });
+		assert.equal(store.agents(state.runId).find((entry) => entry.id === agentId)?.status, "failed");
+		assert.throws(() => complete(store, state.runId, operation.id, "READY"), /cannot complete operation from pending/);
+		store.close();
+	});
+
+	test("explicit blocks support defer, abort and escalate without changing semantic rounds", () => {
+		for (const decision of ["defer", "abort", "escalate"] as const) {
+			const { store } = fixture();
+			const state = store.initRun(`block-${decision}`, "build", "Plan");
+			const operation = store.next(state.runId).operations[0];
+			start(store, state.runId, operation.id);
+			store.record({ runId: state.runId, operationId: operation.id, status: "blocked", error: "operator decision required" });
+			const result = store.resolveExhaustion(state.runId, operation.id, decision, "2026-08-18T12:00:00.000Z");
+			assert.equal(result.status, { defer: "deferred", abort: "cancelled", escalate: "blocked" }[decision]);
+			assert.equal(result.round, state.round);
+			if (decision !== "abort") assert.equal(store.resolveExhaustion(state.runId, operation.id, "retry").status, "active");
+			else assert.throws(() => store.resolveExhaustion(state.runId, operation.id, "retry"), /recovery decision/);
+			store.close();
+		}
+	});
+
+	test("recovery rejects foreign and stale operations without mutating either run", () => {
+		const { store } = fixture();
+		const first = store.initRun("first-recovery", "build", "Plan");
+		const second = store.initRun("second-recovery", "build", "Plan");
+		const original = store.next(first.runId).operations[0];
+		const foreign = store.next(second.runId).operations[0];
+		start(store, first.runId, original.id);
+		complete(store, first.runId, original.id, "READY", { slices: [{ id: "slice", name: "Slice", task: "Implement", ownedPaths: ["owned.ts"] }] });
+		const current = store.next(first.runId).operations[0];
+		start(store, first.runId, current.id);
+		store.record({ runId: first.runId, operationId: current.id, status: "failed", error: "approval denied" });
+		const before = [store.getState(first.runId), store.getState(second.runId), store.operations(first.runId), store.operations(second.runId), store.events(first.runId)];
+		for (const decision of ["retry", "defer", "abort", "escalate"] as const) {
+			assert.throws(() => store.resolveExhaustion(first.runId, foreign.id, decision, "2026-08-18T12:00:00.000Z"), /does not belong to run/);
+			assert.throws(() => store.resolveExhaustion(first.runId, original.id, decision, "2026-08-18T12:00:00.000Z"), /stale/);
+		}
+		assert.deepEqual([store.getState(first.runId), store.getState(second.runId), store.operations(first.runId), store.operations(second.runId), store.events(first.runId)], before);
+		store.close();
+	});
+
+	test("recovery cannot reopen a completed semantic-cap block", () => {
+		const { store } = fixture();
+		const state = store.initRun("semantic-cap-recovery", "build", "Plan");
+		let operation = store.next(state.runId).operations[0];
+		start(store, state.runId, operation.id);
+		complete(store, state.runId, operation.id, "READY", { slices: [{ id: "slice", name: "Slice", task: "Implement", ownedPaths: ["owned.ts"] }] });
+		while (store.getState(state.runId).status === "active") {
+			operation = store.next(state.runId).operations[0];
+			start(store, state.runId, operation.id);
+			complete(store, state.runId, operation.id, operation.node === "implement" ? "DONE" : "FAIL");
+		}
+		const before = store.getState(state.runId);
+		assert.equal(before.status, "blocked");
+		assert.equal(store.getOperation(operation.id).status, "completed");
+		assert.throws(() => store.resolveExhaustion(state.runId, operation.id, "retry"), /explicitly blocked operation/);
+		assert.deepEqual(store.getState(state.runId), before);
 		store.close();
 	});
 

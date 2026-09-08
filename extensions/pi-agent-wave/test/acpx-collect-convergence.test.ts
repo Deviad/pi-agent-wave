@@ -13,7 +13,7 @@ function parsed(result: unknown): Record<string, any> { return JSON.parse((resul
 
 const ROLES = ["thinker", "implementer", "reviewer", "tester", "auditor", "searcher"];
 
-async function toolIn(dir: string, models: string[] = ["openai-codex/gpt-5.6-sol", "alibaba/glm-5.2-fallback"]): Promise<Record<string, any>> {
+async function toolIn(dir: string, models: string[] = ["openai-codex/gpt-5.6-sol", "alibaba/glm-5.2-fallback"], invocations?: { command: string; args: string[] }[]): Promise<Record<string, any>> {
 	process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
 	process.env.DELEGATE_GRAPH_DB = join(dir, "graph.db");
 	delete process.env.HERDR_ENV;
@@ -32,6 +32,7 @@ async function toolIn(dir: string, models: string[] = ["openai-codex/gpt-5.6-sol
 		registerCommand() {},
 		registerTool(definition: Record<string, any>) { tool = definition; },
 		exec: async (command: string, args: string[]) => {
+			invocations?.push({ command, args: [...args] });
 			const result = spawnSync(command, args, { encoding: "utf8" });
 			return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "", killed: false };
 		},
@@ -73,13 +74,16 @@ async function startDeadAttempt(dir: string, options: { cancelExit: number; stat
 }
 
 describe("provider preflight at dispatch", () => {
-	test("blocks the launch and records the reason when the route provider cannot authenticate", async () => {
+	for (const graph of ["build", "operations"] as const) {
+	test(`forwards ${graph} access mode and records an unauthenticated route block`, async () => {
 		const dir = mkdtempSync(join(tmpdir(), "preflight-block-"));
 		dirs.push(dir);
 		const saved = { agentDir: process.env.PI_CODING_AGENT_DIR, db: process.env.DELEGATE_GRAPH_DB, herdrEnv: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID };
 		try {
-			const { tool } = await toolIn(dir, ["nosuchproviderxyz/dead-route", "alibaba/live-route"]);
-			const init = parsed(await tool.execute("init", { op: "init", story: "preflight-block", graph: "build", task: "Plan the wave" }, undefined, () => {}, {} as ExtensionContext));
+			const invocations: { command: string; args: string[] }[] = [];
+			const { tool } = await toolIn(dir, ["nosuchproviderxyz/dead-route", "alibaba/live-route"], invocations);
+			const commands = graph === "operations" ? [{ id: "access", name: "access", command: { executable: process.execPath, args: ["-e", "process.exit(0)"], cwd: dir }, ownedPaths: [join(dir, "result.txt")] }] : undefined;
+			const init = parsed(await tool.execute("init", { op: "init", story: "preflight-block", graph, task: "Plan the wave", commands }, undefined, () => {}, {} as ExtensionContext));
 			const operation = init.next.operations[0];
 			const blocked = parsed(await tool.execute("dispatch", { op: "dispatch", runId: init.state.runId, operationId: operation.id, transport: "headless" }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(blocked.error, undefined, `dispatch must converge on a named block, got ${JSON.stringify(blocked)}`);
@@ -88,10 +92,15 @@ describe("provider preflight at dispatch", () => {
 			assert.match(String(blocked.reason), /worker preflight:.*nosuchproviderxyz/);
 			assert.equal(blocked.operation.retry_reason, "worker-credential-preflight");
 			assert.equal(blocked.operation.model_attempt, 0, "the first block spends one same-model attempt before the chain advances");
+			const start = invocations.find((call) => call.args.includes("--owned-paths-json"));
+			assert.ok(start, "the actual private launcher invocation must be observed");
+			const modeIndex = start.args.indexOf("--access-mode");
+			assert.deepEqual(start.args.slice(modeIndex, modeIndex + 2), ["--access-mode", graph === "build" ? "read-only" : "owned-write"]);
 		} finally {
 			Object.assign(process.env, saved);
 		}
 	});
+	}
 });
 
 describe("terminated attempt convergence", () => {

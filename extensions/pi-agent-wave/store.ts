@@ -1247,18 +1247,26 @@ export class GraphStore {
 		return this.db.query<EventRow, [string, number]>("SELECT * FROM events WHERE run_id=? ORDER BY id DESC LIMIT ?").all(runId, limit).reverse();
 	}
 
-	/** Applies the user's post-exhaustion choice without inventing a new operation. */
+	/** Applies an explicit recovery choice to the current failed or blocked operation. */
 	resolveExhaustion(runId: string, operationId: string, decision: "retry" | "defer" | "abort" | "escalate", deferredUntil?: string): RunState {
 		return this.transaction(() => {
 			const state = this.getState(runId);
-			if (state.status !== "awaiting_user" && state.status !== "deferred") throw new Error("run is not awaiting a recovery decision");
+			if (state.status !== "awaiting_user" && state.status !== "deferred" && state.status !== "blocked") throw new Error("run is not awaiting a recovery decision");
 			const operation = this.getOperation(operationId);
+			if (operation.run_id !== runId) throw new Error("operation does not belong to run");
+			if (operation.node !== state.currentNode || operation.round !== state.round || operation.fix_iteration !== state.fixIteration) {
+				throw new Error("operation is stale for current graph state");
+			}
+			if (state.status === "blocked" && operation.status !== "blocked") throw new Error("recovery requires an explicitly blocked operation");
+			if (operation.status !== "blocked" && operation.status !== "failed") throw new Error("operation is not awaiting recovery");
 			if (decision === "retry") {
 				this.db
-					.query("UPDATE operations SET status='pending',transient_attempts=0,classifier_reason=NULL,last_error=NULL,retry_not_before=NULL,started_at=NULL,finished_at=NULL WHERE id=?")
+					.query("UPDATE operations SET status='pending',agent_id=NULL,report_path=NULL,verdict=NULL,transient_attempts=0,classifier_reason=NULL,last_error=NULL,retry_reason='operator-approved-retry',fallback_reason=NULL,retry_not_before=NULL,started_at=NULL,finished_at=NULL WHERE id=?")
 					.run(operationId);
 				this.setState(runId, operation.node, operation.round, operation.fix_iteration, "active");
-				this.event({ runId, type: "resume", node: operation.node, operationId, toAgent: roleForNode(operation.node), replyTo: roleForNode(operation.node) });
+				this.event({ runId, type: "resume", node: operation.node, operationId, agentId: operation.agent_id ?? undefined, toAgent: roleForNode(operation.node), replyTo: roleForNode(operation.node), payload: {
+					previousAttempt: { agentId: operation.agent_id, status: operation.status, reportPath: operation.report_path, verdict: operation.verdict, error: operation.last_error },
+				} });
 			} else if (decision === "defer") {
 				if (!deferredUntil) throw new Error("deferredUntil is required");
 				this.setState(runId, operation.node, operation.round, operation.fix_iteration, "deferred");
