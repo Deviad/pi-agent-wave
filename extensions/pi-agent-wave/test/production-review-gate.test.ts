@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildPromptArgv, parseWorkerConfig } from "../scripts/acpx-worker.ts";
+import { packageRoot } from "./support/repoRoot.ts";
 
 describe("production evidence-only review gate", () => {
 	test("places --no-terminal before the ACP agent command", () => {
@@ -24,12 +25,12 @@ describe("production evidence-only review gate", () => {
 
 	test("threads the no-terminal flag through the shared production lifecycle", () => {
 		for (const name of ["headless_delegate.py", "herdr_delegate.py"]) {
-			const script = join(process.cwd(), "extensions/pi-agent-wave/scripts", name);
+			const script = join(packageRoot, "scripts", name);
 			const help = spawnSync("python3", [script, "start", "--help"], { encoding: "utf8" });
 			assert.equal(help.status, 0, help.stderr);
 			assert.match(help.stdout, /--no-terminal/);
 		}
-		const source = readFileSync(join(process.cwd(), "extensions/pi-agent-wave/scripts/delegate_core.py"), "utf8");
+		const source = readFileSync(join(packageRoot, "scripts/delegate_core.py"), "utf8");
 		assert.match(source, /"noTerminal": args\.no_terminal/);
 		assert.match(source, /Terminal capability is disabled/);
 	});

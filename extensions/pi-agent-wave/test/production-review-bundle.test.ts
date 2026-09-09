@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildProductionReviewBundle, REVIEW_PATHS } from "../scripts/production-review-bundle.ts";
+import { repoRoot } from "./support/repoRoot.ts";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -15,7 +16,7 @@ describe("production final review bundle", () => {
 		const directory = mkdtempSync(join(tmpdir(), "production-review-bundle-"));
 		directories.push(directory);
 		const output = join(directory, "bundle.md");
-		const result = buildProductionReviewBundle(process.cwd(), output);
+		const result = buildProductionReviewBundle(repoRoot, output);
 		const bundle = readFileSync(output, "utf8");
 		assert.equal(result.sections, REVIEW_PATHS.length);
 		for (const requiredPath of ["extensions/pi-agent-wave/scripts/production-review-bundle.ts", "extensions/pi-agent-wave/test/production-review-bundle.test.ts", "extensions/pi-agent-wave/test/commands.test.ts"]) {

@@ -4,6 +4,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { artifactsCurrent, auditCommands, EXPECTED_AUDIT_COMMANDS, EXPECTED_AUDIT_SUMMARIES, productionSourceDigest, runProductionAudit, summariesValid, summarizeAuditOutput, type AuditCommandRecord, type Runner } from "../scripts/production-audit.ts";
+import { packageRoot, repoRoot } from "./support/repoRoot.ts";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -22,7 +23,7 @@ function runner(failing?: string): Runner {
 
 describe("production host audit bundle", () => {
 	test("defines direct argv commands and parses stable summaries", () => {
-		const commands = auditCommands(process.cwd());
+		const commands = auditCommands(repoRoot);
 		assert.ok(commands.every((command) => command.executable && Array.isArray(command.args) && command.cwd));
 		assert.deepEqual(summarizeAuditOutput("full-node", "# tests 10\n# pass 9\n# fail 0\n# skipped 1\n"), { tests: 10, pass: 9, fail: 0, skipped: 1 });
 		assert.deepEqual(summarizeAuditOutput("bun-package", "34 pass\n0 fail\n"), { pass: 34, fail: 0 });
@@ -59,10 +60,10 @@ describe("production host audit bundle", () => {
 		mkdirSync(join(root, "extensions/pi-agent-wave/lib"), { recursive: true });
 		mkdirSync(join(root, "extensions/pi-agent-wave/scripts"), { recursive: true });
 		mkdirSync(join(root, "extensions/pi-agent-wave/test"), { recursive: true });
-		copyFileSync(join(process.cwd(), "extensions/pi-agent-wave/retry.ts"), join(root, "extensions/pi-agent-wave/retry.ts"));
+		copyFileSync(join(packageRoot, "retry.ts"), join(root, "extensions/pi-agent-wave/retry.ts"));
 		for (const prd of ["prd-production-acpx-worker-backend.md", "prd-production-acpx-lifecycle-hardening.md", "prd-production-acpx-final-audit.md", "prd-production-acpx-final-source-hardening.md", "prd-air-controlled-editor-independent-orchestration.md"]) {
 			mkdirSync(join(root, "tasks"), { recursive: true });
-			copyFileSync(join(process.cwd(), "tasks", prd), join(root, "tasks", prd));
+			copyFileSync(join(repoRoot, "tasks", prd), join(root, "tasks", prd));
 		}
 		const digest = productionSourceDigest(root);
 		const sourceBound = [
@@ -92,7 +93,7 @@ describe("production host audit bundle", () => {
 	test("fails closed when any command fails", () => {
 		const directory = mkdtempSync(join(tmpdir(), "production-audit-fail-"));
 		directories.push(directory);
-		const bundle = runProductionAudit(process.cwd(), join(directory, "audit.json"), runner("typecheck"));
+		const bundle = runProductionAudit(repoRoot, join(directory, "audit.json"), runner("typecheck"));
 		assert.equal(bundle.ok, false);
 		assert.equal(bundle.commands.find((command) => command.name === "typecheck")?.exitCode, 1);
 	});

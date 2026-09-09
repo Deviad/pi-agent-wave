@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { ensureAcpxSession, parseWorkerConfig } from "../scripts/acpx-worker.ts";
+import { packageRoot } from "./support/repoRoot.ts";
 
 describe("headless Pi ACP stdio lifecycle", () => {
 	test("retries only the exact stream-destroyed ensure transient once", () => {
@@ -29,7 +30,7 @@ describe("headless Pi ACP stdio lifecycle", () => {
 	});
 
 	test("owns the detached process group, descriptors, result, and exit code", () => {
-		const driver = join(process.cwd(), "extensions/pi-agent-wave/test/support/headless-pi-stdio-driver.py");
+		const driver = join(packageRoot, "test/support/headless-pi-stdio-driver.py");
 		const run = spawnSync("python3", [driver], { cwd: process.cwd(), encoding: "utf8", timeout: 30_000 });
 		assert.equal(run.status, 0, run.stderr);
 		const result = JSON.parse(run.stdout);
@@ -51,7 +52,7 @@ describe("headless Pi ACP stdio lifecycle", () => {
 		const script = [
 			"import json, sys, tempfile",
 			"from pathlib import Path",
-			"sys.path.insert(0, 'extensions/pi-agent-wave/scripts')",
+			`sys.path.insert(0, '${packageRoot}/scripts')`,
 			"import delegate_core",
 			"root = Path(tempfile.mkdtemp())",
 			"real_home = root / 'home'; (real_home / '.pi' / 'agent').mkdir(parents=True)",
@@ -78,12 +79,12 @@ describe("headless Pi ACP stdio lifecycle", () => {
 	});
 
 	test("production launcher retains the AgentFS to acpx-worker argv and bounded diagnostics", () => {
-		const source = readFileSync(join(process.cwd(), "extensions/pi-agent-wave/scripts/delegate_core.py"), "utf8");
+		const source = readFileSync(join(packageRoot, "scripts/delegate_core.py"), "utf8");
 		assert.ok(source.includes('shlex.quote(agentfs_executable), "run", "--session"'));
 		assert.ok(source.includes('shlex.quote(str(ACPX_WORKER))'));
 		assert.match(source, /stdin=subprocess\.DEVNULL/);
 		assert.match(source, /start_new_session=True/);
-		const supervisor = readFileSync(join(process.cwd(), "extensions/pi-agent-wave/scripts/headless_supervisor.py"), "utf8");
+		const supervisor = readFileSync(join(packageRoot, "scripts/headless_supervisor.py"), "utf8");
 		assert.match(supervisor, /stdin=subprocess\.PIPE/);
 		assert.match(supervisor, /worker\.wait\(\)/);
 		assert.match(source, /headless worker exited before result/);

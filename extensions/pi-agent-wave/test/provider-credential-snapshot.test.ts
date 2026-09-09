@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { selectAcpAgent } from "../lib/acpx-select.ts";
 import { join } from "node:path";
+import { packageRoot } from "./support/repoRoot.ts";
 
-const DRIVER = join(process.cwd(), "extensions/pi-agent-wave/test/support/provider-snapshot-driver.py");
+const DRIVER = join(packageRoot, "test/support/provider-snapshot-driver.py");
 
 function driver(mode: string, name: string): Record<string, any> {
 	const result = spawnSync("python3", [DRIVER, mode, name], { cwd: process.cwd(), encoding: "utf8", timeout: 60_000 });

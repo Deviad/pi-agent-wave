@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GraphStore } from "../store.ts";
 import { parseAcpxNdjson, reconcileAcpxLifecycle, sanitizeAcpxNdjson, settleAcpxGraphOperation } from "./support/acpx-spike.ts";
+import { repoRoot } from "./support/repoRoot.ts";
 
 const fixtureTranscript = [
 	JSON.stringify({ jsonrpc: "2.0", id: "request-1", method: "session/prompt", params: { sessionId: "session-1", prompt: [{ type: "text", text: "task" }] } }),
@@ -30,15 +31,15 @@ describe("ACPX event mapping", () => {
 		assert.deepEqual(parseAcpxNdjson(sanitized).map((event) => event.kind), ["started", "completed"]);
 	});
 
-	test("maps a sanitized real completed transcript when the bounded rehearsal produced one", { skip: !existsSync(join(process.cwd(), "agent-output", "acpx-headless-worker-spike", "acpx-session.ndjson")) }, () => {
-		const transcript = readFileSync(join(process.cwd(), "agent-output", "acpx-headless-worker-spike", "acpx-session.ndjson"), "utf8");
+	test("maps a sanitized real completed transcript when the bounded rehearsal produced one", { skip: !existsSync(join(repoRoot, "agent-output", "acpx-headless-worker-spike", "acpx-session.ndjson")) }, () => {
+		const transcript = readFileSync(join(repoRoot, "agent-output", "acpx-headless-worker-spike", "acpx-session.ndjson"), "utf8");
 		const events = parseAcpxNdjson(transcript);
 		assert.ok(events.some((event) => event.kind === "started"));
 		assert.ok(events.some((event) => event.kind === "completed"));
 	});
 
-	test("maps a sanitized real cancellation transcript when the bounded rehearsal produced one", { skip: !existsSync(join(process.cwd(), "agent-output", "acpx-headless-worker-spike", "acpx-cancel-session.ndjson")) }, () => {
-		const transcript = readFileSync(join(process.cwd(), "agent-output", "acpx-headless-worker-spike", "acpx-cancel-session.ndjson"), "utf8");
+	test("maps a sanitized real cancellation transcript when the bounded rehearsal produced one", { skip: !existsSync(join(repoRoot, "agent-output", "acpx-headless-worker-spike", "acpx-cancel-session.ndjson")) }, () => {
+		const transcript = readFileSync(join(repoRoot, "agent-output", "acpx-headless-worker-spike", "acpx-cancel-session.ndjson"), "utf8");
 		const events = parseAcpxNdjson(transcript);
 		assert.ok(events.some((event) => event.kind === "started"));
 		assert.ok(events.some((event) => event.kind === "cancelled"));
@@ -56,7 +57,7 @@ describe("ACPX event mapping", () => {
 			const agentId = store.registerAgent({ runId: state.runId, name: "searcher-1", node: operation.node, role: "searcher", transport: "herdr", herdrAgent: "dg-acpx-searcher-1", tabId: "tab-1", herdrPaneId: "pane-1", currentTask: operation.task });
 			store.record({ runId: state.runId, operationId: operation.id, status: "running", agentId, agentName: "searcher-1", transport: "herdr" });
 
-			const completedTranscriptPath = join(process.cwd(), "agent-output", "acpx-headless-worker-spike", "acpx-session.ndjson");
+			const completedTranscriptPath = join(repoRoot, "agent-output", "acpx-headless-worker-spike", "acpx-session.ndjson");
 			const completedTranscript = existsSync(completedTranscriptPath) ? readFileSync(completedTranscriptPath, "utf8") : fixtureTranscript;
 			const incomplete = reconcileAcpxLifecycle({ events: parseAcpxNdjson(completedTranscript), exitCode: 0, sessionState: "idle", herdrVisible: true, reportValidated: false, evidenceAuditValid: true });
 			assert.throws(() => settleAcpxGraphOperation(store, { runId: state.runId, operationId: operation.id, agentId, agentName: "searcher-1", reportPath, verdict: "DONE", lifecycle: incomplete }), /report is not validated/);

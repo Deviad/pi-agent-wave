@@ -25,6 +25,7 @@ import {
 import { parseDeferredTime, writeDeferredJob } from "../scheduler.ts";
 import { GraphStore, roleForNode } from "../store.ts";
 import type { ResolvedPolicy } from "../types.ts";
+import { packageRoot } from "./support/repoRoot.ts";
 
 const SOL_MODEL = "openai-codex/gpt-5.6-sol";
 const FALLBACK_MODEL = "anthropic/claude-opus-4-1";
@@ -222,7 +223,7 @@ describe("supervisor UX", () => {
 
 	test("production registration maps graph nodes to persisted attempt roles", () => {
 		expect(["thinker_plan", "thinker_synthesize", "implement", "review", "test", "audit", "search"].map((node) => roleForNode(node as Parameters<typeof roleForNode>[0]))).toEqual(["thinker", "thinker", "implementer", "reviewer", "tester", "auditor", "searcher"]);
-		const source = readFileSync(join(process.cwd(), "extensions/pi-agent-wave/index.ts"), "utf8");
+		const source = readFileSync(join(packageRoot, "index.ts"), "utf8");
 		expect(source).toContain("role: roleForNode(operation.node)");
 		expect(source.includes("role: operation.node")).toBe(false);
 	});

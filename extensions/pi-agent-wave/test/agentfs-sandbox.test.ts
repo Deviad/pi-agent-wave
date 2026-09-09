@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { auditAgentFsChanges, buildAgentFsInvocation, expectedAgentFsDb, exportOwnedAgentFsChanges } from "../lib/agentfs-sandbox.ts";
 import { runExport, type ExportConfig } from "../scripts/agentfs-export.ts";
+import { packageRoot } from "./support/repoRoot.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -67,7 +68,7 @@ resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'export-fix
 resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher'})
 print(json.dumps({'exportConfig': json.loads(Path(resource['export_config']).read_text()), 'workerConfig': json.loads(Path(resource['worker_config']).read_text()), 'homeDir': resource['agentfs_home'], 'sessionId': resource['agentfs_session'], 'resource': resource}))
 `;
-	const result = spawnSync("python3", ["-c", script, join(process.cwd(), "extensions/pi-agent-wave/scripts"), f.base, f.privateDir, node, accessMode ?? ""], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+	const result = spawnSync("python3", ["-c", script, join(packageRoot, "scripts"), f.base, f.privateDir, node, accessMode ?? ""], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
 	assert.equal(result.status, 0, result.stderr);
 	const prepared: PreparedAttempt = JSON.parse(result.stdout);
 	return prepared;
@@ -122,7 +123,7 @@ except core.DelegateError as error:
 else:
  raise AssertionError('invalid export accepted')
 `;
-			const result = spawnSync("python3", ["-c", script, join(process.cwd(), "extensions/pi-agent-wave/scripts"), JSON.stringify(prepared.resource), JSON.stringify(receipt)], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+			const result = spawnSync("python3", ["-c", script, join(packageRoot, "scripts"), JSON.stringify(prepared.resource), JSON.stringify(receipt)], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
 			assert.equal(result.status, 0, result.stderr);
 			const failure = JSON.parse(result.stdout);
 			assert.equal(failure.exit, 2);
@@ -152,7 +153,7 @@ core.abort_acpx_attempt(resource)
 bundle = json.loads(next(Path(resource['run_dir']).glob('failure-*.json')).read_text())
 print(json.dumps({'error': message, 'bundle': bundle, 'attemptRemoved': not Path(resource['attempt_dir']).exists()}))
 `;
-		const result = spawnSync("python3", ["-c", script, join(process.cwd(), "extensions/pi-agent-wave/scripts"), JSON.stringify(prepared.resource)], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+		const result = spawnSync("python3", ["-c", script, join(packageRoot, "scripts"), JSON.stringify(prepared.resource)], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
 		assert.equal(result.status, 0, result.stderr);
 		const failure = JSON.parse(result.stdout);
 		assert.match(failure.error, /unowned\.txt/);

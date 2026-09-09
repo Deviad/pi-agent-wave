@@ -70,4 +70,27 @@ describe("package portability", () => {
 			process.env = previous;
 		}
 	});
+
+	// A duplicated helper drifts: `lib/model-failover-native.mjs` existed here and in
+	// `$PI_CODING_AGENT_DIR/lib` with different content, and only the package copy was covered by
+	// tests. `lib/jsonc.mjs` is still present in both trees and is byte-identical, so the durable
+	// invariant is "no diverged twin", not "no twin". Declaration files are skipped: they carry no
+	// runtime behaviour and legitimately differ in extension between the trees.
+	test("shipped lib code has no diverged twin in the agent directory", () => {
+		const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
+		const agentLib = join(agentDir, "lib");
+		if (!existsSync(agentLib)) return;
+		const stem = (name: string) => name.replace(/\.(?:test\.)?(?:ts|mjs|js|py)(?:\.test)?$/, "").replace(/\.d$/, "");
+		const shipped = readdirSync(join(ROOT, "lib"));
+		const twins = readdirSync(agentLib).filter((name) => !name.includes(".test.") && !name.endsWith(".d.ts") && !name.endsWith(".d.mts"));
+		for (const twin of twins) {
+			const twinPath = join(agentLib, twin);
+			if (!statSync(twinPath).isFile()) continue;
+			const match = shipped.filter((name) => !name.includes(".test.") && !name.endsWith(".d.ts") && !name.endsWith(".d.mts") && stem(name) === stem(twin));
+			for (const name of match) {
+				const shippedText = readFileSync(join(ROOT, "lib", name), "utf8");
+				expect(readFileSync(twinPath, "utf8"), `${twin} diverged from shipped ${name}`).toBe(shippedText);
+			}
+		}
+	});
 });

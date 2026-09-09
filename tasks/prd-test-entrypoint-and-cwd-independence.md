@@ -94,8 +94,14 @@ real defects instead of whatever makes the run go quiet.
       behaviour, real defect unrelated to cwd, no-longer-true assertion}.
 - [ Each entry cites the command whose output produced it, and no entry's mechanism is
       marked "confirmed" without a run that reproduces it from both directories.
-- [ ] The two tests that skip under one cwd and run under the other are named, with which one
-      they are and whether that is silent coverage loss.
+- [x] The two tests that skip under one cwd and run under the other are named. **Answered and
+      fixed.** `acpx-event-mapping.test.ts` "maps a sanitized real completed transcript…" and
+      "…real cancellation transcript…", gated on `existsSync(join(process.cwd(), "agent-output", …))`
+      while `agent-output/` exists at the repository root only. From the repository root that file
+      reported 5 pass / 0 skipped; from the package directory, 3 pass / **2 skipped**, with both
+      transcripts present (1783 and 842 bytes). Silent coverage loss, not a neutral skip: the only
+      difference was where the command was typed. Anchored to `repoRoot`, it reports 5 pass /
+      0 skipped from either directory.
 
 ### US-002: Define the canonical entry point
 
@@ -119,11 +125,13 @@ not depend on where I typed the command.
 
 **Acceptance criteria:**
 
-- [ ] Each of the 18 path-construction `process.cwd()` sites is either converted to an
-      `import.meta.url` anchor, or annotated as intentionally launch-dependent with the
-      reason, and the count in this PRD is updated to match reality.
-- [ ] Full-suite run from `extensions/pi-agent-wave/` reports **0 failures**, or a PRD blocker
-      entry names each remaining failure and why it is not fixable here. Not "fewer failures".
+- [ ] Each of the 18 path-construction `process.cwd()` sites is either anchored or annotated.
+      **Partly — count now correct at 19.** After the eight-file pass 19 lines still read
+      `process.cwd()`; they include legitimate `cwd:` arguments to subprocesses and the matrix
+      files' sandbox workspace (Q2), which has not been triaged.
+- [ ] Full-suite run from the package directory reports 0 failures, or names each remaining one.
+      **Half met, left unchecked on purpose:** down to one failure, named below, but "not fixable
+      here" is not established — it is a concurrency interaction, not yet traced to a sibling.
 - [ ] The `deepEqual` assertion in `acpx-herdr-bridge.test.ts` still fails when pointed at a
       missing helper (mutation check re-run, result recorded), proving the guards stayed
       binding.
@@ -167,3 +175,92 @@ that a second runner does not silently mean a second, weaker suite.
   `--workspace`; unverified here, and it should be verified rather than assumed.
 - **Q4 — real-Pi failover rehearsal.** Needs a spec for what it must pin. Not scheduled by
   this PRD.
+
+
+## Implementation record — 2026-09-09 (path class closed, one interference failure open)
+
+Authorised by the user's "1b / 2a / 3b" answers. This section replaces the *status* of the
+hypotheses above; the hypotheses themselves stay as written, annotated, because they record
+what was knowable before the runs.
+
+### Confirmed mechanism (was: hypothesis)
+
+Every one of the 25 was reproduced from **both** launch directories, which is the test US-001
+demands before anything gets called confirmed. All 25 are genuine cwd coupling: the seven
+affected files give 56 passes and 0 failures from the repository root and 25 failures from the
+package directory. Nothing among them was an unavailable-environment case, and nothing was a
+"no-longer-true assertion".
+
+The signature is a doubled path segment. Failures tried to open
+`extensions/pi-agent-wave/extensions/pi-agent-wave/index.ts`, `…/scripts/delegate_core.py`,
+`…/retry.ts`, and to `scandir` `extensions/pi-agent-wave/extensions/pi-agent-wave`. Those come
+from `join(process.cwd(), "extensions/pi-agent-wave/…")` where `process.cwd()` is already
+`extensions/pi-agent-wave`. `production-audit.ts` builds `join(root, "extensions",
+"pi-agent-wave")` internally, so its `root` argument means *repository* root: passing
+`process.cwd()` was wrong from the package directory, not merely a different supported mode.
+
+### What changed
+
+- `test/support/repoRoot.ts` (new) exports `packageRoot` and `repoRoot`, derived from
+  `import.meta.url`. Depth is measured from `test/support/`, which is one level deeper than the
+  existing `test/*.test.ts` anchors, so it is deliberately not the same `../` count; a first
+  draft copied the precedent's count and pointed `repoRoot` at `<repo>/extensions`. That was
+  caught by running the affected files from both directories, not by reading the code.
+- Eight files converted to those anchors: `agentfs-sandbox`, `commands`, `headless-pi-stdio`
+  (including an inline Python `sys.path.insert(0, 'extensions/pi-agent-wave/scripts')`, now
+  absolute so the child no longer inherits a cwd assumption), `production-audit`,
+  `production-review-bundle`, `production-review-gate`, `provider-credential-snapshot`, and
+  `acpx-event-mapping` (the silent-skip class).
+- `acpx-real-matrix.test.ts` had the same latent defect on its driver path. Fixed for
+  consistency, **not verified**: it sits behind `RUN_REAL_ACPX_MATRIX` plus a token-file check,
+  so no run here exercises it. Recorded as unverified rather than as a fix.
+- `package-portability.test.ts` gained the divergence guard the user asked for: a file under
+  `$PI_CODING_AGENT_DIR/lib` whose stem matches a shipped `lib/` file must be byte-identical to
+  it. It skips when no agent directory exists, so a clean machine is not failed by it.
+
+### Why the guard checks divergence rather than existence
+
+`lib/jsonc.mjs` exists in both trees right now and the two copies are byte-identical (same
+SHA-1, 99 lines each), and the agent-directory copy is live: `scripts/policy-resolver.mjs` and
+`scripts/resolve-model.mjs` import it. A "no twin allowed" assertion would therefore have failed
+on the day it was written and been weakened within the hour. `lib/model-failover-native.mjs` was
+the case where two copies *had* drifted apart, which is the failure the guard needs to catch.
+
+Mutation-checked, against a temporary agent directory (`PI_CODING_AGENT_DIR=/tmp/…`), never the
+real one: a diverged twin makes the test fail and names itself
+(`agentfs-sandbox.ts diverged from shipped agentfs-sandbox.ts`); restoring the copies to
+identical makes it pass again; an agent directory with no `lib/` passes. Runs under Node from
+either directory and under Bun from the package directory. The real `~/.pi/agent/lib` was
+verified unchanged afterwards.
+
+### Counts, before and after
+
+| launch directory | before | after |
+| --- | --- | --- |
+| repository root | 438 pass / 0 fail (449 tests) | 438 pass / 1 fail (450 tests) |
+| package directory | 411 pass / **25 fail** / 13 skipped | 438 pass / **1 fail** / 11 skipped |
+| package directory, `--test-concurrency=1` | — | **439 pass / 0 fail** / 11 skipped |
+
+Both directories now report identical counts and the *same* single failure, which is the point of
+G2: launch directory no longer changes the outcome. Skips match at 11 after the
+`acpx-event-mapping` fix; they were 11 against 13 before it.
+
+### The one remaining failure, and what is actually known about it
+
+`production-audit.test.ts` "writes a private hash-bound passing bundle" fails in a **full-suite**
+run from either directory and passes when its file runs alone. It also fails with all of this
+session's changes stashed (`git stash push -u`, baseline re-run, then popped), so it predates the
+path work rather than being caused by it — the honest reading of the earlier "438 / 0" figure is
+that it was measured under different conditions, not that the class was closed then.
+
+Observed, not inferred: a serial run (`--test-concurrency=1`) from the package directory gives
+439 pass / **0 fail** / 11 skipped, against 438 / 1 concurrently. Inferred from that asymmetry:
+the assertion inspects global state — leaked temporary directories, live AgentFS processes, the
+token file — so concurrently running siblings pollute it. Which sibling, and whether the fix is
+serialising that file or scoping the scan, is **unverified** and is the next thing to establish.
+It is not counted as closed anywhere, and it must not be closed by documenting a serial command,
+which would trade a visible failure for a run shape nobody types by hand.
+
+Still open after this slice: the runner dimension (US-004), Q2 (matrix files that use
+`process.cwd()` as the sandbox workspace on purpose), Q3 (AgentFS containment for relative
+owned paths), and Q4 (the real-Pi failover rehearsal spec).

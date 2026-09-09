@@ -7,8 +7,9 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { auditAgentFsChanges, buildAgentFsInvocation, expectedAgentFsDb } from "../lib/agentfs-sandbox.ts";
 import { productionSourceDigest } from "../scripts/production-audit.ts";
+import { packageRoot } from "./support/repoRoot.ts";
 
-const DRIVER = join(process.cwd(), "extensions/pi-agent-wave/test/support/acpx-lifecycle-driver.mjs");
+const DRIVER = join(packageRoot, "test/support/acpx-lifecycle-driver.mjs");
 const TOKEN_FILE = process.env.PI_CLAUDE_OAUTH_TOKEN_FILE;
 const RUN_REAL = process.env.RUN_REAL_ACPX_MATRIX === "1" && !!TOKEN_FILE && existsSync(TOKEN_FILE);
 const EVIDENCE_DIR = process.env.MATRIX_EVIDENCE_DIR;
