@@ -333,5 +333,30 @@ runner that reaches the whole suite; Bun is supported for the shim subset and th
 in the documented gate, which pass 46/0. A whole-directory `bun test` is not a supported shape and
 should not be read as a red build.
 
-Still open after this slice: Q3 (AgentFS containment for relative owned paths) and Q4 (the real-Pi
-failover rehearsal spec).
+### Q3 closed: the containment gap was not reachable, and the invariant that makes it unreachable is now pinned
+
+The deferred item was that `ownedRelativePaths()` resolves a relative owned path against
+`process.cwd()` rather than against the sandbox base, which looked like the same launch-directory
+class as the doubled paths above. It is not reachable, and the reason is a guarantee that sits in
+Python with no test on it: `delegate_core.parsed_owned_paths()` absolutizes every relative entry
+against the attempt workspace before an export config is written, and `delegate_core` is the only
+producer of that config. The tool contract's `ownedPaths` go through it (`index.ts` schema ->
+`store.ts` JSON -> `--owned-paths-json` -> `parsed_owned_paths` -> `auditAgentFsChanges`), and every
+existing test and runtime call passes absolute paths. So a relative entry only reaches the
+TypeScript side through a hand-authored export config, which is out of the supported shape.
+
+Rather than "fix" an unreachable path, `test/owned-path-normalization.test.ts` now pins both halves
+of the pair: normalization absolutizes against the attempt workspace, and ownership separates an
+escaping path from a contained one before the delta is read (the escape case raises `owned path
+escapes base directory`, the contained case gets past it). Binding was checked by mutation, not by
+reading: removing the absolutization in `delegate_core.py` fails the first case, and removing the
+escape rejection in `lib/agentfs-sandbox.ts` fails the second. Both files were restored from Git
+afterwards, and the suite is 454 tests / 443 pass / 0 fail / 11 skipped from either launch
+directory, with the Bun gate unchanged at 46/0.
+
+The macOS detail that the first draft of that test got wrong is worth keeping: `mkdtempSync` returns
+`/var/folders/...` while Python's `resolve()` returns `/private/var/folders/...`, so any assertion
+that compares the two must go through `realpathSync` first.
+
+Still open after this slice: Q4 (the real-Pi failover rehearsal spec), which needs a decision about
+what failover should pin before anyone builds it.
