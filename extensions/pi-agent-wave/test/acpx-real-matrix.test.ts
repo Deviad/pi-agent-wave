@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { auditAgentFsChanges, buildAgentFsInvocation, expectedAgentFsDb } from "../lib/agentfs-sandbox.ts";
 import { productionSourceDigest } from "../scripts/production-audit.ts";
-import { packageRoot } from "./support/repoRoot.ts";
+import { packageRoot, repoRoot } from "./support/repoRoot.ts";
 
 const DRIVER = join(packageRoot, "test/support/acpx-lifecycle-driver.mjs");
 const TOKEN_FILE = process.env.PI_CLAUDE_OAUTH_TOKEN_FILE;
@@ -60,7 +60,7 @@ function runAgent(agent: "pi" | "codex" | "claude", model: string): void {
 	if (TOKEN_FILE) symlinkSync(TOKEN_FILE, tokenLink);
 	const session = `matrix-${agent}-${process.pid}`;
 	const resultPath = join(root, `${agent}-result.json`);
-	const invocation = buildAgentFsInvocation({ sessionId: session, baseDir: process.cwd(), homeDir: agentFsHome, privateDir: root, command: process.execPath, args: [DRIVER] }, {
+	const invocation = buildAgentFsInvocation({ sessionId: session, baseDir: repoRoot, homeDir: agentFsHome, privateDir: root, command: process.execPath, args: [DRIVER] }, {
 		...process.env,
 		MATRIX_AGENT: agent,
 		MATRIX_MODEL: model,
@@ -78,13 +78,13 @@ function runAgent(agent: "pi" | "codex" | "claude", model: string): void {
 	const resultBytes = readFileSync(resultPath);
 	const result = JSON.parse(resultBytes.toString("utf8"));
 	assert.deepEqual({ ensured: result.ensured, queued: result.queued, cancelled: result.cancelled, reconnected: result.reconnected, closed: result.closed }, { ensured: true, queued: true, cancelled: true, reconnected: true, closed: true });
-	const audit = auditAgentFsChanges(expectedAgentFsDb(agentFsHome, session), process.cwd(), []);
+	const audit = auditAgentFsChanges(expectedAgentFsDb(agentFsHome, session), repoRoot, []);
 	assert.equal(audit.violations.length, 0);
 	assert.equal(audit.owned.length, 0);
 	if (TOKEN_FILE && tokenBefore) assert.equal(Buffer.compare(tokenBefore, readFileSync(TOKEN_FILE)), 0);
 	if (EVIDENCE_DIR) {
 		mkdirSync(EVIDENCE_DIR, { recursive: true, mode: 0o700 });
-		const sanitizedArgs = invocation.args.map((value) => value.replaceAll(root, "<temporary>").replaceAll(process.cwd(), "<repository>"));
+		const sanitizedArgs = invocation.args.map((value) => value.replaceAll(root, "<temporary>").replaceAll(repoRoot, "<repository>"));
 		const evidence = {
 			schemaVersion: 1,
 			agent,
@@ -94,7 +94,7 @@ function runAgent(agent: "pi" | "codex" | "claude", model: string): void {
 			resultSha256: createHash("sha256").update(resultBytes).digest("hex"),
 			agentFs: { changes: audit.changes.length, owned: audit.owned.length, violations: audit.violations.length, dbSha256: createHash("sha256").update(readFileSync(expectedAgentFsDb(agentFsHome, session))).digest("hex") },
 			credentialBoundary: { tokenFileUsed: agent === "claude", tokenMode: agent === "claude" && TOKEN_FILE ? (statSync(TOKEN_FILE).mode & 0o777).toString(8) : null, tokenUnchanged: agent === "claude" ? tokenBefore !== null && Buffer.compare(tokenBefore, readFileSync(TOKEN_FILE!)) === 0 : true, valuePersisted: false },
-			productionSourceSha256: productionSourceDigest(process.cwd()),
+			productionSourceSha256: productionSourceDigest(repoRoot),
 			productionReport: `agent-output/production-acpx-worker-backend/real-matrix-${agent}-report.json`,
 		};
 		const output = join(EVIDENCE_DIR, `${agent}.json`);

@@ -6,8 +6,11 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { productionSourceDigest } from "../scripts/production-audit.ts";
+import { repoRoot } from "./support/repoRoot.ts";
 
-const ROOT = process.cwd();
+// The repository root, not the launch directory: DELEGATE and the digest walk below
+// are both repo-shaped, and the file is only meaningful when they resolve.
+const ROOT = repoRoot;
 const DELEGATE = join(ROOT, "extensions/pi-agent-wave/scripts/delegate.ts");
 const TOKEN_FILE = process.env.PI_CLAUDE_OAUTH_TOKEN_FILE;
 const EVIDENCE_DIR = process.env.MATRIX_EVIDENCE_DIR;

@@ -284,6 +284,54 @@ exported and covered against synthetic process lists, mirroring the fabricated `
 copies changes what an audit measures and needs its own slice.by "clean".
 
 
-Still open after this slice: the runner dimension (US-004), Q2 (matrix files that use
-`process.cwd()` as the sandbox workspace on purpose), Q3 (AgentFS containment for relative
-owned paths), and Q4 (the real-Pi failover rehearsal spec).
+### Q2 closed: the remaining `process.cwd()` sites, classified rather than churned
+
+The earlier note calling these "matrix files that use `process.cwd()` as the sandbox workspace on
+purpose" was **wrong**, and the correction matters: they were repo-root-shaped, i.e. the same defect
+class as the doubled paths, only hidden behind an env gate. Measured before changing anything:
+
+| launch directory | `join(cwd, "extensions/pi-agent-wave/scripts/delegate.ts")` | files seen by a digest over that root |
+| --- | --- | --- |
+| repository root | resolves | 499 |
+| package directory | **missing** (`extensions/pi-agent-wave/extensions/…`) | 159 |
+
+`acpx-production-matrix.test.ts`, `acpx-headless-real-matrix.test.ts` and `acpx-real-matrix.test.ts`
+now take the root from `test/support/repoRoot.ts`, so both columns resolve. Their `replaceAll(root,
+"<temporary>").replaceAll(process.cwd(), "<repository>")` sanitizer is the tell: the value was
+always meant to be the repository.
+
+Nine `process.cwd()` sites remain and are left alone on evidence, not preference. Eight are a
+subprocess working directory where nothing downstream derives a path from it: every driver is
+located by an absolute path (`import.meta.url`, `packageRoot`, `dirname(fileURLToPath(…))`) and each
+Python driver resolves its own target through `Path(__file__).resolve().parents[2]`. The ninth is
+`acpx-cancellation.test.ts`, where `cwd` is data inside a record handed to a fake ACPX binary;
+`scripts/acpx-cancel.ts:17` spawns from `config.acpxHome` and passes `config.cwd` as a `--cwd`
+argument, deliberately, because a session cwd may be an unmounted AgentFS path. Full suite stays
+452 tests / 441 pass / 0 fail / 11 skipped from both directories after the change.
+
+**Not verified, and why:** the three matrix files only execute under `RUN_REAL_ACPX_*` with a real
+token and evidence directory. Running them for real would dispatch live workers, which the repo
+contract excludes from development verification, so the fix is proven at the level that is
+checkable - path derivation from both launch directories - and not end to end. It also cannot
+regress the shape that does run: the numbers above are identical before and after.
+
+### US-004 closed: two runners, two different scopes
+
+`test/test-api.mjs` is a real dual-runner shim (`globalThis.Bun ? bun:test : node:test`, with a
+hand-written `expect` for the Node side) and 13 files import it. Measured on those 13 from the
+package directory: **93 tests, 93 pass, 0 fail under Node** and **93 tests, 93 pass, 0 fail and 1
+skip under Bun**. The dual-runner design works and is load-bearing; trimming it would cost coverage
+rather than remove it.
+
+`bun test test/` over the whole directory is a different matter: 193 tests, 135 pass, 54 fail, 45
+errors, and the causes are structural rather than incidental - `No such built-in module:
+node:sqlite`, and a temp-path ENOENT (`…/cancel-alive-XXXX/agent/model-routing.jsonc`). Same counts
+with this slice's matrix edits stashed, so nothing here introduced them.
+
+Conclusion recorded for whoever picks this up: Node is the completion gate because it is the only
+runner that reaches the whole suite; Bun is supported for the shim subset and the eight named files
+in the documented gate, which pass 46/0. A whole-directory `bun test` is not a supported shape and
+should not be read as a red build.
+
+Still open after this slice: Q3 (AgentFS containment for relative owned paths) and Q4 (the real-Pi
+failover rehearsal spec).
