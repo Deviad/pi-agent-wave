@@ -3,10 +3,14 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { artifactsCurrent, auditCommands, EXPECTED_AUDIT_COMMANDS, EXPECTED_AUDIT_SUMMARIES, productionSourceDigest, runProductionAudit, summariesValid, summarizeAuditOutput, type AuditCommandRecord, type Runner } from "../scripts/production-audit.ts";
+import { artifactsCurrent, auditCommands, countAgentFsProcesses, EXPECTED_AUDIT_COMMANDS, EXPECTED_AUDIT_SUMMARIES, productionSourceDigest, readCleanup, runProductionAudit, summariesValid, summarizeAuditOutput, type AuditCommandRecord, type CleanupSnapshot, type Runner } from "../scripts/production-audit.ts";
 import { packageRoot, repoRoot } from "./support/repoRoot.ts";
 
 const directories: string[] = [];
+
+// A machine with nothing left over. Tests that only care about gate logic pass this instead of
+// asserting against whatever this host happens to be running at the moment of the run.
+const cleanMachine: CleanupSnapshot = { leakedTabs: [], agentFsProcesses: 0, temporaryDirectories: [], tokenFilePresent: false };
 afterEach(() => {
 	for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -81,13 +85,33 @@ describe("production host audit bundle", () => {
 			writeFileSync(path, `${JSON.stringify(sourceBound.includes(relative) ? { productionSourceSha256: digest } : { recorded: true })}\n`, { mode: 0o600 });
 		}
 		const output = join(directory, "audit.json");
-		const bundle = runProductionAudit(root, output, runner());
+		const bundle = runProductionAudit(root, output, runner(), () => ({ ...cleanMachine }));
 		assert.equal(bundle.ok, true, JSON.stringify({ stale: bundle.artifacts.filter((artifact) => !artifact.sourceCurrent).map((artifact) => [artifact.path, artifact.productionSourceSha256]), cleanup: bundle.cleanup, secret: bundle.secretScan, changed: bundle.sourceChangedDuringAudit }));
 		assert.equal(bundle.commands.length, 14);
 		assert.ok(bundle.commands.every((command) => command.outputSha256.length === 64));
 		assert.ok(bundle.artifacts.every((artifact) => artifact.sha256.length === 64 && artifact.mode === "600"));
 		assert.ok(bundle.artifacts.every((artifact) => artifact.sourceCurrent));
 		assert.equal(statSync(output).mode & 0o777, 0o600);
+
+		// Same fixture, same fake Runner; only the injected machine differs. A live AgentFS process
+		// must still fail the bundle, otherwise injecting the probe would have blinded the gate
+		// rather than decoupled it.
+		const dirty = runProductionAudit(root, join(directory, "audit-dirty.json"), runner(), () => ({ ...cleanMachine, agentFsProcesses: 1 }));
+		assert.equal(dirty.ok, false);
+		assert.equal(dirty.cleanup.agentFsProcesses, 1);
+	});
+
+	test("counts leftover AgentFS runs and nothing else", () => {
+		// Mirrors the synthetic process lists in test/support/acpx-cleanup-driver.py: an
+		// agentfs run without a dg- session is somebody else's, and a non-agentfs line mentioning
+		// dg- is not a process to clean up.
+		assert.equal(countAgentFsProcesses("124 agentfs run session-owned\n500 agentfs run dg-abc\n501 grep dg-nothing\n502 agentfs mount dg-x\n"), 1);
+	});
+
+	test("the real machine probe returns a snapshot instead of throwing", () => {
+		const cleanup = readCleanup();
+		assert.equal(typeof cleanup.agentFsProcesses, "number");
+		assert.ok(Array.isArray(cleanup.leakedTabs) && Array.isArray(cleanup.temporaryDirectories) && typeof cleanup.tokenFilePresent === "boolean");
 	});
 
 	test("fails closed when any command fails", () => {

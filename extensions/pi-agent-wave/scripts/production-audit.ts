@@ -225,7 +225,41 @@ export function summariesValid(commands: AuditCommandRecord[], expectations: Aud
 	});
 }
 
-export function runProductionAudit(root: string, outputPath: string, runner: Runner = spawnSync): ProductionAuditBundle {
+export interface CleanupSnapshot {
+	leakedTabs: string[];
+	agentFsProcesses: number;
+	temporaryDirectories: string[];
+	tokenFilePresent: boolean;
+}
+
+// A bundle records what the machine looked like during the audit, independently of how its
+// commands were executed. Callers that drive the audit with a fake Runner pass their own snapshot
+// here; the default reads live state, which is what a real audit has to prove.
+export type CleanupProbe = () => CleanupSnapshot;
+
+const AGENTFS_PROCESS = /agentfs run.*dg-/;
+const PRODUCTION_TEMPORARY = /delegate-graph-herdr-production-acpx|production-acpx-(pi|codex|claude)-real/;
+
+export function countAgentFsProcesses(processList: string): number {
+	return processList.split("\n").filter((line) => AGENTFS_PROCESS.test(line)).length;
+}
+
+export function readCleanup(): CleanupSnapshot {
+	const ps = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+	const agentFsProcesses = countAgentFsProcesses(`${ps.stdout ?? ""}`);
+	const temporaryDirectories = readdirSync("/private/tmp").filter((name) => PRODUCTION_TEMPORARY.test(name));
+	const tabList = spawnSync("herdr", ["tab", "list", "--workspace", process.env.HERDR_WORKSPACE_ID ?? ""], { encoding: "utf8" });
+	let leakedTabs: string[] = [];
+	try {
+		const tabs = JSON.parse(tabList.stdout).result?.tabs ?? [];
+		leakedTabs = tabs.filter((tab: { label?: string }) => /production-acpx/i.test(tab.label ?? "")).map((tab: { tab_id: string }) => tab.tab_id);
+	} catch { leakedTabs = ["unparseable-herdr-tab-list"]; }
+	const tokenFilePresent = !!process.env.PI_CLAUDE_OAUTH_TOKEN_FILE && existsSync(process.env.PI_CLAUDE_OAUTH_TOKEN_FILE);
+	return { leakedTabs, agentFsProcesses, temporaryDirectories, tokenFilePresent };
+}
+
+export function runProductionAudit(root: string, outputPath: string, runner: Runner = spawnSync, probe: CleanupProbe = readCleanup): ProductionAuditBundle {
+	const cleanup = probe();
 	const sourceBefore = spawnSync("git", ["diff", "--binary", "HEAD"], { cwd: root, encoding: "utf8" }).stdout;
 	const productionSourceSha256 = productionSourceDigest(root);
 	const commands = auditCommands(root).map((command) => runCommand(command, runner));
@@ -235,21 +269,11 @@ export function runProductionAudit(root: string, outputPath: string, runner: Run
 	const secretPattern = /\bsk-ant-[A-Za-z0-9_-]{20,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY/g;
 	let findings = 0;
 	for (const file of files) findings += [...readFileSync(file, "utf8").matchAll(secretPattern)].length;
-	const ps = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
-	const agentFsProcesses = `${ps.stdout ?? ""}`.split("\n").filter((line) => /agentfs run.*dg-/.test(line)).length;
-	const temporaryDirectories = readdirSync("/private/tmp").filter((name) => /delegate-graph-herdr-production-acpx|production-acpx-(pi|codex|claude)-real/.test(name));
-	const tabList = spawnSync("herdr", ["tab", "list", "--workspace", process.env.HERDR_WORKSPACE_ID ?? ""], { encoding: "utf8" });
-	let leakedTabs: string[] = [];
-	try {
-		const tabs = JSON.parse(tabList.stdout).result?.tabs ?? [];
-		leakedTabs = tabs.filter((tab: { label?: string }) => /production-acpx/i.test(tab.label ?? "")).map((tab: { tab_id: string }) => tab.tab_id);
-	} catch { leakedTabs = ["unparseable-herdr-tab-list"]; }
-	const tokenFilePresent = !!process.env.PI_CLAUDE_OAUTH_TOKEN_FILE && existsSync(process.env.PI_CLAUDE_OAUTH_TOKEN_FILE);
 	const artifactRecords = artifacts(root, productionSourceSha256);
 	const bundle: ProductionAuditBundle = {
 		schemaVersion: 1,
 		observedAt: new Date().toISOString(),
-		ok: summariesValid(commands) && artifactsCurrent(artifactRecords) && findings === 0 && agentFsProcesses === 0 && temporaryDirectories.length === 0 && leakedTabs.length === 0 && !tokenFilePresent && sourceBefore === sourceAfter,
+		ok: summariesValid(commands) && artifactsCurrent(artifactRecords) && findings === 0 && cleanup.agentFsProcesses === 0 && cleanup.temporaryDirectories.length === 0 && cleanup.leakedTabs.length === 0 && !cleanup.tokenFilePresent && sourceBefore === sourceAfter,
 		runtimes: { node: process.version, acpx: "0.13.2", agentfs: "0.6.4", herdr: "0.8.0" },
 		commands,
 		artifacts: artifactRecords,
@@ -258,7 +282,7 @@ export function runProductionAudit(root: string, outputPath: string, runner: Run
 		checklist: checklist(root),
 		sourceSnapshotSha256: hash(sourceAfter),
 		sourceChangedDuringAudit: sourceBefore !== sourceAfter,
-		cleanup: { leakedTabs, agentFsProcesses, temporaryDirectories, tokenFilePresent },
+		cleanup,
 		secretScan: { files: files.length, findings },
 	};
 	writeFileSync(outputPath, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });

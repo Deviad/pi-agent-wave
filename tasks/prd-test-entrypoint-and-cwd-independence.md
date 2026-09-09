@@ -129,9 +129,9 @@ not depend on where I typed the command.
       **Partly — count now correct at 19.** After the eight-file pass 19 lines still read
       `process.cwd()`; they include legitimate `cwd:` arguments to subprocesses and the matrix
       files' sandbox workspace (Q2), which has not been triaged.
-- [ ] Full-suite run from the package directory reports 0 failures, or names each remaining one.
-      **Half met, left unchecked on purpose:** down to one failure, named below, but "not fixable
-      here" is not established — it is a concurrency interaction, not yet traced to a sibling.
+- [x] Full-suite run from the package directory reports 0 failures. **Met:** 452 tests / 441 pass /
+      **0 fail** / 11 skipped, and the same numbers from the repository root. Reached by removing the
+      dependence on live host state, not by serialising the run or editing an assertion.
 - [ ] The `deepEqual` assertion in `acpx-herdr-bridge.test.ts` still fails when pointed at a
       missing helper (mutation check re-run, result recorded), proving the guards stayed
       binding.
@@ -239,7 +239,8 @@ verified unchanged afterwards.
 | --- | --- | --- |
 | repository root | 438 pass / 0 fail (449 tests) | 438 pass / 1 fail (450 tests) |
 | package directory | 411 pass / **25 fail** / 13 skipped | 438 pass / **1 fail** / 11 skipped |
-| package directory, `--test-concurrency=1` | — | **439 pass / 0 fail** / 11 skipped |
+| package directory, serial, before the probe change | — | 439 pass / 0 fail / 11 skipped |
+| **either directory, default concurrency, after the probe change** | — | **441 pass / 0 fail** / 11 skipped |
 
 Both directories now report identical counts and the *same* single failure, which is the point of
 G2: launch directory no longer changes the outcome. Skips match at 11 after the
@@ -272,15 +273,15 @@ one poison sibling. Nor is it leftover state — no AgentFS process and no leake
 directory existed on the machine when it was checked, and the serial run is green.
 
 So the assertion asks "is this machine quiet right now?" of a suite whose other files are
-deliberately not quiet. Three ways out, none applied, and (a) and (c) touch product code:
-
-- **(a) Inject the cleanup probe** as a parameter defaulting to the real one, so a test covers
-  the gate logic against a synthetic quiet machine and a separate check covers the real probe.
-  Preferred: the function already takes an injected `Runner`, so this follows an existing seam.
-- **(b) Serialize the file or the suite.** Rejected: hides a visible failure behind a command
-  nobody types by hand, and taxes every future run given 24 possible contributors.
-- **(c) Scope the scan** to processes whose command line references the audit's own workspace.
-  Most precise, more work, and it changes what a production audit means by "clean".
+deliberately not quiet. **Applied: (a), decided 2026-09-09.** Whole-machine semantics kept — a real audit still probes the
+live host — and the probe became the fourth parameter of `runProductionAudit`, defaulting to
+`readCleanup()`, which is the extracted original. The passing-bundle test injects a clean snapshot;
+the same test also re-runs the fixture with an injected `agentFsProcesses: 1` and asserts the
+bundle fails, so the gate stayed bound rather than being switched off. `countAgentFsProcesses` is
+exported and covered against synthetic process lists, mirroring the fabricated `ps` input
+`test/support/acpx-cleanup-driver.py` already feeds to the second copy of this rule in
+`scripts/production-cleanup-scan.ts`. That duplication is unresolved on purpose: unifying the two
+copies changes what an audit measures and needs its own slice.by "clean".
 
 
 Still open after this slice: the runner dimension (US-004), Q2 (matrix files that use

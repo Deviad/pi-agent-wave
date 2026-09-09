@@ -1,5 +1,30 @@
 # PRD: Package Delegate Graph as `@dpugliese/pi-agent-wave`
 
+## Maintenance slice: audit cleanup probe becomes injectable (semantics unchanged)
+
+`runProductionAudit` read machine state inline — `ps -axo pid=,command=` counted against
+`/agentfs run.*dg-/", plus temp-directory, Herdr-tab and token-file scans — and folded the result
+into `ok`. That read is correct for a real audit and untestable as a unit: running with a fake
+`Runner` still probed the live host, so the suite's own concurrency decided the outcome. Twenty-four
+other test files start AgentFS, so a full-suite run reported one failure from either launch
+directory while a serial run reported none, and the file passed on its own.
+
+The read is now `readCleanup()`, passed to `runProductionAudit` as a fourth parameter defaulting
+to itself. Production behaviour is identical: a real audit still probes the real machine, and a
+non-zero AgentFS count still fails the bundle — pinned by a new assertion that injects a machine
+with one live process and requires `ok === false`. Tests that only exercise gate logic inject a
+clean snapshot instead of inheriting whatever the host was running. `countAgentFsProcesses` is
+exported and tested against synthetic process lists in the style of
+`test/support/acpx-cleanup-driver.py`, which already feeds fabricated `ps` output to the
+duplicate of this rule in `scripts/production-cleanup-scan.ts`.
+
+Two things deliberately left open. The rule exists twice (`production-audit.ts` and
+`production-cleanup-scan.ts`); they agree today, and unifying them changes what an audit measures,
+so it needs its own slice. And one concurrent run failed in `acpx-cleanup.test.ts`, which passes
+31/31 alone; the same shape of interference is plausible there and was not reproduced in the three
+runs after this change, so it is recorded as unconfirmed rather than fixed.
+
+
 **Status:** Core packaging, migration, initial user configuration, cross-provider HTTP 429 failover, historical mandatory-Herdr enforcement, panel-transport removal, the user-first README, and operational-search delegation are implemented and verified. `tasks/prd-air-controlled-editor-independent-orchestration.md` now governs the phased change to Air/headless operation with optional Herdr presentation. Production ACPX-only worker execution is authorized by `tasks/prd-production-acpx-worker-backend.md`, following the completed validation spike in `tasks/prd-acpx-headless-worker-spike.md`; lifecycle hardening, source hardening, deterministic host audit, bundle completeness, and the final observable review all pass; final evidence is recorded in `tasks/prd-production-acpx-final-bundle-completeness.md`. Operational-search proof is recorded in `tasks/prd-operational-search-delegation.md`; other feature proof is recorded in the linked PRDs, including `tasks/prd-require-herdr.md`. The npm package remains unpublished. `tasks/prd-worker-route-resilience.md` records the worker-route recovery fixes verified in field use on 2026-09-06 (frozen-chain failover on transient worker failures, collect/cancel convergence, retained failure diagnostics, and rejecting supervisor projections as semantic verdicts); silent-turn detection, and the keychain-credential root cause of the silent Pi worker are implemented and verified there; the credential-delivery remedy for keychain-backed providers remains an open product decision.
 
 ## Maintenance slice: AgentFS large-file comparison and export
