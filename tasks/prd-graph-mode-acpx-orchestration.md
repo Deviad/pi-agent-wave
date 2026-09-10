@@ -195,6 +195,12 @@ recorded here rather than quietly dropped.
 
 ## Open decision
 
+> **Answered 2026-09-10, so this prompt is no longer open.** Both options below were executed. The
+> reconnect path passes 2/2 on a valid credential, and the credential-staleness theory is refuted by the
+> diagnostic table in the section at the end of this file: a bad credential produces a captured
+> `errorClass: "auth"` or a `401`, and neither matches what September recorded. What is left is not a
+> debugging task but a missing artifact — see the retention gap in that same section.
+
 The matrix has now been run, so the remaining question is narrower than the one this file opened
 with. Two things are worth deciding, in order of cost:
 
@@ -307,3 +313,60 @@ inside that isolation, for reasons that have nothing to do with the reconnect pa
 succeeds in the same isolated shape first, then run the lifecycle case. If the no-tool prompt already
 fails there with a live credential, the finding is about harness isolation, not about ACP session resume,
 and that is a different issue than the one this file has been chasing.
+
+
+## 2026-09-10: the Claude lifecycle now passes 2/2, and the credential theory I wrote earlier today was wrong
+
+Executed after a Claude re-login, with authorization to rerun the Claude case. Read this section before
+the two above it; it supersedes their causal conclusions.
+
+**The lifecycle is not broken.** `Claude cancel and reconnect` ran twice through the real harness — ACPX
+0.13.2 inside AgentFS 0.6.4, model `claude-opus-5`, isolated `HOME` and `CLAUDE_CONFIG_DIR`, no tools —
+and both returned all five stages true at 21.48 s and 21.06 s (`agent-output/claude-recheck-2026-09-10/
+claude.json`, `.../run2/claude.json`; `agentFs.changes: 0`, `violations: 0`, `credentialBoundary.
+tokenUnchanged: true`). So "the Claude agent does not resume an ACP session" is answered in the negative
+for this configuration.
+
+**Three credential states were then run through the same harness to see whether the September failures
+were credential-caused. They were not, and the reason is observable, not inferred.**
+
+| state | result | what the reconnect diagnostics recorded |
+| --- | --- | --- |
+| valid token (Keychain, 7.8 h left) | pass, 21.1–21.5 s | `end_turn` present, no error |
+| stale token (expired 2026-09-06) | fail, 12.1 s | `errorKeys: ["code","message","data"]`, code `-32603`, `401 Invalid bearer token` |
+| empty token file | fail | `errorKeys: ["code","message"]`, `errorCode: -32000`, **`errorClass: "auth"`**, 23-byte message |
+
+A bad credential is therefore loud, and the harness can hear it: `protocolDiagnostics` records
+`errorKeys`, `errorCode` and `errorClass`, and it correctly classified the auth failure as `"auth"`. The
+September record states `errorKeys: []`, `errorCode: null`, `errorClass: null` on every diagnostic line,
+plus one `session/update` and no terminal stop reason. That is a fourth, different shape — a resumed turn
+that began and never finished — and it is the only shape the credential controls did **not** reproduce.
+So the two September attempts were not "silent because the credential was expired"; silence was
+genuinely what happened, and the leading explanation remains the one this file first recorded: a
+degraded provider window, now unreproducible.
+
+**What that does and does not buy.** It removes credential staleness as the explanation, and it removes
+"the reconnect path is broken" as a standing assumption — both were being carried as facts. It does not
+identify the September cause; two passing runs on a healthy provider show the code path works today,
+which is not the same as knowing what it did on 2026-09-10 at 15:2x local. Anything that wants the
+original cause needs a fresh degraded-provider window, which is not schedulable.
+
+**Corrections to the section above this one, which was written before these runs.** "Zero tokens were
+requested or spent" and "not an auth rejection reported by the agent": the second was right, and right
+for the reason given, but the first was wrong in general — a stale token does reach the provider and
+comes back `401`. Also retracted: my note that `CLAUDE_CODE_OAUTH_TOKEN` "appears nowhere in the chain".
+It is read by `@anthropic-ai/claude-agent-sdk` alongside `ANTHROPIC_API_KEY` and
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`; the first grep had scoped to the adapter package only.
+
+**Still worth building, and now smaller than when it was proposed.** The driver already classifies auth
+errors correctly, so the only gap is retention: its detailed result lands in `MATRIX_RESULT` inside a
+temp root that `rmSync` deletes, and only five booleans plus hashes reach `MATRIX_EVIDENCE_DIR`. Copying
+that file into the evidence dir would have let the September question be answered from disk instead of
+by rerunning the world's least available provider. Needs its own slice.
+
+**Practical note, still true and still the main trap.** On this host the authoritative Claude credential
+is the Keychain item `Claude Code-credentials`, not `~/.claude/.credentials.json`, which sat expired at
+its Sep 6 content even after a successful login. The harness symlinks that file into
+`CLAUDE_CONFIG_DIR` and passes its content as `CLAUDE_CODE_OAUTH_TOKEN`, so trusting the file feeds the
+worker a four-day-dead bearer token. Stage a real token for any `RUN_REAL_ACPX_MATRIX=1` run, mode 600,
+deleted afterwards.
