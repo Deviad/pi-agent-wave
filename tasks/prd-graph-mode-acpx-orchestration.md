@@ -207,3 +207,42 @@ with. Two things are worth deciding, in order of cost:
 Building the larger declarative/cross-host design still needs a concrete second location, which
 issue 014 recorded as absent. Nothing downstream of that can be planned credibly without a named
 host or resolvable SSH target.
+### The credential used by both Claude runs had already expired (2026-09-10, measured)
+
+Checked before any further failure analysis, as this file's own precondition requires.
+
+Measured, not inferred:
+
+- `~/.claude/.credentials.json` carries `claudeAiOauth.expiresAt = 1788705752829` = **2026-09-06T14:42:32Z**,
+  and its mtime is 2026-09-06T06:42:32Z. At the control run it was **94.9 h past expiry** and had never
+  been refreshed. Pi's `auth.json` `claude-code` entry holds the *same* expiry value; its file was last
+  written 2026-09-08T19:58Z. Pi's `anthropic` entry expired 2026-09-09T03:53Z; `openai-codex` is valid
+  until 2026-09-15T08:44Z.
+- Both recorded Claude attempts are dated 2026-09-10, i.e. **3.4 to 3.6 days after that credential died**,
+  including the second attempt that used a correctly extracted raw 108-character token. So the line above
+  this section — "the credential format was not the cause" — is right about format and silent about age.
+- A fresh control run today at 15:32-15:33 local, new session, `--allowed-tools ""`, `--deny-all`, temp
+  `HOME` and `CLAUDE_CONFIG_DIR` with the credentials symlinked and **no** `CLAUDE_CODE_OAUTH_TOKEN`:
+  `sessions ensure` succeeded, then the prompt returned `{"error":{"code":-32000,"message":"Authentication
+  required"}}` with `usage_update used: 0, cost 0` and no `end_turn`. Zero tokens were requested or spent.
+
+Two things this settles and one it does not:
+
+1. The recorded shape and today's control shape are **different**. The recorded runs carried
+   `errorKeys: []` / `errorClass: null` — silence. A run with no credential at all produces an explicit
+   auth error. So the recorded failure was not simply "credential absent": with a stale-but-present token
+   the resumed turn produced no terminal stop reason and no error object. If anything, that is a clue that
+   a stale token degrades into silence rather than into a clean rejection.
+2. An at-rest-expired entry does **not** automatically block the lifecycle: `pi.json` and `codex.json` were
+   both written on 2026-09-10, after their own credentials' expiry, and both record `reconnected: true`.
+   So "expired at rest" is a confounder to remove, not a proven cause, and it must not be written as one.
+3. Therefore neither open question can be answered from existing data — not "the Claude agent does not
+   resume an ACP session", not "claude-opus-5 does not exist here". Both need one rerun with a credential
+   that is currently valid, which needs a re-login or a fresh token file; neither is mine to do.
+
+Operational note for the next probe, because the first attempt wasted itself on it: `--cwd`, `--format`,
+`--json-strict`, `--timeout`, `--model`, `--deny-all` and `--allowed-tools` are **global** options and must
+precede the agent subcommand — `acpx --format json … claude "prompt"`, which is why the driver builds
+`[...base, agent, ...args]`. Placing them after `claude` exits 1 with `unknown option '--cwd'` and spends
+nothing. A prompt also needs a session first (`acpx claude sessions ensure --name <n>`), otherwise the
+answer is `NO_SESSION`.
