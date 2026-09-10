@@ -246,3 +246,35 @@ precede the agent subcommand — `acpx --format json … claude "prompt"`, which
 `[...base, agent, ...args]`. Placing them after `claude` exits 1 with `unknown option '--cwd'` and spends
 nothing. A prompt also needs a session first (`acpx claude sessions ensure --name <n>`), otherwise the
 answer is `NO_SESSION`.
+
+### Credential state as measured on 2026-09-10, and the rerun that settles it
+
+`pi auth check` output, run here, all three verbatim:
+
+| provider | status | reason |
+| --- | --- | --- |
+| `claude-code` | `not_ready` | `credentials_not_configured` — same with and without `--no-refresh` |
+| `anthropic` | `invalid` | `invalid_state` (entry expired 2026-09-09T03:53Z) |
+| `openai-codex` | `ready` | — |
+
+So the self-service refresh route does not heal the Claude path: `pi auth check` defaults to refreshing
+expired OAuth, ran against `claude-code`, and left `auth.json` byte-identical (mtime still
+2026-09-08T19:58Z). The `claude-code` entry being present in `auth.json` is not the same as it being
+usable, which is the second time this file's history has been misled by that distinction. Settling the
+open question therefore needs a credential that is live now: a Claude Code login that rewrites
+`~/.claude/.credentials.json`, or a raw token file handed to `PI_CLAUDE_OAUTH_TOKEN_FILE`.
+
+Rerun recipe, one case only, verified rather than assumed. `--test-name-pattern` was rehearsed against a
+two-test fixture and selected only the named case, so this does not quietly spend a Pi or Codex case too:
+
+```bash
+PI_CLAUDE_OAUTH_TOKEN_FILE=/tmp/acpx-claude-token.txt RUN_REAL_ACPX_MATRIX=1 \
+MATRIX_EVIDENCE_DIR=agent-output/claude-recheck-2026-09-10 \
+node --experimental-strip-types --test --test-name-pattern="Claude cancel and reconnect" \
+  extensions/pi-agent-wave/test/acpx-real-matrix.test.ts
+```
+
+Run from the repository root. `RUN_REAL` needs both variables and an existing token file, otherwise the
+case skips and reports as skipped; `npm run test:acpx` is the entry point that says so out loud instead.
+The token file must hold the raw token, not the JSON bundle — the driver reads the file and passes its
+content as `CLAUDE_CODE_OAUTH_TOKEN`.
