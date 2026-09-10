@@ -325,24 +325,6 @@ def frozen_route(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-TRANSIENT_LAUNCH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\b429\b", re.I), "http-429"),
-    (re.compile(r"\b50[0-4]\b", re.I), "http-5xx"),
-    (re.compile(r"rate[ -]?limit", re.I), "rate-limit"),
-    (re.compile(r"\bquota\b", re.I), "quota"),
-    (re.compile(r"overload(?:ed)?", re.I), "overloaded"),
-    (re.compile(r"ETIMEDOUT|timed? out", re.I), "timeout"),
-    (re.compile(r"ECONNRESET|connection reset", re.I), "connection-reset"),
-    (re.compile(r"connection[- ]closed|provider unavailable", re.I), "connection-closed"),
-)
-
-
-def classify_launch_failure(message: str) -> tuple[str, str]:
-    for pattern, reason in TRANSIENT_LAUNCH_PATTERNS:
-        if pattern.search(message):
-            return "transient", reason
-    return "permanent", "unclassified"
-
 
 def start_agent_when_ready(argv: list[str]) -> None:
     """Retry only Herdr's transient new-tab shell-readiness rejection."""

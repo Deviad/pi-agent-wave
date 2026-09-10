@@ -21,6 +21,11 @@ separately in `lib/model-failover-native.mjs` and that the two lanes must not di
 does not mention: `classify_launch_failure()` in `scripts/delegate_core.py`, which scans its own
 `TRANSIENT_LAUNCH_PATTERNS` and defaults to `permanent/unclassified`.
 
+> Annotated 2026-09-10, after implementation. That "third lane" was not a lane: the function has no
+> caller, so there was never a second consumer for it to disagree with. The paragraph above is kept
+> as written because it is what prompted the check; the finding is in "Resolution of the two open
+> questions" below, and the code was removed on 2026-09-10.
+
 No test references `classify_launch_failure`, and no test calls `preflight_provider_credential()`
 either, which sits directly in the worker path one function below. So the two unproven places are
 (a) whether the Python lane agrees with the TypeScript lanes on the same input, and (b) whether the
@@ -94,8 +99,116 @@ formally changed. Before any of the three, resolve the open question above about
 attempt actually consults the Pi failover extension, because that determines whether a rehearsal
 would exercise failover or only the supervisor's own classification.
 
-## What is needed from the user
+## Resolution of the two open questions (2026-09-10, by reading and instrumenting)
 
-One choice: A only, A plus B, B only, or park the whole thing. If A or B is chosen, the shared
-corpus and the gate variable get specified in this file before any test is written, and the
-third-lane question gets answered by reading rather than by assumption.
+Both questions this file opened with are now answered, and neither answer supports Option A as
+originally written.
+
+**The lanes are shape-separated, not agreeing and not diverging in practice.** `classifyFailure` in
+`retry.ts` takes a bare string recorded by the supervisor; `classifyFailoverError` in
+`lib/model-failover-native.mjs` takes an assistant message and only runs at all when
+`role === "assistant"`, `stopReason === "error"` and `errorMessage` is non-empty
+(`model-failover-native.mjs:109-112`). Grepping `errorMessage` across `index.ts`, `scripts/` and
+`lib/` outside tests returns **nothing**: the text handed to `store.ts` comes from wrapper reasons
+(`index.ts:276,501,564,605` build it from `reason` / `projectedFailure` plus a diagnostics path).
+So there is no production input on which both classifiers decide the same failure.
+
+There are kind-level differences on paper — `provider credential target changed`, `report-missing`,
+`ACPX worker failed` and friends are transient in `retry.ts` and fall to the terminal default in the
+native lane — but every one of those strings is emitted by launch or transport code
+(`delegate_core.py:1061`, `delegate_core.py:1240`, `lib/projected-report.ts:39`, `index.ts:262`),
+not by a provider response. They cannot arrive as an `errorMessage`. That makes the shared-corpus
+half of Option A a test over unreachable combinations, which is declined rather than deferred: it
+would pin paths no caller can take, in the same category as the owned-path normalisation case.
+
+**The third lane is dead code.** `classify_launch_failure` and its `TRANSIENT_LAUNCH_PATTERNS` have
+no caller anywhere. The only hits are the definition itself (`delegate_core.py:328`, `:340`, the
+loop at `:341`) and copies of that file under `agent-output/`. Nothing in `scripts/`, `lib/`,
+`test/` or the README invokes it. It is therefore not a lane that could drift, and the right change
+is removal, not a guard — see the decision request at the end.
+
+Correction of record: an earlier note in this file's draft lineage described a
+`check-unavailable: Pi auth check returned contaminated provider selection` result. The string
+`contaminated` does not appear anywhere in this repository. That observation did not come from this
+code and is withdrawn; do not build on it.
+
+## What is actually untested, and what gets built
+
+`preflight_provider_credential()` is live on every Pi worker launch — called at
+`delegate_core.py:509` from the agent preflight and at `:535` from `materialize_pi_credentials`,
+which `:607` calls while building an attempt — and it has no test at any level. Verified by grepping
+`test/` for `auth check`, `--no-refresh`, `provider_preflight_environment`,
+`preflight_provider_credential` and `materialize_pi_credentials`: zero hits. The three-way
+`agent_for_model` / `agentForModel` / `selectAcpAgent` agreement that the development contract asks
+for is already pinned (`test/provider-credential-snapshot.test.ts`, `test/acpx-doctor.test.ts`,
+`test/acpx-routing.test.ts`), so that is not duplicated here.
+
+### Built: `test/credential-preflight.test.ts` with `test/support/credential-preflight-driver.py`
+
+Status: implemented, 8 tests, green from the package directory and the repository root.
+
+Two things the driver deliberately does not fake: the injected runner is passed to the production
+function as `command_runner`, so the real branches execute rather than a re-implementation of them;
+and every key in a fixture is a literal placeholder, never material taken from a real store.
+
+The `no-usable-credential` and override cases run with a failing `print-api-key` so that consulting
+it at all is observable — the override case asserts exactly one runner call, which is what proves a
+seeded live entry is used directly instead of being looked up.
+
+### Built: Option B as `PI_RUN_LIVE_PREFLIGHT`-gated, skipped by default
+
+Status: implemented in `test/credential-preflight-live.test.ts`, verified both ways.
+
+With the gate off the file reports 1 test, 0 pass, **1 skipped** — it does not fail, and it does not
+quietly run. With `PI_RUN_LIVE_PREFLIGHT=1` it ran in 2.2 seconds and reported the machine's four
+configured providers rather than an assumed list:
+
+| Provider | authType | reason | store unchanged |
+| --- | --- | --- | --- |
+| anthropic | oauth | — | yes |
+| claude-code | unknown | `credentials_not_configured` | yes |
+| openai-codex | oauth | — | yes |
+| opencode-go | api_key | — | yes |
+
+### Guards were mutated, not just written
+
+Every guard here was checked by breaking the thing it protects and requiring a failure, then
+restoring `scripts/delegate_core.py` from git.
+
+| Break | Result |
+| --- | --- |
+| drop `--json` and `--no-refresh` from the argv | 2 tests fail |
+| treat `status: "ready"` as usable at exit code 1 | 1 fails |
+| let the preflight inherit the caller's `HOME` / `PI_CODING_AGENT_DIR` | 1 fails |
+| make a not-ready check block a launch that does hold a credential | 1 fails |
+
+The same break applied to the live test is stronger evidence than the offline one: with `--json`
+removed, the real Pi CLI returns plain text, the probe reports `status=unparseable exit=0`, and the
+live test fails. That confirms against the installed tool — not only against a fixture — that the
+flag is load-bearing and that dropping it degrades every launch's credential answer to unknown.
+
+### Gate state after this slice
+
+Node completion gate: **463 tests, 451 pass, 0 fail, 12 skipped**, identical from the repository
+root and the package directory (it was 454 / 443 / 0 / 11 before; the nine added tests are these
+two files, and the twelfth skip is the live probe). Bun package gate: 46 pass, 0 fail.
+`npm run typecheck`: exit 0. `git diff --check`: clean. Test files are excluded from the npm
+tarball, so no fixture or driver enters the published artifact.
+
+### Declined
+
+The shared-corpus agreement test, for the reachability reason above. Option C stays parked for the
+reasons already in this file.
+
+## Decision taken
+
+Asked on 2026-09-10 whether to remove the unreachable lane; the answer was to remove it, so
+`classify_launch_failure` and `TRANSIENT_LAUNCH_PATTERNS` are gone — 18 lines, `scripts/delegate_core.py`.
+Verified before deleting: the only references anywhere were the definition, its own loop, and
+frozen copies of the file under `agent-output/` (generated evidence, which is not edited and is not
+packaged). Verified after deleting: the file still parses, `re` remains in use by five other sites
+so the import stays, and the completion gate is unchanged at 463 tests / 451 pass / 0 fail /
+12 skipped. Nothing was counting on that code, which is the point of it being unreachable.
+
+The reference at the top of this file stays as written and is annotated rather than rewritten,
+because it is the reason the check happened.
