@@ -101,9 +101,12 @@ assertions pass, and `afterEach` deletes the temp dir. So the failing run's diag
 — they are what the assertion message printed — but they land nowhere durable. Anyone
 reproducing this should read the assertion output rather than looking for a file.
 
-Re-running the Claude case alone on 2026-09-10 reproduced it exactly: exit 1, no terminal
+Re-running the Claude case alone on 2026-09-10 gave the same shape: exit 1, no terminal
 `end_turn`, a `session/prompt` request with one `session/update` and neither a result nor an
-error object. Two hypotheses were then eliminated rather than assumed.
+error object. That repetition is weaker than it looks: Claude's service was reported to be having
+technical difficulties at the time, so this run cannot separate a provider-side fault from a local
+one. It reproduces the symptom, which is not evidence about the cause. Two hypotheses were still
+eliminated on the way.
 
 - *Missing Claude credential.* Wrong. `~/.claude/.credentials.json` exists at mode 600, the
   `claude` CLI is on PATH, and `queued` and `cancelled` passed inside the same run, which needs
@@ -115,8 +118,8 @@ error object. Two hypotheses were then eliminated rather than assumed.
   or agentfs build, and the earlier file predates the current assertion set. Reading it as proof
   of a regression would be unsupported: whether anything actually regressed is unknown.
 
-One cheap probe was attempted and discarded as invalid: invoking `acpx` directly with `--model
-describing claude-opus-5` placed before the agent name, which never reached Claude at all. The
+One cheap probe was attempted and discarded as invalid: invoking `acpx` directly with the model
+flag set to `claude-opus-5` but placed before the agent name, which never reached Claude at all. The
 reply was `the ACP agent did not advertise that model. Available models: gpt-6-astra, ...` — the
 request went to the default agent, and the guard that binds a model to its own agent
 (`agent_for_model` / `agentForModel` / `selectAcpAgent`) refused it. That confirms the routing
@@ -126,6 +129,13 @@ because it skips the `CLAUDE_CONFIG_DIR` and token wiring the harness supplies.
 What is still open, stated as open: whether the cancel step leaves a Claude session in a state
 the next prompt cannot resume. Settling it needs an instrumented run through the harness with
 real Claude calls, which costs money, so it is left for a decision rather than done quietly.
+
+Deferred on 2026-09-10 rather than run, because the provider was degraded and a probe cannot
+attribute a failure while the service itself is unhealthy. Any future attempt should establish
+provider health first — one trivial no-tool prompt on a fresh session, checked against the
+expected reply — and only treat a full-sequence failure as local if that control passes. Running
+the sequence against an unhealthy provider yields a result readable neither way, which is why
+nothing was spent on it.
 
 That settles the architectural question this file was opened to ask. A no-panel worker launch, a
 cancel mid-run, a reconnect after the cancel, and a session close all work against the real acpx
