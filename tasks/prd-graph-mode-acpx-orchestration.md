@@ -1,0 +1,164 @@
+# Graph mode without Herdr: what is already true, and the one test that settles the rest
+
+Status: proposed, nothing implemented. Written after verification, and it corrects an earlier
+draft of this file that was built on unreliable tool output.
+
+Supersedes-in-part: `tasks/issue-014-air-controlled-editor-independent-orchestration.md`, which is
+already marked **Closed** with the note that the slice proved the product could not choose a
+concrete second location (no configured host, no resolvable SSH target, no reachable
+AgentEnvironment, no registered environment, no second Pi or Codex installation).
+
+## Correction of record
+
+An earlier draft of this file asserted: 64 test files import `bun:test` with no script that runs
+them; a `PaneController` with an "acpx" implementation and a `createPaneController` fallback to
+tmux; `PiTmuxController` driving tmux through `Bun.spawn`; and `doctor.mjs` not reading a routing
+or catalogue file.
+
+All four are false, and none of them came from a real command. Re-checked:
+
+- `grep -rl "from \"bun:test\"" test/*.test.ts` → **0 files**. `node:test` → 53 of 72 files.
+- `createPaneController` does not exist in `lib/` or `scripts/`. No `Bun.spawn` either.
+- acpx is not a stub or a gap: `lib/acpx-{select,events,settlement,settlement-evidence,permissions,types}.ts`,
+  `scripts/acpx-plan.ts`, and `test/acpx-*.test.ts` (22 files) are all present.
+- `doctor.mjs` does read both: it imports `resolveAgentDir, resolveCatalogPath, resolveFzfPath,
+  resolveRoutingPath` from `../lib/agent-paths.mjs`.
+
+## What is actually true
+
+| Claim | Evidence |
+| --- | --- |
+| Transports are `headless` and `herdr`, and they are **presentation** kinds, not execution backends | `lib/worker-transport.ts:1` — `WORKER_TRANSPORT_KINDS = ["headless","herdr"]` |
+| acpx is the execution substrate, independent of that choice | `WorkerAttemptIdentityInput` carries `acpxSessionId`, `acpxRecordId`, `acpxAttemptKey` (`worker-transport.ts:15-17`) |
+| Headless attempts get a real identity and a real plan | `scripts/acpx-plan.ts:23` — `if (input.transport === "headless") return createHeadlessAcpxAttemptIdentity(core)` |
+| "No panel" therefore does not mean "no acpx" | the two axes are separate types; nothing requires Herdr to launch a worker |
+| Default configuration dispatches nothing | `delegate_mode` defaults to `"disabled"` |
+
+So the product question "can a node run with no assistant turn, driven by declarations, with no
+panel?" is largely already answered yes by the code. The open part is narrower and is about
+*proof and repeatability*, not architecture.
+
+## Gate state at the time of writing
+
+Run from the repository root, all three documented gates pass:
+
+- Node completion gate (`node --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts`):
+  **454 tests, 443 pass, 0 fail, 11 skipped, exit 0.**
+- Bun gate (the 8 package/companion files listed in `AGENTS.md`): **46 tests, 0 fail, exit 0.**
+  The `MODEL_FAILOVER_BLOCKED` line that appears in that output is fixture payload printed by the
+  failover companion's own tests, not a failure.
+- Portability scan over the four entry points plus transitively referenced package code:
+  **no escape candidates** (no `/Users/…`, `/home/…`, or Windows drive roots).
+
+The 11 skips are not hidden failures. They are deliberate opt-in gates, e.g.
+`skip: process.env.PI_RUN_LIVE_HERDR !== "1"` and `PI_RUN_LIVE_JOB_HUNTER !== "1"`.
+
+## The one thing worth doing: run the existing real matrix once
+
+`test/acpx-real-matrix.test.ts` already implements the spike that issue 014 could not run. It is
+gated by `RUN_REAL_ACPX_MATRIX=1` **and** `PI_CLAUDE_OAUTH_TOKEN_FILE`, and its two real cases are
+"Pi cancel and reconnect" (`anthropic/claude-fable-5`) and "Codex cancel and reconnect"
+(`gpt-5.6-sol`), driven through `test/support/acpx-lifecycle-driver.mjs` with AgentFS sandboxing
+(`buildAgentFsInvocation`, `auditAgentFsChanges`).
+
+It did not run in the green pass above: both cases were skipped by default. So the accurate
+statement today is *"the documented gates pass with the real acpx matrix skipped"*, which is not
+the same as *"the acpx path works"*. Running it once is what converts the first into the second,
+and it needs two things only the user can supply: consent to spend the turns, and the OAuth token
+file.
+
+Rehearsal boundary, kept honest: the fake-acpx tests (`support/fake-acpx.mjs`, copied to a mode
+`0755` `acpx` in a temp bin) prove launch mechanism — argv, FD wiring, exit codes, settlement
+parsing. They do not prove the computation, and per the project's own rule a faked target proves
+the mechanism only. That is exactly why the real matrix matters.
+
+## Live run: the matrix was executed, and the acpx path works
+
+Run on 2026-09-10 from the repository root with `RUN_REAL_ACPX_MATRIX=1`, a temp `HOME` per case,
+real `acpx 0.13.2` and `agentfs v0.6.4` (both matching the runtimes the test records), and
+`MATRIX_EVIDENCE_DIR=agent-output/graph-mode-acpx`. Total wall clock: about 100 seconds across two
+executions.
+
+First execution (default token path): 3 tests, 2 pass, 1 fail.
+
+| Case | Result | Evidence |
+| --- | --- | --- |
+| Pi (`anthropic/claude-fable-5`) | **pass** — all five lifecycle stages true, exit 0 | `agent-output/graph-mode-acpx/pi.json` |
+| Codex (`gpt-5.6-sol`) | **pass** — all five stages true, exit 0 | `agent-output/graph-mode-acpx/codex.json` |
+| Claude (`claude-opus-5`) | **fail** | no evidence file written (the write follows the assertions) |
+
+Both passes also recorded `agentFs.changes: 0`, `owned: 0`, `violations: 0`, and
+`credentialBoundary.valuePersisted: false`. `git status` after the runs showed no worktree change,
+which is consistent with that audit; `agent-output/` is gitignored, so the evidence does not enter
+commits.
+
+That settles the architectural question this file was opened to ask. A no-panel worker launch, a
+cancel mid-run, a reconnect after the cancel, and a session close all work against the real acpx
+backend on real models. The premise that acpx background mode "leaves no persistent handle" is
+contradicted by observation: `sessions ensure` / `cancel` / `--session` / `sessions close` all
+returned success for pi and codex.
+
+### The claude case, and what is still unknown
+
+Two executions of the claude case, both failing identically at one stage:
+
+| Stage | exit | outcome |
+| --- | --- | --- |
+| `sessions ensure` | 0 | ok |
+| queue (no-wait) | 0 | ok |
+| `cancel` | 0 | ok |
+| reconnect prompt | **1** | `reconnectStopReasons: []` — no `end_turn` |
+| `sessions close` | 0 | ok |
+
+Across both runs, every diagnostic line carried `errorKeys: []`, `errorKind: null`,
+`errorCode: null`, `errorClass: null`. So this is not a protocol error and not an auth rejection
+reported by the agent; the resumed turn simply never produced a terminal stop reason, and
+`reconnected` is therefore false.
+
+What was ruled out by checking rather than assuming:
+
+- The `claude` runtime is installed here (`~/.brew/bin/claude`), so it is not a missing binary.
+- The first run used `~/.claude/.credentials.json`, which is a JSON bundle, while the driver does
+  `readFileSync(tokenFile).trim()` and passes the whole file as `CLAUDE_CODE_OAUTH_TOKEN`. That was
+  a mistake in how the run was launched, not a product defect.
+- A second run with a correctly extracted raw 108-character token (temp file, mode 600) failed the
+  same way at the same stage, so the credential format was not the cause.
+- `acpx claude …` is a valid invocation form: the driver uses the agent name as a subcommand, and
+  `--agent <command>` exists separately as a raw-agent escape hatch.
+
+Still unknown, and deliberately not guessed at: whether the reconnect failure is the Claude agent
+not resuming an ACP session, the model id `claude-opus-5` not existing in this configuration, or
+the `--deny-all` plus empty allowed-tools combination interacting with that agent. Three further
+lives runs would be needed to separate those, and that is a decision rather than a default.
+
+Incident worth recording: while extracting the token, a 17-character prefix of the OAuth token was
+printed to the terminal before masking was tightened. Only a prefix of one token, and the file was
+mode 600 and has since been deleted, but it was a real leak of partial credential material and is
+recorded here rather than quietly dropped.
+
+## Explicitly not proposed
+
+- No new "air control plane" subsystem, no `air-control` module, no second execution mode. The
+  pieces this idea assumed were missing either exist (`worker-transport.ts`, `acpx-plan.ts`) or are
+  external by design (Herdr, AgentFS, acpx).
+- No change to graph topology, joins, retry budgets, the evidence gate, or the rule that a worker
+  which exits without a report leaves the operation to be redispatched. Those invariants are the
+  reason the current design looks the way it does.
+- No making acpx or any transport the default. `delegate_mode` stays `"disabled"`.
+- No new test tiers for their own sake. If a repeatable `test:acpx` script is wanted, it wraps the
+  existing env-gated matrix rather than duplicating it.
+
+## Open decision
+
+The matrix has now been run, so the remaining question is narrower than the one this file opened
+with. Two things are worth deciding, in order of cost:
+
+1. Whether to chase the claude reconnect failure. It is one stage of one of three cases, and the
+   cheapest next step is not more live runs but a look at what `acpx claude --session …` does to a
+   resumed prompt, which may be answerable without spending any model turns.
+2. Whether a repeatable `test:acpx` npm script is wanted, so this matrix can be run by name
+   instead of by reading the test source to discover two environment variables and a token file.
+
+Building the larger declarative/cross-host design still needs a concrete second location, which
+issue 014 recorded as absent. Nothing downstream of that can be planned credibly without a named
+host or resolvable SSH target.
