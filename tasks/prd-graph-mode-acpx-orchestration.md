@@ -278,3 +278,32 @@ Run from the repository root. `RUN_REAL` needs both variables and an existing to
 case skips and reports as skipped; `npm run test:acpx` is the entry point that says so out loud instead.
 The token file must hold the raw token, not the JSON bundle — the driver reads the file and passes its
 content as `CLAUDE_CODE_OAUTH_TOKEN`.
+
+### Who actually reads the Claude credential, and why an isolated-home rerun can be ambiguous
+
+Read from the installed code rather than assumed, because the first pass at this produced a wrong
+conclusion that had to be retracted.
+
+- `acpx` 0.13.2 launches the Claude agent as `npx -y @agentclientprotocol/claude-agent-acp@^0.60.0`
+  (`AGENT_REGISTRY` in `dist/live-checkpoint-*.js`; `isHandwrittenAgent` matches the same string). The
+  adapter is **already cached** here at `~/.npm/_npx/889eb40c2e0ed497`, version 0.60.0, directory dated
+  Sep 8 — so a run does not depend on fetching the adapter, and the recorded failure and today's control
+  both used that same cached copy.
+- `Authentication required` does not occur anywhere in `acpx/dist`. It came from the adapter side, so the
+  control did reach a real adapter and the adapter declined before any inference. `cost: 0, used: 0`.
+- The credential readers are in `@anthropic-ai/claude-agent-sdk` (`sdk.mjs`, `bridge.mjs`), which honours
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` and
+  `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`. The driver's choice of `CLAUDE_CODE_OAUTH_TOKEN` is therefore
+  a supported name, not a mismatch. An earlier note here claimed the token env name appeared nowhere; that
+  was a scoping error in the grep (adapter package only, SDK excluded) and is retracted.
+- The same file reads `.credentials.json` and `.claude.json`, has an expiry-aware `getToken()` that
+  refreshes when the remaining lifetime drops below a threshold, and strips `refreshToken` when it copies
+  credentials into a destination file.
+
+Consequence for the rerun, which is the reason this is worth recording: the harness deliberately isolates
+`HOME` and `CLAUDE_CONFIG_DIR`. A credential that refreshes happily in a normal home may not refresh
+inside that isolation, for reasons that have nothing to do with the reconnect path. So a failing rerun
+*inside* the harness proves nothing on its own. Sequence the next attempt as: prove a no-tool prompt
+succeeds in the same isolated shape first, then run the lifecycle case. If the no-tool prompt already
+fails there with a live credential, the finding is about harness isolation, not about ACP session resume,
+and that is a different issue than the one this file has been chasing.
