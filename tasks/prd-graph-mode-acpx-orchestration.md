@@ -85,12 +85,47 @@ First execution (default token path): 3 tests, 2 pass, 1 fail.
 | --- | --- | --- |
 | Pi (`anthropic/claude-fable-5`) | **pass** — all five lifecycle stages true, exit 0 | `agent-output/graph-mode-acpx/pi.json` |
 | Codex (`gpt-5.6-sol`) | **pass** — all five stages true, exit 0 | `agent-output/graph-mode-acpx/codex.json` |
-| Claude (`claude-opus-5`) | **fail** | no evidence file written (the write follows the assertions) |
+| Claude (`claude-opus-5`) | **fail** | no copy under `agent-output/graph-mode-acpx/` — see the correction below |
 
 Both passes also recorded `agentFs.changes: 0`, `owned: 0`, `violations: 0`, and
 `credentialBoundary.valuePersisted: false`. `git status` after the runs showed no worktree change,
 which is consistent with that audit; `agent-output/` is gitignored, so the evidence does not enter
 commits.
+
+### Correction to the table above, and a re-verification (same day)
+
+The parenthetical was wrong about mechanism. `acpx-lifecycle-driver.mjs` writes
+`${agent}-result.json` unconditionally, before it sets a failing exit code, into the throwaway
+temp dir the test makes; the copy into `MATRIX_EVIDENCE_DIR` happens only after the lifecycle
+assertions pass, and `afterEach` deletes the temp dir. So the failing run's diagnostics did exist
+— they are what the assertion message printed — but they land nowhere durable. Anyone
+reproducing this should read the assertion output rather than looking for a file.
+
+Re-running the Claude case alone on 2026-09-10 reproduced it exactly: exit 1, no terminal
+`end_turn`, a `session/prompt` request with one `session/update` and neither a result nor an
+error object. Two hypotheses were then eliminated rather than assumed.
+
+- *Missing Claude credential.* Wrong. `~/.claude/.credentials.json` exists at mode 600, the
+  `claude` CLI is on PATH, and `queued` and `cancelled` passed inside the same run, which needs
+  working auth. An earlier note here said the credential was unavailable; that came from reading
+  the wrong key (`claude` instead of `claude-code`) in `auth.json`.
+- *A permanent gap in Claude session resume.* Not supported. A `final-matrix/claude.json` dated
+  2026-09-01 records all five stages true, including `reconnected`. Its `runtimes` block is
+  **hardcoded in the test**, not measured, so it does not prove the two runs used the same acpx
+  or agentfs build, and the earlier file predates the current assertion set. Reading it as proof
+  of a regression would be unsupported: whether anything actually regressed is unknown.
+
+One cheap probe was attempted and discarded as invalid: invoking `acpx` directly with `--model
+describing claude-opus-5` placed before the agent name, which never reached Claude at all. The
+reply was `the ACP agent did not advertise that model. Available models: gpt-6-astra, ...` — the
+request went to the default agent, and the guard that binds a model to its own agent
+(`agent_for_model` / `agentForModel` / `selectAcpAgent`) refused it. That confirms the routing
+guard works; it says nothing about resume, and it is not a faithful way to probe this case
+because it skips the `CLAUDE_CONFIG_DIR` and token wiring the harness supplies.
+
+What is still open, stated as open: whether the cancel step leaves a Claude session in a state
+the next prompt cannot resume. Settling it needs an instrumented run through the harness with
+real Claude calls, which costs money, so it is left for a decision rather than done quietly.
 
 That settles the architectural question this file was opened to ask. A no-panel worker launch, a
 cancel mid-run, a reconnect after the cancel, and a session close all work against the real acpx
