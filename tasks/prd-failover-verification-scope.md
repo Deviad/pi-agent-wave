@@ -43,6 +43,37 @@ worker-path story is entirely `retry.ts` plus `classify_launch_failure()`. Which
 what any rehearsal could assert, so it gets resolved by reading and instrumenting before anything is
 built.
 
+> Resolved on 2026-09-10, second branch: workers do not consult the extension. See the next section.
+
+## The extension question is answered, and it removes most of the premise
+
+**A worker never loads `model-failover.ts`.** `worker_pi_settings()` (`scripts/delegate_core.py:414`)
+builds the worker's `settings.json` from `{"packages": []}` plus copied keys (`defaultProvider`,
+`defaultModel`, `defaultThinkingLevel`, `compaction`, `retry`). Its docstring says the supervisor's real
+settings must never reach a worker precisely because that packages list loads pi-agent-wave, whose entry
+point fails closed without Herdr identity and kills the worker's ACP server. Exactly one call site writes
+that file (`delegate_core.py:620`), so there is no second worker route that receives packages.
+
+Two things follow that the options above were written without:
+
+- Worker-side classification happens in **one** place, `retry.ts`. The three-places worry in the paragraph
+  above was wrong even before `classify_launch_failure` was removed, and the extension lane only governs
+  interactive sessions that opt in with `/failover enable <tier>`. A rehearsal therefore cannot exercise
+  cross-lane agreement, because no input reaches two classifiers.
+- The zero-packages invariant is **already guarded**, so it is not the gap it looks like. The matrix in
+  `test/headless-pi-stdio.test.ts` seeds a real `settings.json` containing `packages: ['npm:x',
+  '/abs/pi-agent-wave']`, calls `delegate_core.provider_runtime_environment(...)` against it, and asserts
+  the materialised worker settings are `packages: []` with mode 600 and no symlink. That is a real call
+  into the launcher, not a mirror of it, so a change forwarding the supervisor's settings would fail here
+  rather than only at runtime.
+
+What survives of the options: Option A's shared-corpus half stays declined for the reachability reason,
+now with a stronger cause (shape separation plus the loader fact above); its preflight-branch half is
+unaffected, because `preflight_provider_credential()` and `materialize_pi_credentials` are launcher code
+and genuinely reachable. Option B is unchanged in principle — its three assertions are about the launcher's
+credential seam and the installed CLI, none of which route through the extension — but it needs provider
+calls, so it waits for both authorization and a provider health check. Option C is unaffected and parked.
+
 ## Verified environment facts (2026-09-09, this machine)
 
 - `pi auth check --provider <p> --json --no-refresh` exists and works in the installed Pi 0.84.1:
@@ -95,9 +126,10 @@ offered as something to build now.
 
 A, plus B as an opt-in gate. Together they cover both places that currently have zero coverage, and
 neither depends on a provider cooperating. C should stay parked unless the no-dispatch rule is
-formally changed. Before any of the three, resolve the open question above about whether a worker
-attempt actually consults the Pi failover extension, because that determines whether a rehearsal
-would exercise failover or only the supervisor's own classification.
+formally changed. The prerequisite this section used to name — whether a worker attempt consults the Pi
+failover extension — is now answered: it does not. A rehearsal therefore exercises the supervisor's own
+classification and the launcher's credential seam, and nothing else. Read the resolution above before
+building any of the three.
 
 ## Resolution of the two open questions (2026-09-10, by reading and instrumenting)
 
