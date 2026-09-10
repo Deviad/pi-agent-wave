@@ -361,3 +361,124 @@ that compares the two must go through `realpathSync` first.
 Still open after this slice: Q4, the failover verification scope. It is written up as
 `prd-failover-verification-scope.md` with three options and a recommendation, and it needs a choice
 before anything gets built.
+
+## Slice 2026-09-10: verification entry point, the duplicated probe, and the cleanup flake
+
+Authorised by the user's "fix these" over three listed items. All three belong to this file: the
+first is US-002 (a canonical runner), the second and third are the interference and duplication
+threads left open in the 2026-09-09 record.
+
+### Two labels in the pending list were wrong, and both mattered to the fix
+
+- The item called a "duplicate AgentFS **allow-rule**" is not an allow-rule. `/agentfs run.*dg-/` is
+  a **detection** pattern for leftover AgentFS worker processes; nothing permits anything with it.
+  Treating it as an allow-rule would have led to removing a safety check.
+- The 2026-09-09 note left the duplication in place because "unifying the two copies changes what an
+  audit measures". That was checked rather than inherited. `scanProductionCleanup()` and
+  `readCleanup()` take the same four observations from the same three sources with the same patterns:
+  `herdr tab list` filtered by `/production-acpx/i`, `ps -axo pid=,command=` filtered by
+  `/agentfs run.*dg-/`, `/private/tmp` filtered by the production temp pattern, and the
+  `PI_CLAUDE_OAUTH_TOKEN_FILE` existence check. Deduping the code therefore preserves what is
+  measured; what it removes is the chance of the two drifting. Proof required is the script's own
+  JSON output on identical machine state before and after, not an argument about equivalence.
+
+### Where the loudness for `test:acpx` goes, and why not in the test
+
+The temptation was to make the matrix test fail when `RUN_REAL_ACPX_MATRIX=1` but no token file is
+configured. Rejected on two observed facts:
+
+1. `production-audit.ts:130-135` sets `RUN_REAL_ACPX_MATRIX=1` for all three real-matrix commands
+   and keeps `PI_CLAUDE_OAUTH_TOKEN_FILE` only for them, so an audit on a machine with no token
+   currently produces three skipped files and an **invalid** bundle, because `summariesValid` requires
+   `skipped === 0` for those commands. Silent skips are already caught where they would otherwise
+   fake a green audit.
+2. Flipping skip to fail would change audit outcomes for a reason unrelated to this slice, which is
+   the exact category the 2026-09-09 note warns about.
+
+So the test keeps its skip semantics and the new entry point gets the loudness: a bare `npm run
+test:acpx` on an unconfigured machine must say what is missing and exit non-zero, instead of
+reporting three skips and a green exit. The script also has to stay on `node --test`; Bun cannot
+reach this file (`node:sqlite`, and the temp-path ENOENT recorded under US-004).
+
+### Acceptance criteria, each naming its proof
+
+- [x] `npm run test:acpx` with `PI_CLAUDE_OAUTH_TOKEN_FILE` unset exits non-zero and prints the names
+      of `RUN_REAL_ACPX_MATRIX`, `PI_CLAUDE_OAUTH_TOKEN_FILE` and `MATRIX_EVIDENCE_DIR`, with no test
+      counts in its output. Proof: the run's stdout and exit code.
+- [x] `package.json` contains no `bun` invocation. Proof: `grep -c bun package.json` → 0.
+- [x] `scripts/production-cleanup-scan.ts` keeps its CLI and its four-key JSON contract but no longer
+      carries its own copy of the two patterns; the module-level dedupe is guarded so re-inlining
+      fails a test. Proof: before/after JSON on the same machine state, plus the guard run against a
+      deliberately re-inlined copy.
+- [x] The cleanup flake gets data before a verdict: at least five solo runs of
+      `test/acpx-cleanup.test.ts` from both launch directories and two full-suite runs, recorded with
+      counts. The word "flaky" is not used for this file unless a failure actually reproduces; the
+      recorded alternative is "no failure observed in N runs", which is weaker and is labelled as
+      such.
+- [x] Nothing here runs the real matrix. Provider health was reported poor on 2026-09-10 and the run
+      costs tokens, so the new script is verified against a fake runner configuration only.
+
+## Record for the 2026-09-10 slice
+
+### The entry point needed rehearsing, and rehearsing is what found the defects
+
+`test/support/acpx-matrix-gate.mjs` plus one `test:acpx` script in `package.json`. Three things worth
+keeping, all of which came from running the script against harmless fixtures rather than from reading it:
+
+- `packageRoot` first resolved to `test/`, so the target came out as `test/test/acpx-real-matrix.test.ts`.
+  The target-existence check surfaced it, which is the evidence that check earns its place.
+- `main()` returned the exit code without assigning it to `process.exitCode`, so **every** run exited 0,
+  including one whose child had failed. That is the exact failure the script exists to prevent, and it
+  survived reading and `bash -n`-style review; only execution against a failing fixture exposed it. Now
+  pinned by `test/acpx-matrix-gate.test.ts`, which asserts a failing child yields a failing gate.
+- `NODE_TEST_CONTEXT` is a real hazard, recorded for whoever hits it next: a nested `node --test` that
+  inherits it from an outer test run hides its output and exits 0. Reproduced by hand both ways on the
+  same fixture — without the variable the gate exits 1 with `not ok` visible, with it the gate exits 0
+  and shows nothing. The gate now strips it and the test cleans it from the child environment too.
+  `production-audit.ts` passes four `node --test` commands (lines 102-110 and 126) the same way, but
+  those only run from a shell today, where the variable is absent, and a run with no parseable summary
+  fails `summariesValid`, so there is no false green to fix. Recorded rather than changed.
+
+Verified without spending anything: unconfigured refuses with exit 1 and names all three variables and
+prints no test counts; a token path that does not exist is refused and named; a failing fixture
+propagates as exit 1 with the child's output still visible; a passing fixture exits 0; `--dry-run`
+prints the command and creates no evidence directory.
+
+### The dedupe, and the restore mistake that cost a re-run
+
+`scripts/production-cleanup-scan.ts` now imports `readCleanup` from `./production-audit.ts`. Behaviour
+compared on identical machine state before and after, from both launch directories: `{"leakedTabs":[],
+"agentFsProcesses":0,"temporaryDirectories":[],"tokenFilePresent":false}` with exit 0 every time. Leak
+detection was re-checked by planting a matching path under `/private/tmp`, which the scanner reported
+and exited 1 on, then removed.
+
+While mutation-testing the guard, `git checkout -- scripts/production-cleanup-scan.ts` was used to undo
+the injected copy. That reverted the file to HEAD, which discarded the uncommitted dedupe along with the
+injection, and the guard test then failed for the wrong reason. The rule this broke: a dirty file has no
+git restore point, so undo means a copy made beforehand. The dedupe was re-applied and re-verified
+(9/9 in the file, same JSON, plant still detected), so nothing was shipped broken — but the sequence is
+worth remembering, because the failure looked like a test problem rather than a lost change.
+
+### The cleanup flake: no failure observed, and that is the finding
+
+Twelve runs, zero failures:
+
+- 7 solo — 5 from the repository root, 2 from the package directory; 31 tests each, 31 pass.
+- 2 full-suite — one per launch directory, both 469 tests / 457 pass / 0 fail / 12 skipped. The
+  25-failure package-directory baseline in the 2026-09-09 record did not reproduce; the cwd work
+  recorded earlier in this file fixed it.
+- 3 concurrency runs pairing the file with `acpx-collect-convergence`, `acpx-doctor`,
+  `production-audit` and `acpx-matrix-gate`, in both argument orders — 53, 53 and 49 tests, all pass.
+
+So the item's premise is unsupported: there was no recorded failure anywhere and none could be produced
+on this machine. What this does **not** show: the host currently has no leftover AgentFS or Herdr
+production state, so the original suspicion (a previous run leaking state and poisoning the next) went
+untested. If the file ever does fail, that is the scenario to build first, and the shape of the test is
+already in this section: plant a matching path, run the file, expect it to be reported.
+
+### Gates after the change
+
+Node completion gate 469 tests / 457 pass / 0 fail / 12 skipped, from the repository root and from the
+package directory. Bun package-focused gate 46 pass / 0 fail. `npm run typecheck` clean. `npm pack
+--dry-run` 60 files with zero `test/` entries, so the new helper and its tests stay out of the artifact.
+`npm publish --dry-run` exit 0. `git diff --check` clean.

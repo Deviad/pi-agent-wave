@@ -2,6 +2,7 @@ import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { artifactsCurrent, auditCommands, countAgentFsProcesses, EXPECTED_AUDIT_COMMANDS, EXPECTED_AUDIT_SUMMARIES, productionSourceDigest, readCleanup, runProductionAudit, summariesValid, summarizeAuditOutput, type AuditCommandRecord, type CleanupSnapshot, type Runner } from "../scripts/production-audit.ts";
 import { packageRoot, repoRoot } from "./support/repoRoot.ts";
@@ -120,5 +121,33 @@ describe("production host audit bundle", () => {
 		const bundle = runProductionAudit(repoRoot, join(directory, "audit.json"), runner("typecheck"));
 		assert.equal(bundle.ok, false);
 		assert.equal(bundle.commands.find((command) => command.name === "typecheck")?.exitCode, 1);
+	});
+
+	// Two probes reading the same machine drift silently: each keeps reporting "clean" while the pair
+	// disagrees about what clean means. The cleanup scanner used to carry its own copy of these
+	// patterns, so this guards the delegation; the counting itself already has its own test above
+	// ("counts leftover AgentFS runs and nothing else") and the shared probe is smoke-tested live.
+	test("the cleanup scanner delegates to the audit probe instead of copying it", () => {
+		const scanner = readFileSync(join(packageRoot, "scripts/production-cleanup-scan.ts"), "utf8");
+		assert.match(scanner, /readCleanup/, "the scanner must call the shared probe");
+		for (const pattern of ["agentfs run", "delegate-graph-herdr-production-acpx", "production-acpx-(pi|codex|claude)-real"]) {
+			assert.ok(!scanner.includes(pattern), `re-inlined pattern recreates a second probe: ${pattern}`);
+		}
+	});
+
+	// From either launch directory the exit code has to keep tracking what was reported: that is the
+	// contract the audit's cleanup-scan command reads. Leak detection itself is proven by the plant in
+	// tasks/prd-test-entrypoint-and-cwd-independence.md, not here, because planting a real path under
+	// /private/tmp would be seen by every test file running alongside this one.
+	test("the cleanup scanner keeps its contract from either launch directory", () => {
+		const script = join(packageRoot, "scripts/production-cleanup-scan.ts");
+		for (const cwd of [repoRoot, packageRoot]) {
+			const run = spawnSync(process.execPath, ["--experimental-strip-types", script], { cwd, encoding: "utf8" });
+			assert.ok(run.status === 0 || run.status === 1, `${cwd}: exit ${run.status} ${run.stderr}`);
+			const snapshot = JSON.parse(run.stdout) as Record<string, unknown>;
+			assert.deepEqual(Object.keys(snapshot).sort(), ["agentFsProcesses", "leakedTabs", "temporaryDirectories", "tokenFilePresent"], cwd);
+			const leaked = Number(snapshot.agentFsProcesses) > 0 || (snapshot.leakedTabs as string[]).length > 0 || (snapshot.temporaryDirectories as string[]).length > 0 || snapshot.tokenFilePresent === true;
+			assert.equal(run.status === 1, leaked, `${cwd}: exit code must track the reported leaks`);
+		}
 	});
 });

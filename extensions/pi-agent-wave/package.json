@@ -25,7 +25,8 @@
     "pi-agent-wave-doctor": "scripts/doctor.mjs"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "test:acpx": "node --experimental-strip-types test/support/acpx-matrix-gate.mjs"
   },
   "pi": {
     "extensions": [

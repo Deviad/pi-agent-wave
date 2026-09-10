@@ -251,6 +251,24 @@ node --experimental-strip-types scripts/production-audit.ts
 
 It writes `agent-output/production-acpx-worker-backend/final-audit.json` with direct argv records, explicit expected and observed counts, production-source and artifact hashes, cleanup inventory, and secret-scan results. Unexpected counts or stale source bindings fail closed. The final reviewer consumes this bundle with ACPX `--no-terminal`, so nested AgentFS, package-manager, build, test, and git-write commands are unavailable. Embed the required source and evidence text in the task: no-terminal mode does not guarantee filesystem-read tools. If the reviewer returns authored JSON instead of writing its report file, preserve that response byte-for-byte with stream/message attribution before applying the ordinary report and settlement gates; it is not a supervisor-generated semantic verdict.
 
+### Running the real ACPX lifecycle matrix
+
+The three lifecycle cases in `test/acpx-real-matrix.test.ts` drive live ACPX sessions against Pi, Codex, and Claude. They are skipped unless configured, because a skipped case proves nothing about a provider. `npm run test:acpx` is the entry point and it refuses rather than reporting passes when the configuration is missing.
+
+```bash
+cd extensions/pi-agent-wave
+PI_CLAUDE_OAUTH_TOKEN_FILE=~/.config/pi/acpx-claude-token.txt npm run test:acpx
+npm run test:acpx -- --dry-run   # print the command; starts no session
+```
+
+- `RUN_REAL_ACPX_MATRIX` — set to `1` by the script; the three cases skip unless it is `1`. Set it yourself only when calling `node --test` directly.
+- `PI_CLAUDE_OAUTH_TOKEN_FILE` — required, and it must point at an existing file: a raw token, mode 600, not JSON. Without it all three cases skip, which is why the script treats an unset or missing path as a refusal instead of a green run.
+- `MATRIX_EVIDENCE_DIR` — where the run writes `<agent>.json` and `<agent>-production.json`. It defaults to `agent-output/production-acpx-worker-backend/final-matrix`, the directory the host audit reads.
+
+Use `node --test`, never `bun test`: the matrix imports `node:sqlite`, and Bun resolves a bare `test/` glob to a temporary-directory path that does not exist, so the whole-directory run dies in module loading before any assertion. Run single files under Bun only for the package-focused checks listed in `AGENTS.md`.
+
+The run dispatches real worker sessions and spends provider credits, bounded by a fifteen-minute timeout on the script; a run that fails early ends in seconds, so a fast non-zero exit is a real failure rather than a skipped one. Source checkouts only: `test/` is not in the published package, so this script exists only in a clone.
+
 ## Runtime scenarios
 
 ### Build delegation

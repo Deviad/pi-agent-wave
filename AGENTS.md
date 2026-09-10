@@ -75,6 +75,14 @@ The real installation matrix is intentionally Node-only because it exercises `no
 node --experimental-strip-types --test extensions/pi-agent-wave/test/package-install-rehearsal.test.ts
 ```
 
+`test/acpx-real-matrix.test.ts` sits in the completion glob above, but its three cases skip unless `RUN_REAL_ACPX_MATRIX=1` and a `PI_CLAUDE_OAUTH_TOKEN_FILE` are present. To run them for real, use the guard from the package directory; it refuses when the configuration is missing rather than reporting three skips as a pass, and it dispatches live worker sessions that spend provider credits:
+
+```bash
+cd extensions/pi-agent-wave
+PI_CLAUDE_OAUTH_TOKEN_FILE=~/.config/pi/acpx-claude-token.txt npm run test:acpx
+npm run test:acpx -- --dry-run   # print the command, start nothing
+```
+
 Additional required checks:
 
 ```bash
