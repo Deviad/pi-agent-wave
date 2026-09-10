@@ -358,5 +358,6 @@ The macOS detail that the first draft of that test got wrong is worth keeping: `
 `/var/folders/...` while Python's `resolve()` returns `/private/var/folders/...`, so any assertion
 that compares the two must go through `realpathSync` first.
 
-Still open after this slice: Q4 (the real-Pi failover rehearsal spec), which needs a decision about
-what failover should pin before anyone builds it.
+Still open after this slice: Q4, the failover verification scope. It is written up as
+`prd-failover-verification-scope.md` with three options and a recommendation, and it needs a choice
+before anything gets built.
