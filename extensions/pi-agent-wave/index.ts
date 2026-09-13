@@ -585,7 +585,8 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 }
 
 const ANSWER_PREVIEW_BYTES = 16 * 1024;
-const VERDICT_NODES: Partial<Record<string, readonly string[]>> = { review: ["PASS", "FAIL"], test: ["GREEN", "NOT_OK"], audit: ["PASS", "FAIL"], source_search: ["DONE", "BLOCKED"], thinker_synthesize: ["DONE"] };
+/** Nodes whose worker prompt ends the answer with a VERDICT line (mirrors RUNTIME_VERDICT_NODES in scripts/delegate_core.py). */
+const VERDICT_NODES: Partial<Record<string, readonly string[]>> = { review: ["PASS", "FAIL"], test: ["GREEN", "NOT_OK"], audit: ["PASS", "FAIL"], source_search: ["DONE", "BLOCKED"] };
 
 /**
  * What the supervisor needs in order to decide a settled candidate, so it never has to find the answer on disk:
@@ -600,9 +601,13 @@ export function decisionBrief(graphStore: GraphStore, runId: string, operationId
 	const verdictLines = answer ? [...answer.matchAll(/^\s*VERDICT:\s*([A-Z_]+)\s*$/gm)] : [];
 	const verdict = verdictLines.length ? verdictLines[verdictLines.length - 1]![1]! : null;
 	const expectedVerdicts = VERDICT_NODES[operation.node] ?? null;
+	// The operations graph advances from synthesis only on DONE (graph-core.ts), but the worker prompt asks no
+	// VERDICT of a thinker: the supervisor supplies DONE when the synthesis is complete.
+	const operationsSynthesis = operation.node === "thinker_synthesize" && graphStore.getState(runId).graph === "operations";
 	const needsSlices = operation.node === "thinker_plan" || operation.node === "thinker_split";
 	const decide: Record<string, unknown> = { op: "decide", runId, operationId, decision: "accepted | rejected", reason: "<required: why the answer is accepted or rejected>" };
 	if (expectedVerdicts) decide.verdict = verdict ?? `<the answer has no VERDICT line; expected one of ${expectedVerdicts.join("|")}>`;
+	if (operationsSynthesis) decide.verdict = verdict ?? "DONE";
 	if (needsSlices) decide.payload = { slices: [{ id: "<slug>", name: "<short name>", task: "<what one worker does>", ...(operation.node === "thinker_plan" ? { ownedPaths: ["<paths this slice may change; disjoint across slices>"] } : {}) }] };
 	const kind = attempt.candidate?.kind ?? null;
 	const note = !attempt.candidate
@@ -613,7 +618,9 @@ export function decisionBrief(graphStore: GraphStore, runId: string, operationId
 				? "Call op=integrate for this operationId before op=decide accepted."
 				: expectedVerdicts && !verdict
 					? "The answer lacks the VERDICT line this node requires; decide rejected with that reason or supply the verdict the answer supports."
-					: "Read the retained answer, then op=decide.";
+					: operationsSynthesis
+						? "Operations synthesis advances to the audit only with verdict DONE; the worker was not asked for a VERDICT line, so pass DONE when the synthesis is complete and reject otherwise."
+						: "Read the retained answer, then op=decide.";
 	return { answer, answerBytes: reference?.bytes ?? 0, answerTruncated: (reference?.bytes ?? 0) > ANSWER_PREVIEW_BYTES, verdict, decide, note };
 }
 

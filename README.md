@@ -37,7 +37,7 @@ flowchart TB
         rev["reviewer<br/>PASS / FAIL"]
         test["tester<br/>GREEN / NOT_OK"]
         aud["auditor<br/>evidence PASS"]
-        search["searcher<br/>read-only research"]
+        search["searcher<br/>research · source search"]
     end
 
     fs["AgentFS sandbox<br/>copy-on-write, one per attempt"]
@@ -73,7 +73,7 @@ The **research** graph is `thinker_split → search (fan-out) → thinker_synthe
 
 Every run uses one result contract, frozen at creation.
 
-- **`runtime-v1`** is the only result contract. The supervisor retains the worker's public answer and, for implementation and operational sources, its audited AgentFS changes as immutable content before anything is closed or cleaned up. An `exited` attempt with a candidate must then be accepted or rejected with a reason through `op=decide`; a `failed`, `interrupted` or candidate-less attempt is replaced through `op=retry` under a three-attempt same-model budget and the frozen model chain. Every run is refused until `/graph enable-adapter` has recorded real capture evidence for every adapter the run can route to. No adapter is enabled by default, so a fresh installation refuses `/delegate` until that act, and the contract has no autonomous scheduling. Its status and remaining work are recorded in [the runtime-owned results issue](tasks/prd-runtime-owned-results.md). The earlier report contract, `legacy-v1`, was removed on 2026-09-12.
+- **`runtime-v1`** is the only result contract. The supervisor retains the worker's public answer and, for implementation and operational sources, its audited AgentFS changes as immutable content before anything is closed or cleaned up. An `exited` attempt with a candidate must then be accepted or rejected with a reason through `op=decide`; a `failed`, `interrupted` or candidate-less attempt is replaced through `op=retry` under a three-attempt same-model budget and the frozen model chain. Its status and remaining work are recorded in [the runtime-owned results issue](tasks/prd-runtime-owned-results.md). The earlier report contract, `legacy-v1`, was removed on 2026-09-12.
 
 ## Requirements
 
@@ -165,7 +165,7 @@ Ask Pi to use `delegate_graph`:
 Use delegate_graph to implement tenant-scoped API keys. Keep me updated and ask before resolving blocked recovery choices.
 ```
 
-Air receives structured tool progress and final results. Because not every ACP client exposes Pi slash commands, Air workflows use the equivalent `delegate_graph` operations for initialization, status, cancellation, recovery, and resume. The structured question tool renders as native pickers in Air, with explicit Back, Cancel, and Submit steps.
+Air receives structured tool progress and final results. Because not every ACP client exposes Pi slash commands, Air workflows use the equivalent `delegate_graph` operations: `op=init` to initialize, `op=status` and `op=watch` to inspect, `op=cancel` to cancel, `op=retry` and `op=resolve` to recover, and `op=next` to continue a parked run. The structured question tool renders as native pickers in Air, with explicit Back, Cancel, and Submit steps.
 
 For structured source-command workflows, see [operational search delegation](extensions/pi-agent-wave/README.md#operational-search-delegation).
 

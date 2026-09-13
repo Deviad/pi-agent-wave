@@ -58,11 +58,11 @@ function settledThinker(store: GraphStore, dir: string, runId: string, operation
 test("the supervisor contract describes the runtime-v1 loop the tool accepts", () => {
 	const text = supervisorContract("run_x", "build", "Add a sentence");
 	assert.match(text, /^Delegate Graph run run_x started for: Add a sentence\n/, "the opening line is what the fake supervisor and the operator recognise");
-	for (const needle of ["op=next", "op=dispatch", "op=collect", "op=decide", "accepted or rejected", "payload.slices", "op=integrate", "op=retry", "op=resolve", "awaiting_user"]) assert.ok(text.includes(needle), `contract names ${needle}`);
+	for (const needle of ["op=next", "op=dispatch", "op=collect", "op=decide", "accepted or rejected", "payload.slices", "op=integrate", "op=retry", "op=resolve", "awaiting_user", "op=cancel"]) assert.ok(text.includes(needle), `contract names ${needle}`);
 	assert.equal(text.includes("status=completed"), false, "no completed record exists on runtime-v1");
 	assert.equal(text.includes("reportPath"), false);
 	assert.equal(text.includes("acpxSettlementEvidencePath"), false);
-	assert.match(text, /op=record exists only for status=cancelled/);
+	assert.match(text, /op=record is refused on runtime-v1 runs; cancellation is op=cancel/);
 	assert.match(text, /op=resolve[^.]*refused while the run is active/);
 });
 
