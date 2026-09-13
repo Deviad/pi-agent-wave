@@ -7,6 +7,12 @@ import { decideTransition, graphDefinition } from "./graph-core.ts";
 import { classifyFailure, retryDelayMs, selectModelFallback, type ModelFallbackDecision } from "./retry.ts";
 import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
 import { headlessPresentationIdentity, herdrPresentationIdentity, parseWorkerTransportKind, type WorkerPresentationIdentity, type WorkerTransportKind } from "./lib/worker-transport.ts";
+import { createAcpxAttemptIdentity } from "./lib/acpx-types.ts";
+import { selectAcpAgent } from "./lib/acpx-select.ts";
+import { RuntimeContentStore } from "./lib/runtime-content.ts";
+import { RuntimeIntegration, type IntegrationStatus } from "./lib/runtime-integration.ts";
+import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
+import { canonical, candidateContents, type RuntimeLedger, parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, runtimeDigest, type ResultContract, type RuntimeAttempt, type RuntimeAttemptInput, type RuntimeContent, type RuntimeDecision, type RuntimeDecisionInput, type RuntimeRetryInput, type RuntimeRetryResult, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import type {
 	EventRow,
 	FrozenPolicy,
@@ -42,7 +48,6 @@ export interface RecordOperationInput {
 	operationId: string;
 	status: OperationStatus;
 	verdict?: string;
-	reportPath?: string;
 	error?: string;
 	agentId?: string;
 	agentName?: string;
@@ -121,6 +126,38 @@ export interface AgentRow extends AgentDbRow {
 
 interface CountRow {
 	count: number;
+}
+
+interface RuntimeAttemptRow {
+	attempt_key: string;
+	run_id: string;
+	operation_id: string;
+	identity_json: string;
+	outcome_json: string | null;
+	candidate_json: string | null;
+	candidate_id: string | null;
+	observation_json: string | null;
+	agent_id: string | null;
+	started_at: string;
+	finished_at: string | null;
+	superseded_at: string | null;
+}
+
+interface RuntimeDecisionRow {
+	attempt_key: string;
+	candidate_id: string;
+	decision: string;
+	verdict: string | null;
+	reason: string;
+	integration_id: string | null;
+	payload_json: string | null;
+	decided_at: string;
+}
+
+export interface RuntimeDecisionResult {
+	readonly attempt: RuntimeAttempt;
+	readonly state: RunState;
+	readonly operation: OperationRow;
 }
 
 interface SliceRow {
@@ -207,6 +244,12 @@ function validateOperationalCommands(commands: OperationalCommandSpec[] | undefi
 		const command = item.command as OperationalCommand | undefined;
 		if (!command?.executable?.trim() || !command.cwd?.trim() || !Array.isArray(command.args) || command.args.some((value) => typeof value !== "string")) {
 			throw new Error(`operational command ${item.id} requires executable, argv, and cwd`);
+		}
+		if (item.checkpoint !== undefined) {
+			if (typeof item.checkpoint !== "string" || !item.checkpoint.trim()) throw new Error(`operational command ${item.id} checkpoint must be a path`);
+			const checkpoint = resolve(command.cwd, item.checkpoint);
+			const inside = item.ownedPaths?.some((owned) => { const root = resolve(command.cwd, owned); return checkpoint === root || checkpoint.startsWith(`${root}/`); });
+			if (!inside) throw new Error(`operational command ${item.id} checkpoint must lie under one of its owned paths`);
 		}
 	}
 	assertDisjointOwnership(commands, "operational command");
@@ -297,7 +340,6 @@ export class GraphStore {
 				transient_attempts INTEGER NOT NULL DEFAULT 0,
 				command_json TEXT,
 				task TEXT NOT NULL,
-				report_path TEXT,
 				verdict TEXT,
 				classifier_reason TEXT,
 				last_error TEXT,
@@ -341,6 +383,12 @@ export class GraphStore {
 		this.migrateToV3();
 		this.migrateToV4();
 		this.migrateToV5();
+		this.migrateToV6();
+		this.migrateToV7();
+		this.migrateToV8();
+		this.migrateToV9();
+		this.migrateToV10();
+		this.migrateToV11();
 	}
 
 	private schemaVersion(): number {
@@ -348,14 +396,14 @@ export class GraphStore {
 		return row?.version ?? 0;
 	}
 
-	private hasColumn(table: "runs" | "agents" | "operations", column: string): boolean {
+	private hasColumn(table: "runs" | "agents" | "operations" | "runtime_attempts", column: string): boolean {
 		return this.db
 			.query<{ name: string }, []>(`PRAGMA table_info(${table})`)
 			.all()
 			.some((row) => row.name === column);
 	}
 
-	private ensureColumn(table: "runs" | "agents" | "operations", column: string, definition: string): void {
+	private ensureColumn(table: "runs" | "agents" | "operations" | "runtime_attempts", column: string, definition: string): void {
 		if (!this.hasColumn(table, column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 	}
 
@@ -398,7 +446,7 @@ export class GraphStore {
 
 	/** v3 adds operational graphs and structured command persistence. */
 	private migrateToV3(): void {
-		const version = (this.db.query<{ version: number }, []>("SELECT version FROM schema_version LIMIT 1").get() as { version: number }).version;
+		const version = this.schemaVersion();
 		if (version >= 3) return;
 		if (!this.hasColumn("operations", "command_json")) this.db.exec("ALTER TABLE operations ADD COLUMN command_json TEXT");
 		this.db.exec("PRAGMA foreign_keys = OFF");
@@ -526,6 +574,256 @@ export class GraphStore {
 		}
 		const foreignKeyFinding = this.db.query("PRAGMA foreign_key_check").get();
 		if (foreignKeyFinding) throw new Error("v5 migration produced a foreign-key violation");
+	}
+
+	private migrateToV6(): void {
+		this.transaction(() => {
+			// The contract column existed from v6 to v9; v10 removes it, so it is only materialized on older databases.
+			if (this.schemaVersion() < 10) this.ensureColumn("runs", "result_contract", "TEXT NOT NULL DEFAULT 'runtime-v1' CHECK(result_contract IN ('legacy-v1','runtime-v1'))");
+			this.db.exec(`
+				CREATE TABLE IF NOT EXISTS runtime_attempts (
+					attempt_key TEXT PRIMARY KEY,
+					run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+					operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id) ON DELETE CASCADE,
+					identity_json TEXT NOT NULL CHECK(json_valid(identity_json)),
+					outcome_json TEXT CHECK(outcome_json IS NULL OR json_valid(outcome_json)),
+					candidate_json TEXT CHECK(candidate_json IS NULL OR json_valid(candidate_json)),
+					candidate_id TEXT UNIQUE,
+					started_at TEXT NOT NULL,
+					finished_at TEXT,
+					CHECK((outcome_json IS NULL AND finished_at IS NULL) OR (outcome_json IS NOT NULL AND finished_at IS NOT NULL)),
+					CHECK((candidate_json IS NULL AND candidate_id IS NULL) OR (candidate_json IS NOT NULL AND candidate_id IS NOT NULL AND outcome_json IS NOT NULL))
+				);
+				CREATE TRIGGER IF NOT EXISTS runtime_attempts_identity_immutable
+				BEFORE UPDATE OF attempt_key,run_id,operation_id,identity_json,started_at ON runtime_attempts
+				BEGIN SELECT RAISE(ABORT, 'runtime attempt identity is immutable'); END;
+				CREATE TRIGGER IF NOT EXISTS runtime_attempts_settlement_immutable
+				BEFORE UPDATE OF outcome_json,candidate_json,candidate_id,finished_at ON runtime_attempts WHEN OLD.outcome_json IS NOT NULL
+				BEGIN SELECT RAISE(ABORT, 'runtime settlement is immutable'); END;
+				INSERT OR REPLACE INTO schema_version(version) VALUES (6);
+			`);
+			if (this.schemaVersion() < 10) this.db.exec(`
+				CREATE TRIGGER IF NOT EXISTS runtime_attempts_identity_insert
+				BEFORE INSERT ON runtime_attempts WHEN NOT EXISTS (
+					SELECT 1 FROM operations JOIN runs ON runs.id=operations.run_id
+					WHERE operations.id=NEW.operation_id AND runs.id=NEW.run_id AND runs.result_contract='runtime-v1'
+				)
+				BEGIN SELECT RAISE(ABORT, 'runtime attempt requires matching operation and contract'); END;
+			`);
+		});
+	}
+
+	/** v7 records explicit candidate decisions, observed settlement identity and per-adapter enablement evidence. */
+	private migrateToV7(): void {
+		this.transaction(() => {
+			this.ensureColumn("runtime_attempts", "observation_json", "TEXT CHECK(observation_json IS NULL OR json_valid(observation_json))");
+			this.ensureColumn("runtime_attempts", "agent_id", "TEXT REFERENCES agents(id)");
+			this.db.exec(`
+				CREATE TABLE IF NOT EXISTS runtime_decisions (
+					attempt_key TEXT PRIMARY KEY REFERENCES runtime_attempts(attempt_key) ON DELETE CASCADE,
+					candidate_id TEXT NOT NULL,
+					decision TEXT NOT NULL CHECK(decision IN ('accepted','rejected')),
+					verdict TEXT,
+					reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+					integration_id TEXT,
+					payload_json TEXT CHECK(payload_json IS NULL OR json_valid(payload_json)),
+					decided_at TEXT NOT NULL
+				);
+				CREATE TRIGGER IF NOT EXISTS runtime_decisions_immutable
+				BEFORE UPDATE ON runtime_decisions
+				BEGIN SELECT RAISE(ABORT, 'runtime decision is immutable'); END;
+				CREATE TRIGGER IF NOT EXISTS runtime_decisions_candidate
+				BEFORE INSERT ON runtime_decisions WHEN NOT EXISTS (
+					SELECT 1 FROM runtime_attempts WHERE attempt_key=NEW.attempt_key AND candidate_id=NEW.candidate_id
+				)
+				BEGIN SELECT RAISE(ABORT, 'runtime decision requires the settled candidate'); END;
+				CREATE TABLE IF NOT EXISTS runtime_adapters (
+					agent TEXT PRIMARY KEY CHECK(agent IN ('pi','codex','claude')),
+					evidence TEXT NOT NULL CHECK(length(trim(evidence)) > 0),
+					enabled_at TEXT NOT NULL
+				);
+				INSERT OR REPLACE INTO schema_version(version) VALUES (7);
+			`);
+		});
+	}
+
+	/**
+	 * v8 allows fenced attempt replacement: one active attempt per operation (partial unique index) while
+	 * superseded attempts stay as immutable rows with their retained candidates and decisions. SQLite cannot
+	 * drop the v6 UNIQUE constraint in place, so the table is rebuilt with foreign keys off and checked after.
+	 */
+	private migrateToV8(): void {
+		if (this.schemaVersion() >= 8) return;
+		this.db.exec("PRAGMA foreign_keys = OFF");
+		try {
+			this.db.exec("BEGIN IMMEDIATE");
+			// Re-checked under the write lock: a second opener that saw v7 before the lock must not rebuild again.
+			if (this.schemaVersion() >= 8) { this.db.exec("ROLLBACK"); return; }
+			this.db.exec(`
+				DROP TRIGGER IF EXISTS runtime_decisions_candidate;
+				CREATE TABLE runtime_attempts_v8 (
+					attempt_key TEXT PRIMARY KEY,
+					run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+					operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+					identity_json TEXT NOT NULL CHECK(json_valid(identity_json)),
+					outcome_json TEXT CHECK(outcome_json IS NULL OR json_valid(outcome_json)),
+					candidate_json TEXT CHECK(candidate_json IS NULL OR json_valid(candidate_json)),
+					candidate_id TEXT UNIQUE,
+					started_at TEXT NOT NULL,
+					finished_at TEXT,
+					observation_json TEXT CHECK(observation_json IS NULL OR json_valid(observation_json)),
+					agent_id TEXT REFERENCES agents(id),
+					superseded_at TEXT,
+					CHECK((outcome_json IS NULL AND finished_at IS NULL) OR (outcome_json IS NOT NULL AND finished_at IS NOT NULL)),
+					CHECK((candidate_json IS NULL AND candidate_id IS NULL) OR (candidate_json IS NOT NULL AND candidate_id IS NOT NULL AND outcome_json IS NOT NULL)),
+					CHECK(superseded_at IS NULL OR outcome_json IS NOT NULL)
+				);
+				INSERT INTO runtime_attempts_v8 (attempt_key,run_id,operation_id,identity_json,outcome_json,candidate_json,candidate_id,started_at,finished_at,observation_json,agent_id,superseded_at)
+					SELECT attempt_key,run_id,operation_id,identity_json,outcome_json,candidate_json,candidate_id,started_at,finished_at,observation_json,agent_id,NULL FROM runtime_attempts;
+				DROP TABLE runtime_attempts;
+				ALTER TABLE runtime_attempts_v8 RENAME TO runtime_attempts;
+				CREATE UNIQUE INDEX runtime_attempts_active ON runtime_attempts(operation_id) WHERE superseded_at IS NULL;
+				CREATE TRIGGER runtime_attempts_identity_insert
+				BEFORE INSERT ON runtime_attempts WHEN NOT EXISTS (
+					SELECT 1 FROM operations JOIN runs ON runs.id=operations.run_id
+					WHERE operations.id=NEW.operation_id AND runs.id=NEW.run_id AND runs.result_contract='runtime-v1'
+				)
+				BEGIN SELECT RAISE(ABORT, 'runtime attempt requires matching operation and contract'); END;
+				CREATE TRIGGER runtime_attempts_identity_immutable
+				BEFORE UPDATE OF attempt_key,run_id,operation_id,identity_json,started_at ON runtime_attempts
+				BEGIN SELECT RAISE(ABORT, 'runtime attempt identity is immutable'); END;
+				CREATE TRIGGER runtime_attempts_settlement_immutable
+				BEFORE UPDATE OF outcome_json,candidate_json,candidate_id,observation_json,finished_at ON runtime_attempts WHEN OLD.outcome_json IS NOT NULL
+				BEGIN SELECT RAISE(ABORT, 'runtime settlement is immutable'); END;
+				CREATE TRIGGER runtime_attempts_superseded_immutable
+				BEFORE UPDATE ON runtime_attempts WHEN OLD.superseded_at IS NOT NULL
+				BEGIN SELECT RAISE(ABORT, 'a superseded runtime attempt is immutable'); END;
+				CREATE TRIGGER runtime_decisions_candidate
+				BEFORE INSERT ON runtime_decisions WHEN NOT EXISTS (
+					SELECT 1 FROM runtime_attempts WHERE attempt_key=NEW.attempt_key AND candidate_id=NEW.candidate_id AND superseded_at IS NULL
+				)
+				BEGIN SELECT RAISE(ABORT, 'runtime decision requires the active settled candidate'); END;
+				INSERT OR REPLACE INTO schema_version(version) VALUES (8);
+			`);
+			// Validated before the rebuild is committed, so an interrupted or violating migration leaves v7 intact.
+			if (this.db.query("PRAGMA foreign_key_check").get()) throw new Error("v8 migration produced a foreign-key violation");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			try {
+				this.db.exec("ROLLBACK");
+			} catch {
+				// The failing statement may already have ended the transaction.
+			}
+			throw error;
+		} finally {
+			this.db.exec("PRAGMA foreign_keys = ON");
+		}
+	}
+
+	/** v9: the operations graph runs on runtime-v1 (operational candidates), so the graph trigger from v6 goes. */
+	private migrateToV9(): void {
+		if (this.schemaVersion() >= 9) return;
+		this.transaction(() => {
+			if (this.schemaVersion() >= 9) return;
+			this.db.exec(`
+				DROP TRIGGER IF EXISTS runs_result_contract_graph;
+				INSERT OR REPLACE INTO schema_version(version) VALUES (9);
+			`);
+		});
+	}
+
+	/**
+	 * v10 removes the two columns the report contract left behind: `runs.result_contract` (with its immutability
+	 * trigger) and `operations.report_path`. SQLite cannot drop a column that a CHECK or trigger names, so both tables
+	 * are rebuilt with foreign keys off and checked before commit, the way v8 rebuilt runtime_attempts. A database
+	 * that still holds a legacy run cannot be migrated and says so; none exists.
+	 */
+	private migrateToV10(): void {
+		if (this.schemaVersion() >= 10) return;
+		this.db.exec("PRAGMA foreign_keys = OFF");
+		try {
+			this.db.exec("BEGIN IMMEDIATE");
+			if (this.schemaVersion() >= 10) { this.db.exec("ROLLBACK"); return; }
+			const legacy = this.hasColumn("runs", "result_contract") ? this.db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM runs WHERE result_contract='legacy-v1'").get() : undefined;
+			if (legacy?.count) throw new Error(`v10 migration refused: ${legacy.count} legacy-v1 run(s) remain; the report contract was removed on 2026-09-12 and such runs cannot be carried forward`);
+			this.db.exec(`
+				DROP TRIGGER IF EXISTS runtime_attempts_identity_insert;
+				CREATE TABLE runs_v10 (
+					id TEXT PRIMARY KEY,
+					story TEXT NOT NULL,
+					graph_name TEXT NOT NULL CHECK(graph_name IN ('build','research','operations')),
+					task TEXT NOT NULL,
+					status TEXT NOT NULL CHECK(status IN ('active','terminal','blocked','awaiting_user','deferred','cancelled')),
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL,
+					policy_json TEXT NOT NULL DEFAULT '{}',
+					policy_digest TEXT NOT NULL DEFAULT ''
+				);
+				INSERT INTO runs_v10 (id,story,graph_name,task,status,created_at,updated_at,policy_json,policy_digest)
+					SELECT id,story,graph_name,task,status,created_at,updated_at,policy_json,policy_digest FROM runs;
+				DROP TABLE runs;
+				ALTER TABLE runs_v10 RENAME TO runs;
+				CREATE TABLE operations_v10 (
+					id TEXT PRIMARY KEY,
+					run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+					node TEXT NOT NULL,
+					slice_id TEXT,
+					agent_id TEXT REFERENCES agents(id),
+					status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed','blocked','cancelled')),
+					read_only INTEGER NOT NULL CHECK(read_only IN (0,1)),
+					owned_paths_json TEXT NOT NULL DEFAULT '[]',
+					round INTEGER NOT NULL,
+					fix_iteration INTEGER NOT NULL,
+					transient_attempts INTEGER NOT NULL DEFAULT 0,
+					command_json TEXT,
+					task TEXT NOT NULL,
+					verdict TEXT,
+					classifier_reason TEXT,
+					last_error TEXT,
+					retry_not_before TEXT,
+					created_at TEXT NOT NULL,
+					started_at TEXT,
+					finished_at TEXT,
+					model_attempt INTEGER NOT NULL DEFAULT 0,
+					selected_model TEXT,
+					retry_reason TEXT,
+					fallback_reason TEXT
+				);
+				INSERT INTO operations_v10 (id,run_id,node,slice_id,agent_id,status,read_only,owned_paths_json,round,fix_iteration,transient_attempts,command_json,task,verdict,classifier_reason,last_error,retry_not_before,created_at,started_at,finished_at,model_attempt,selected_model,retry_reason,fallback_reason)
+					SELECT id,run_id,node,slice_id,agent_id,status,read_only,owned_paths_json,round,fix_iteration,transient_attempts,command_json,task,verdict,classifier_reason,last_error,retry_not_before,created_at,started_at,finished_at,model_attempt,selected_model,retry_reason,fallback_reason FROM operations;
+				DROP TABLE operations;
+				ALTER TABLE operations_v10 RENAME TO operations;
+				CREATE INDEX IF NOT EXISTS idx_operations_current ON operations(run_id, node, round, fix_iteration, status);
+				CREATE TRIGGER runtime_attempts_identity_insert
+				BEFORE INSERT ON runtime_attempts WHEN NOT EXISTS (
+					SELECT 1 FROM operations JOIN runs ON runs.id=operations.run_id
+					WHERE operations.id=NEW.operation_id AND runs.id=NEW.run_id
+				)
+				BEGIN SELECT RAISE(ABORT, 'runtime attempt requires a matching operation'); END;
+				INSERT OR REPLACE INTO schema_version(version) VALUES (10);
+			`);
+			if (this.db.query("PRAGMA foreign_key_check").get()) throw new Error("v10 migration produced a foreign-key violation");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			try { this.db.exec("ROLLBACK"); } catch { /* the failing statement may already have ended the transaction */ }
+			throw error;
+		} finally {
+			this.db.exec("PRAGMA foreign_keys = ON");
+		}
+	}
+
+	/** v11 drops the adapter enablement table: every proven adapter is dispatchable, and provenance lives in the PRD and READMEs. */
+	private migrateToV11(): void {
+		if (this.schemaVersion() >= 11) return;
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			if (this.schemaVersion() >= 11) { this.db.exec("ROLLBACK"); return; }
+			this.db.exec("DROP TABLE IF EXISTS runtime_adapters; INSERT OR REPLACE INTO schema_version(version) VALUES (11)");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 
 	private iso(): string {
@@ -663,7 +961,7 @@ export class GraphStore {
 			);
 			this.event({ runId, type: "run_initialized", toNode: definition.initialNode, replyTo: definition.initialNode, payload: { story, graph, task, policy: { digest, input: policy.input } } });
 			if (commands) {
-				for (const item of commands) this.insertOperation(runId, definition.initialNode, item.name, 1, 0, item.id, item.ownedPaths, item.command);
+				for (const item of commands) this.insertOperation(runId, definition.initialNode, item.name, 1, 0, item.id, item.ownedPaths, item.checkpoint ? { ...item.command, checkpoint: item.checkpoint } : item.command);
 			} else {
 				this.insertOperation(runId, definition.initialNode, task, 1, 0);
 			}
@@ -821,13 +1119,381 @@ export class GraphStore {
 	}
 
 	/** Returns the current dispatchable operations, each with its frozen role route, plus the frozen policy. */
-	next(runId: string): { state: RunState; operations: (OperationRow & { route?: PolicyRoute })[]; policy: FrozenPolicy } {
+	next(runId: string): { state: RunState; operations: (OperationRow & { route?: PolicyRoute; runtimeAttempt?: RuntimeAttempt })[]; policy: FrozenPolicy } {
 		const policy = this.policy(runId);
 		const operations = this.operations(runId, true).map((operation) => ({
 			...operation,
 			route: policy.routes.find((route) => route.role === roleForNode(operation.node)),
+			runtimeAttempt: this.runtimeAttemptForOperation(operation.id),
 		}));
 		return { state: this.getState(runId), operations, policy };
+	}
+
+	retainRuntimeContent(bytes: Uint8Array): RuntimeContent {
+		return new RuntimeContentStore(this.dbPath).retain(bytes);
+	}
+
+	runtimeContentPath(content: RuntimeContent): string {
+		return new RuntimeContentStore(this.dbPath).path(content);
+	}
+
+	/** The registered runtime attempt for an operation, if any; every public runtime op starts here. */
+	runtimeAttemptByOperation(operationId: string): RuntimeAttempt | undefined {
+		return this.runtimeAttemptForOperation(operationId);
+	}
+
+	private runtimeAttemptForOperation(operationId: string): RuntimeAttempt | undefined {
+		const row = this.db.query<{ attempt_key: string }, [string]>("SELECT attempt_key FROM runtime_attempts WHERE operation_id=? AND superseded_at IS NULL").get(operationId);
+		return row ? this.runtimeAttempt(row.attempt_key) : undefined;
+	}
+
+	runtimeAttempt(attemptKey: string): RuntimeAttempt {
+		const row = this.db.query<RuntimeAttemptRow, [string]>("SELECT * FROM runtime_attempts WHERE attempt_key=?").get(attemptKey);
+		if (!row) throw new Error("unknown runtime attempt");
+		const outcome = row.outcome_json === null ? null : parseRuntimeOutcome(JSON.parse(row.outcome_json));
+		const candidate = row.candidate_json === null ? null : parseRuntimeCandidate(JSON.parse(row.candidate_json));
+		const observation = row.observation_json === null ? null : parseRuntimeObservation(JSON.parse(row.observation_json));
+		const decision = this.runtimeDecision(attemptKey);
+		const acceptance: RuntimeAttempt["acceptance"] = decision ? decision.decision : candidate && this.getRun(row.run_id).status !== "cancelled" ? "pending" : "unavailable";
+		return {
+			attemptKey, runId: row.run_id, operationId: row.operation_id, agentId: row.agent_id, processState: outcome?.kind ?? "running", outcome, candidate,
+			candidateId: row.candidate_id, observation, decision, cleanup: "pending", acceptance,
+			startedAt: row.started_at, finishedAt: row.finished_at, supersededAt: row.superseded_at,
+		};
+	}
+
+	private runtimeDecision(attemptKey: string): RuntimeDecision | null {
+		const row = this.db.query<RuntimeDecisionRow, [string]>("SELECT * FROM runtime_decisions WHERE attempt_key=?").get(attemptKey);
+		if (!row) return null;
+		return { decision: parseRuntimeDecisionKind(row.decision), reason: row.reason, verdict: row.verdict, integrationId: row.integration_id, decidedAt: row.decided_at };
+	}
+
+	/**
+	 * A derived, reconstructible view of a runtime-v1 run: every attempt with its identity, outcome,
+	 * candidate references, observation, decision and supersession, plus the event ledger. It reads
+	 * only; it cannot invalidate a candidate, settle an operation or advance a graph, and it is not
+	 * consulted by any gate.
+	 */
+	runtimeLedger(runId: string): RuntimeLedger {
+		const run = this.getRun(runId);
+		const state = this.getState(runId);
+		const policy = this.policy(runId);
+		const operations = this.operations(runId).map((operation) => {
+			const attempts = this.db.query<{ attempt_key: string; identity_json: string }, [string]>("SELECT attempt_key,identity_json FROM runtime_attempts WHERE operation_id=? ORDER BY started_at,attempt_key").all(operation.id)
+				.map((row) => {
+					const attempt = this.runtimeAttempt(row.attempt_key);
+					const registered: unknown = JSON.parse(row.identity_json);
+					const identity = isRecordValue(registered) && isRecordValue(registered.identity) ? registered.identity : {};
+					return {
+						attemptKey: attempt.attemptKey, modelAttempt: numberOr(identity.modelAttempt), transientAttempt: numberOr(identity.transientAttempt), selectedModel: stringOr(identity.selectedModel), agent: stringOr(identity.agent),
+						agentId: attempt.agentId, startedAt: attempt.startedAt, finishedAt: attempt.finishedAt, supersededAt: attempt.supersededAt,
+						processState: attempt.processState, outcome: attempt.outcome, candidateId: attempt.candidateId, candidateKind: attempt.candidate?.kind ?? null, checkpoint: attempt.candidate?.kind === "operational" ? attempt.candidate.checkpoint : null,
+						contents: attempt.candidate ? candidateContents(attempt.candidate).map((content) => ({ digest: content.sha256, bytes: content.bytes })) : [],
+						observation: attempt.observation, acceptance: attempt.acceptance, decision: attempt.decision,
+					};
+				});
+			return { operationId: operation.id, node: operation.node, round: operation.round, fixIteration: operation.fix_iteration, status: operation.status, modelAttempt: operation.model_attempt, transientAttempts: operation.transient_attempts, selectedModel: operation.selected_model, classifierReason: operation.classifier_reason, retryReason: operation.retry_reason, fallbackReason: operation.fallback_reason, lastError: operation.last_error, retryNotBefore: operation.retry_not_before, attempts };
+		});
+		const events = this.events(runId, 10_000).map((event) => ({ id: event.id, ts: event.ts, type: event.type, node: event.node, operationId: event.operation_id, agentId: event.agent_id, verdict: event.verdict, payload: JSON.parse(event.payload_json) as unknown }));
+		return { schemaVersion: 1, derived: true, derivedAt: this.iso(), runId, story: run.story, graph: run.graph_name, task: run.task, resultContract: "runtime-v1", status: state.status, currentNode: state.currentNode, round: state.round, fixIteration: state.fixIteration, policyDigest: policy.digest, operations, events };
+	}
+
+	/** Registers the operation's active attempt; a replacement registers only with the identity retryRuntimeAttempt froze. */
+	beginRuntimeAttempt(input: RuntimeAttemptInput): RuntimeAttempt {
+		return this.transaction(() => {
+			const identity = createAcpxAttemptIdentity({
+				runId: input.identity.runId, operationId: input.identity.operationId, role: input.identity.role,
+				modelAttempt: input.identity.modelAttempt, transientAttempt: input.identity.transientAttempt,
+				selectedModel: input.identity.selectedModel, agent: input.identity.agent, presentation: input.identity.presentation,
+			});
+			if (canonical(identity) !== canonical(input.identity)) throw new Error("runtime attempt identity mismatch");
+			const run = this.getRun(identity.runId);
+			if (run.status !== "active") throw new Error(`run is ${run.status}`);
+			const operation = this.getOperation(identity.operationId);
+			const state = this.getState(run.id);
+			if (operation.run_id !== run.id || operation.node !== state.currentNode || operation.round !== state.round || operation.fix_iteration !== state.fixIteration) throw new Error("stale runtime operation");
+			if (!input.sessionId.trim() || (input.requestId !== null && !input.requestId.trim())) throw new Error("runtime session and request identity required");
+			if (input.agentId !== undefined) {
+				const agent = this.db.query<{ run_id: string }, [string]>("SELECT run_id FROM agents WHERE id=?").get(input.agentId);
+				if (!agent || agent.run_id !== run.id) throw new Error("runtime attempt agent does not belong to run");
+			}
+			if (identity.role !== roleForNode(operation.node) || identity.modelAttempt !== operation.model_attempt || identity.transientAttempt !== operation.transient_attempts) throw new Error("runtime attempt identity conflicts with operation");
+			if (selectAcpAgent(identity.selectedModel) !== identity.agent) throw new Error("runtime agent conflicts with selected model");
+			const policy = this.policy(run.id);
+			if (input.policyDigest !== policy.digest) throw new Error("runtime policy digest mismatch");
+			const route = policy.routes.find((route) => route.role === identity.role);
+			if (!route || route.chain[identity.modelAttempt] !== identity.selectedModel) throw new Error("runtime model conflicts with frozen policy");
+			if (policy.input.kind === "model" && policy.input.model !== identity.selectedModel) throw new Error("runtime model conflicts with exact lock");
+			const identityJson = canonical({ identity: input.identity, sessionId: input.sessionId, requestId: input.requestId, policyDigest: input.policyDigest });
+			const previous = this.db.query<RuntimeAttemptRow, [string]>("SELECT * FROM runtime_attempts WHERE operation_id=? AND superseded_at IS NULL").get(operation.id);
+			if (previous) {
+				if (previous.identity_json !== identityJson) throw new Error("conflicting runtime attempt identity");
+				if (input.agentId !== undefined && previous.agent_id !== null && previous.agent_id !== input.agentId) throw new Error("conflicting runtime attempt agent");
+				if (input.agentId !== undefined && previous.agent_id === null) {
+					this.db.query("UPDATE runtime_attempts SET agent_id=? WHERE attempt_key=?").run(input.agentId, previous.attempt_key);
+					this.db.query("UPDATE operations SET agent_id=? WHERE id=?").run(input.agentId, operation.id);
+				}
+				return this.runtimeAttempt(previous.attempt_key);
+			}
+			if (operation.status !== "pending") throw new Error("runtime operation must be pending");
+			const now = this.iso();
+			this.db.query("INSERT INTO runtime_attempts(attempt_key,run_id,operation_id,identity_json,started_at,agent_id) VALUES (?,?,?,?,?,?)").run(identity.attemptKey, run.id, operation.id, identityJson, now, input.agentId ?? null);
+			this.db.query("UPDATE operations SET status='running',started_at=?,selected_model=?,agent_id=COALESCE(?,agent_id) WHERE id=?").run(now, identity.selectedModel, input.agentId ?? null, operation.id);
+			if (input.agentId !== undefined) this.db.query("UPDATE agents SET status='running',policy_digest=?,selected_model=?,model_attempt=?,last_activity_at=? WHERE id=?").run(policy.digest, identity.selectedModel, identity.modelAttempt, now, input.agentId);
+			this.event({ runId: run.id, operationId: operation.id, type: "runtime_attempt_registered", payload: { attemptKey: identity.attemptKey } });
+			return this.runtimeAttempt(identity.attemptKey);
+		});
+	}
+
+	/** Commits facts only. No report, ledger, verdict, retry or graph transition is inferred. */
+	settleRuntimeAttempt(input: RuntimeSettlementInput): RuntimeAttempt {
+		return this.transaction(() => {
+			const current = this.runtimeAttempt(input.attemptKey);
+			const outcome = parseRuntimeOutcome(input.outcome);
+			const candidate = input.candidate === undefined ? null : parseRuntimeCandidate(input.candidate);
+			const observation = input.observation === undefined ? null : parseRuntimeObservation(input.observation);
+			if (candidate) for (const content of candidateContents(candidate)) new RuntimeContentStore(this.dbPath).verify(content);
+			if (observation?.manifest && (!candidate || (candidate.kind !== "coding" && candidate.kind !== "operational") || !candidate.artifacts.some((item) => canonical(item) === canonical(observation.manifest)))) throw new Error("observed manifest must be a retained coding or operational artifact");
+			if (current.outcome !== null) {
+				if (canonical(current.outcome) !== canonical(outcome) || canonical(current.candidate) !== canonical(candidate) || canonical(current.observation) !== canonical(observation)) throw new Error("conflicting runtime settlement");
+				return current;
+			}
+			const candidateId = candidate ? runtimeDigest({ attemptKey: input.attemptKey, candidate }) : null;
+			this.db.query("UPDATE runtime_attempts SET outcome_json=?,candidate_json=?,candidate_id=?,observation_json=?,finished_at=? WHERE attempt_key=? AND outcome_json IS NULL")
+				.run(canonical(outcome), candidate ? canonical(candidate) : null, candidateId, observation ? canonical(observation) : null, this.iso(), input.attemptKey);
+			if (current.agentId) this.db.query("UPDATE agents SET status=?,last_activity_at=? WHERE id=?").run(outcome.kind === "exited" ? "completed" : outcome.kind === "cancelled" ? "cancelled" : "failed", this.iso(), current.agentId);
+			this.event({ runId: current.runId, operationId: current.operationId, type: "runtime_attempt_settled", payload: { attemptKey: input.attemptKey, processState: outcome.kind, candidateId } });
+			return this.runtimeAttempt(input.attemptKey);
+		});
+	}
+
+	/** Reserves a checkpoint for a retained coding candidate; never applies or accepts it. */
+	prepareRuntimeIntegration(attemptKey: string, manifestReference: RuntimeContent): IntegrationStatus {
+		return this.prepareIntegration(attemptKey, manifestReference, false);
+	}
+
+	/** Only a rollback may touch a superseded attempt's integration: the historical recovery route after replacement. */
+	private prepareIntegration(attemptKey: string, manifestReference: RuntimeContent, historicalRollback: boolean): IntegrationStatus {
+		const attempt = this.runtimeAttempt(attemptKey);
+		if (attempt.supersededAt && !historicalRollback) throw new Error("integration refused: the attempt was superseded by a replacement; only rollback remains available");
+		const candidate = attempt.candidate;
+		if (!attempt.outcome || !candidate || (candidate.kind !== "coding" && candidate.kind !== "operational") || !attempt.candidateId) throw new Error("integration requires a settled coding or operational candidate");
+		if (!candidate.artifacts.some((item) => canonical(item) === canonical(manifestReference))) throw new Error("candidate does not retain this staging manifest");
+		const content = new RuntimeContentStore(this.dbPath);
+		const manifest = parseRuntimeStagingManifest(JSON.parse(content.read(manifestReference, 16 * 1024 * 1024).toString("utf8")));
+		if (manifest.attemptKey !== attemptKey || manifest.baseRevision !== candidate.baseRevision || manifest.readOnly) throw new Error("staging manifest conflicts with candidate identity");
+		if (realpathSync(manifest.workspace) !== manifest.workspace) throw new Error("staging workspace identity changed");
+		for (const change of manifest.changes) {
+			if (change.after && !candidate.artifacts.some((item) => canonical(item) === canonical(change.after))) throw new Error("candidate does not retain staged file");
+		}
+		const journal = new RuntimeIntegration(this.dbPath);
+		try {
+			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding" }, () => {
+				const run = this.getRun(attempt.runId);
+				const operation = this.getOperation(attempt.operationId);
+				if (run.status !== "active" || operation.status === "cancelled") throw new Error(`runtime integration unavailable: ${run.status === "active" ? operation.status : run.status}`);
+				const state = this.getState(run.id);
+				const current = this.runtimeAttempt(attemptKey);
+				if (operation.node !== state.currentNode || operation.round !== state.round || operation.fix_iteration !== state.fixIteration || current.candidateId !== attempt.candidateId) throw new Error("stale integration candidate");
+				if (current.supersededAt && !historicalRollback) throw new Error("integration refused: the attempt was superseded during preparation");
+				for (const reference of candidateContents(candidate)) content.verify(reference);
+			});
+		} finally { journal.close(); }
+	}
+
+	/** Applies a prepared candidate integration to completion, or rolls it back; each file step is journaled. */
+	applyRuntimeIntegration(attemptKey: string, manifest: RuntimeContent, direction: "apply" | "rollback" = "apply"): IntegrationStatus {
+		const prepared = this.prepareIntegration(attemptKey, manifest, direction === "rollback");
+		const journal = new RuntimeIntegration(this.dbPath);
+		try { return direction === "apply" ? journal.apply(prepared.id) : journal.rollback(prepared.id); }
+		finally { journal.close(); }
+	}
+
+	/** An integration that has touched or reserved the workspace for this candidate and has not been rolled back. */
+	private outstandingIntegrationFor(candidateId: string): IntegrationStatus | null {
+		if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_integrations'").get()) return null;
+		const row = this.db.query<{ id: string; state: IntegrationStatus["state"]; direction: IntegrationStatus["direction"]; error: string | null }, [string]>(
+			"SELECT id,state,direction,error FROM runtime_integrations WHERE json_extract(manifest_json,'$.candidateId')=? AND state IN ('prepared','applying','applied','needs_reconciliation')",
+		).get(candidateId);
+		return row ? { id: row.id, state: row.state, direction: row.direction, error: row.error } : null;
+	}
+
+	private integrationStatusFor(workspace: string, candidateId: string): IntegrationStatus | null {
+		// The journal creates its own table on first use; before that nothing can have been prepared.
+		if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_integrations'").get()) return null;
+		const row = this.db.query<{ id: string; state: IntegrationStatus["state"]; direction: IntegrationStatus["direction"]; error: string | null }, [string, string]>(
+			"SELECT id,state,direction,error FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?",
+		).get(workspace, candidateId);
+		return row ? { id: row.id, state: row.state, direction: row.direction, error: row.error } : null;
+	}
+
+	/**
+	 * Records the caller's explicit acceptance or rejection of a settled candidate. Acceptance completes the
+	 * operation through the same join and transition logic as legacy completion; rejection parks the run for
+	 * the user with the candidate retained. Duplicate identical decisions return the recorded outcome.
+	 */
+	decideRuntimeCandidate(input: RuntimeDecisionInput): RuntimeDecisionResult {
+		return this.transaction(() => {
+			const decision = parseRuntimeDecisionKind(input.decision);
+			const reason = input.reason.trim();
+			if (!reason) throw new Error("runtime decision requires a reason");
+			const attempt = this.runtimeAttempt(input.attemptKey);
+			const verdict = input.verdict?.trim().toUpperCase() || null;
+			const result = () => ({ attempt: this.runtimeAttempt(input.attemptKey), state: this.getState(attempt.runId), operation: this.getOperation(attempt.operationId) });
+			if (attempt.decision) {
+				if (attempt.decision.decision !== decision || attempt.decision.reason !== reason || attempt.decision.verdict !== verdict) throw new Error("conflicting runtime decision");
+				return result();
+			}
+			if (attempt.supersededAt) throw new Error("runtime decision refused: the attempt was superseded by a replacement");
+			if (!attempt.outcome || !attempt.candidate || !attempt.candidateId) throw new Error("runtime decision requires a settled candidate");
+			const run = this.getRun(attempt.runId);
+			if (run.status !== "active") throw new Error(`run is ${run.status}`);
+			const state = this.getState(run.id);
+			const operation = this.getOperation(attempt.operationId);
+			if (operation.node !== state.currentNode || operation.round !== state.round || operation.fix_iteration !== state.fixIteration) throw new Error("operation is stale for current graph state");
+			if (operation.status !== "running") throw new Error(`cannot decide operation from ${operation.status}`);
+			let integrationId: string | null = null;
+			if (decision === "accepted" && (attempt.candidate.kind === "coding" || attempt.candidate.kind === "operational")) {
+				const manifestReference = attempt.observation?.manifest ?? null;
+				if (!manifestReference) throw new Error(`${attempt.candidate.kind} acceptance requires the observed staging manifest`);
+				const content = new RuntimeContentStore(this.dbPath);
+				const manifest = parseRuntimeStagingManifest(JSON.parse(content.read(manifestReference, 16 * 1024 * 1024).toString("utf8")));
+				if (manifest.attemptKey !== input.attemptKey || manifest.baseRevision !== attempt.candidate.baseRevision) throw new Error("staging manifest conflicts with candidate identity");
+				if (manifest.changes.length) {
+					const status = this.integrationStatusFor(manifest.workspace, attempt.candidateId);
+					if (!status || status.state !== "applied") throw new Error(`${attempt.candidate.kind} acceptance requires an applied integration (${status?.state ?? "not prepared"})`);
+					integrationId = status.id;
+				}
+			}
+			const now = this.iso();
+			this.db.query("INSERT INTO runtime_decisions(attempt_key,candidate_id,decision,verdict,reason,integration_id,payload_json,decided_at) VALUES (?,?,?,?,?,?,?,?)")
+				.run(input.attemptKey, attempt.candidateId, decision, verdict, reason, integrationId, input.payload ? canonical(input.payload) : null, now);
+			this.event({ runId: run.id, operationId: operation.id, agentId: attempt.agentId ?? undefined, type: "runtime_candidate_decided", node: operation.node, payload: { attemptKey: input.attemptKey, candidateId: attempt.candidateId, decision, verdict, reason, integrationId } });
+			if (decision === "rejected") {
+				this.db.query("UPDATE operations SET status='failed',classifier_reason='candidate-rejected',last_error=?,finished_at=? WHERE id=?").run(reason, now, operation.id);
+				if (attempt.agentId) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, attempt.agentId);
+				this.setState(run.id, state.currentNode, state.round, state.fixIteration, "awaiting_user");
+				this.event({ runId: run.id, type: "operation_failed", node: operation.node, operationId: operation.id, agentId: attempt.agentId ?? undefined, fromAgent: roleForNode(operation.node), toAgent: "user", replyTo: "user", payload: { classification: "candidate-rejected", error: reason } });
+				return result();
+			}
+			this.completeOperation(state, operation, { verdict: verdict ?? undefined, payload: input.payload, agentName: undefined, settlingWhileParked: false });
+			return result();
+		});
+	}
+
+	/**
+	 * Fenced attempt replacement under the frozen policy. Automatic mode classifies the active attempt's own
+	 * recorded failure (or a launch failure when no attempt exists) exactly as legacy record does: same-model
+	 * budget of three, then the next frozen chain model, then awaiting_user. Approved mode is the operator's
+	 * retry from awaiting_user. Neither path decides a candidate or advances the graph.
+	 */
+	retryRuntimeAttempt(input: RuntimeRetryInput): RuntimeRetryResult {
+		return this.transaction(() => {
+			const run = this.getRun(input.runId);
+			const operation = this.getOperation(input.operationId);
+			if (operation.run_id !== run.id) throw new Error("operation does not belong to run");
+			const state = this.getState(run.id);
+			if (operation.node !== state.currentNode || operation.round !== state.round || operation.fix_iteration !== state.fixIteration) throw new Error("operation is stale for current graph state");
+			const activeRow = this.db.query<{ attempt_key: string }, [string]>("SELECT attempt_key FROM runtime_attempts WHERE operation_id=? AND superseded_at IS NULL").get(operation.id);
+			const previous = activeRow ? this.runtimeAttempt(activeRow.attempt_key) : null;
+			const now = this.iso();
+			const role = roleForNode(operation.node);
+			const result = (retry: RuntimeRetryResult["retry"], classification: string | null, exhausted: boolean): RuntimeRetryResult => ({
+				state: this.getState(run.id), operation: this.getOperation(operation.id), previousAttempt: previous ? this.runtimeAttempt(previous.attemptKey) : null, classification, retry, exhausted,
+			});
+			const supersede = () => {
+				if (!previous) return;
+				this.db.query("UPDATE runtime_attempts SET superseded_at=? WHERE attempt_key=? AND superseded_at IS NULL").run(now, previous.attemptKey);
+				this.event({ runId: run.id, operationId: operation.id, agentId: previous.agentId ?? undefined, type: "runtime_attempt_superseded", node: operation.node, payload: { attemptKey: previous.attemptKey, processState: previous.processState } });
+			};
+
+			if (input.approved) {
+				if (input.error !== undefined) throw new Error("an approved retry carries no failure text");
+				// awaiting_user and deferred park a failed operation; an escalated run is blocked with an explicitly blocked operation, and the operator may resume either.
+				if (state.status !== "awaiting_user" && state.status !== "deferred" && state.status !== "blocked") throw new Error("run is not awaiting a recovery decision");
+				if (state.status === "blocked" && operation.status !== "blocked") throw new Error("recovery requires an explicitly blocked operation");
+				if (operation.status !== "failed" && operation.status !== "blocked") throw new Error("operation is not awaiting recovery");
+				if (previous && !previous.outcome) throw new Error("runtime attempt is still running");
+				if (previous?.candidateId) {
+					const outstanding = this.outstandingIntegrationFor(previous.candidateId);
+					if (outstanding) throw new Error(`runtime retry refused: the candidate's integration is ${outstanding.state}; roll it back first`);
+				}
+				supersede();
+				const retryReason = input.retryReason?.trim() || "operator-approved-retry";
+				// The transient counter advances rather than resetting: attempt keys derive from it, and a
+				// superseded key must never be minted twice. The same-model budget is not restored.
+				const attempt = operation.transient_attempts + 1;
+				this.db.query("UPDATE operations SET status='pending',agent_id=NULL,transient_attempts=?,classifier_reason=NULL,last_error=NULL,retry_reason=?,fallback_reason=NULL,retry_not_before=NULL,started_at=NULL,finished_at=NULL WHERE id=?").run(attempt, retryReason, operation.id);
+				const unresolved = this.db.query<CountRow, [string, string, number, number]>(
+					"SELECT COUNT(*) AS count FROM operations WHERE run_id=? AND node=? AND round=? AND fix_iteration=? AND status IN ('failed','blocked')",
+				).get(run.id, operation.node, operation.round, operation.fix_iteration);
+				this.setState(run.id, operation.node, operation.round, operation.fix_iteration, unresolved?.count ? "awaiting_user" : "active");
+				this.event({ runId: run.id, type: "resume", node: operation.node, operationId: operation.id, agentId: previous?.agentId ?? undefined, toAgent: role, replyTo: role, payload: {
+					previousAttempt: previous ? { attemptKey: previous.attemptKey, processState: previous.processState, acceptance: previous.acceptance, error: operation.last_error } : { error: operation.last_error },
+				} });
+				const selectedModel = operation.selected_model ?? this.policy(run.id).routes.find((route) => route.role === role)?.chain[operation.model_attempt] ?? "";
+				return result({ attempt, modelAttempt: operation.model_attempt, selectedModel, delayMs: 0, notBefore: now }, null, false);
+			}
+
+			if (run.status !== "active") throw new Error(`run is ${run.status}`);
+			let error: string;
+			if (previous) {
+				if (!previous.outcome) throw new Error("runtime attempt is still running; collect it before retrying");
+				if (input.error !== undefined) throw new Error("a settled runtime attempt is retried from its own recorded outcome, not caller text");
+				if (previous.decision) throw new Error(`runtime attempt was already ${previous.decision.decision}`);
+				// An exited worker whose capture produced no candidate (empty or incomplete answer) is a transient failure, the
+				// runtime analogue of a silent legacy turn; an exited worker with a candidate is decided, never retried.
+				if (previous.outcome.kind === "exited" && previous.candidate) throw new Error("an exited runtime attempt with a candidate must be decided, not retried");
+				if (previous.outcome.kind === "cancelled") throw new Error("a cancelled runtime attempt cannot be retried");
+				if (operation.status !== "running") throw new Error(`cannot retry operation from ${operation.status}`);
+				if (previous.candidateId) {
+					const outstanding = this.outstandingIntegrationFor(previous.candidateId);
+					if (outstanding) throw new Error(`runtime retry refused: the candidate's integration is ${outstanding.state}; roll it back first`);
+				}
+				error = previous.outcome.kind === "failed" ? previous.outcome.error
+					: previous.outcome.kind === "interrupted" ? previous.outcome.reason
+					: `runtime worker exited without a candidate (capture ${previous.observation?.captureStatus ?? "unrecorded"})`;
+			} else {
+				if (operation.status !== "pending") throw new Error(`cannot retry operation from ${operation.status} without an active attempt`);
+				error = input.error?.trim() ?? "";
+				if (!error) throw new Error("retrying an unlaunched runtime operation requires the launch failure text");
+				// A launch failure is fenced to the identity that was dispatched; a replayed or stale report cannot spend the budget twice.
+				if (!input.launched) throw new Error("retrying an unlaunched runtime operation requires the launched modelAttempt and transientAttempt");
+				if (input.launched.modelAttempt !== operation.model_attempt || input.launched.transientAttempt !== operation.transient_attempts) throw new Error(`stale launch failure: operation is at model attempt ${operation.model_attempt}, transient attempt ${operation.transient_attempts}`);
+			}
+
+			const classification = classifyFailure(error);
+			const policyFields = (modelAttempt: number, transientAttempt: number, retryReason: string, fallbackReason: string | null) =>
+				this.policyEventContext(run.id, operation.node, modelAttempt, transientAttempt, retryReason, fallbackReason);
+			if (classification.kind === "transient" && operation.transient_attempts < 3) {
+				const attempt = operation.transient_attempts + 1;
+				const retryReason = input.retryReason?.trim() || classification.reason;
+				const delayMs = retryDelayMs(operation.transient_attempts, this.random);
+				const notBefore = new Date(this.now().getTime() + delayMs).toISOString();
+				supersede();
+				this.db.query("UPDATE operations SET status='pending',agent_id=NULL,transient_attempts=?,classifier_reason=?,retry_reason=?,last_error=?,retry_not_before=?,started_at=NULL,finished_at=NULL WHERE id=?")
+					.run(attempt, classification.reason, retryReason, error, notBefore, operation.id);
+				const fields = policyFields(operation.model_attempt, attempt, retryReason, null);
+				this.event({ runId: run.id, type: "retry", node: operation.node, operationId: operation.id, agentId: previous?.agentId ?? undefined, fromAgent: role, toAgent: role, replyTo: role, payload: { ...fields, attempt, delayMs, notBefore, classification: classification.reason, reasonCode: retryReason, error, previousAttemptKey: previous?.attemptKey ?? null, policy: fields } });
+				const selectedModel = operation.selected_model ?? this.policy(run.id).routes.find((route) => route.role === role)?.chain[operation.model_attempt] ?? "";
+				return result({ attempt, modelAttempt: operation.model_attempt, selectedModel, delayMs, notBefore }, classification.reason, false);
+			}
+			const fallback = classification.kind === "transient" ? this.modelFallbackFor(run.id, operation, error) : null;
+			if (fallback?.advance) {
+				const delayMs = retryDelayMs(0, this.random);
+				const notBefore = new Date(this.now().getTime() + delayMs).toISOString();
+				supersede();
+				this.db.query("UPDATE operations SET status='pending',agent_id=NULL,model_attempt=?,selected_model=?,transient_attempts=0,classifier_reason=?,retry_reason=?,fallback_reason=?,last_error=?,retry_not_before=?,started_at=NULL,finished_at=NULL WHERE id=?")
+					.run(fallback.attempt, fallback.model, classification.reason, classification.reason, fallback.fallbackReason, error, notBefore, operation.id);
+				this.event({ runId: run.id, type: "model_fallback", node: operation.node, operationId: operation.id, agentId: previous?.agentId ?? undefined, fromAgent: "supervisor", toAgent: role, replyTo: "supervisor", payload: { ...policyFields(fallback.attempt, 0, classification.reason, fallback.fallbackReason), fromModelAttempt: operation.model_attempt, fromModel: operation.selected_model, reasonCode: fallback.fallbackReason, notBefore, previousAttemptKey: previous?.attemptKey ?? null } });
+				return result({ attempt: 0, modelAttempt: fallback.attempt, selectedModel: fallback.model, delayMs, notBefore }, classification.reason, false);
+			}
+			this.db.query("UPDATE operations SET status='failed',classifier_reason=?,last_error=?,finished_at=? WHERE id=?").run(classification.reason, error, now, operation.id);
+			if (previous?.agentId) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, previous.agentId);
+			this.setState(run.id, state.currentNode, state.round, state.fixIteration, "awaiting_user");
+			this.event({ runId: run.id, type: classification.kind === "transient" ? "retry_exhausted" : "operation_failed", node: operation.node, operationId: operation.id, agentId: previous?.agentId ?? undefined, fromAgent: role, toAgent: "user", replyTo: "user", payload: { ...policyFields(operation.model_attempt, operation.transient_attempts, classification.reason, null), classification: classification.reason, error, attemptKey: previous?.attemptKey ?? null } });
+			return result(null, classification.reason, true);
+		});
 	}
 
 	registerAgent(input: AgentRegistration): string {
@@ -962,260 +1628,79 @@ export class GraphStore {
 	}
 
 	/** Records one operation transition and atomically advances the graph when its join is complete. */
+	/** The only remaining record transition: cancellation of the current operation (report settlement was removed with legacy-v1). */
 	record(input: RecordOperationInput): RecordOperationResult {
 		return this.transaction(() => {
+			if (input.status !== "cancelled") throw new Error(`unsupported record status ${input.status}: runtime attempts settle through collect and advance through decide`);
 			const state = this.getState(input.runId);
-			if (state.status !== "active") throw new Error(`run ${input.runId} is ${state.status}; resolve it before recording operations`);
 			const operation = this.getOperation(input.operationId);
 			if (operation.run_id !== input.runId) throw new Error("operation does not belong to run");
 			if (operation.node !== state.currentNode || operation.round !== state.round || operation.fix_iteration !== state.fixIteration) {
 				throw new Error("operation is stale for current graph state");
 			}
+			if (state.status !== "active") throw new Error(`run ${input.runId} is ${state.status}; resolve it before recording operations`);
 			const now = this.iso();
-
-			if (input.status === "running") {
-				if (operation.status !== "pending" && operation.status !== "running") throw new Error(`cannot run operation from ${operation.status}`);
-				if (input.transport === undefined) throw new Error("running operation requires worker transport");
-				parseWorkerTransportKind(input.transport);
-				this.assertDispatchPolicy(input.runId, operation, input);
-				const modelAttempt = input.modelAttempt ?? operation.model_attempt;
-				const advancedModel = modelAttempt > operation.model_attempt;
-				const retryAttempt = advancedModel ? 0 : operation.transient_attempts;
-				const policyFields = this.policyEventContext(
-					input.runId,
-					operation.node,
-					modelAttempt,
-					retryAttempt,
-					input.retryReason ?? operation.retry_reason,
-					input.fallbackReason ?? null,
-				);
-				const selectedModel = (policyFields.selectedModel as string | null) ?? input.selectedModel ?? null;
-				this.db
-					.query("UPDATE operations SET status='running',agent_id=COALESCE(?,agent_id),started_at=COALESCE(started_at,?),model_attempt=?,selected_model=?,transient_attempts=?,retry_reason=?,fallback_reason=? WHERE id=?")
-					.run(
-						input.agentId ?? null,
-						now,
-						modelAttempt,
-						selectedModel,
-						retryAttempt,
-						input.retryReason ?? operation.retry_reason,
-						input.fallbackReason ?? null,
-						operation.id,
-					);
-				if (input.agentId) {
-					this.db
-						.query("UPDATE agents SET status='running',policy_digest=?,selected_model=?,model_attempt=?,last_activity_at=? WHERE id=?")
-						.run(this.policy(input.runId).digest, selectedModel, modelAttempt, now, input.agentId);
-				}
-				if (advancedModel) {
-					this.event({
-						runId: input.runId,
-						type: "model_fallback",
-						node: operation.node,
-						operationId: operation.id,
-						agentId: input.agentId,
-						fromAgent: "supervisor",
-						toAgent: input.agentName ?? roleForNode(operation.node),
-						replyTo: "supervisor",
-						payload: {
-							...policyFields,
-							fromModelAttempt: operation.model_attempt,
-							fromModel: operation.selected_model,
-							reasonCode: input.fallbackReason,
-						},
-					});
-				}
-				this.event({
-					runId: input.runId,
-					type: "model_selected",
-					node: operation.node,
-					operationId: operation.id,
-					agentId: input.agentId,
-					fromAgent: "supervisor",
-					toAgent: input.agentName ?? roleForNode(operation.node),
-					replyTo: "supervisor",
-					payload: policyFields,
-				});
-				this.event({
-					runId: input.runId,
-					type: "operation_running",
-					node: operation.node,
-					operationId: operation.id,
-					agentId: input.agentId,
-					fromAgent: "supervisor",
-					toAgent: input.agentName ?? roleForNode(operation.node),
-					replyTo: "supervisor",
-					payload: { task: operation.task, transport: input.transport, ...policyFields, policy: policyFields },
-				});
-				return { state, operation: this.getOperation(operation.id) };
-			}
-
-			if (input.status === "failed" && input.error) {
-				const classification = classifyFailure(input.error);
-				if (classification.kind === "transient" && operation.transient_attempts < 3) {
-					const attempt = operation.transient_attempts + 1;
-					const retryReason = input.retryReason?.trim() || classification.reason;
-					const delayMs = retryDelayMs(operation.transient_attempts, this.random);
-					const notBefore = new Date(this.now().getTime() + delayMs).toISOString();
-					this.db
-						.query("UPDATE operations SET status='running',transient_attempts=?,classifier_reason=?,retry_reason=?,last_error=?,retry_not_before=? WHERE id=?")
-						.run(attempt, classification.reason, retryReason, input.error, notBefore, operation.id);
-					if (operation.agent_id) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
-					const policyFields = this.policyEventContext(
-						input.runId,
-						operation.node,
-						operation.model_attempt,
-						attempt,
-						retryReason,
-						null,
-					);
-					this.event({
-						runId: input.runId,
-						type: "retry",
-						node: operation.node,
-						operationId: operation.id,
-						agentId: input.agentId,
-						fromAgent: input.agentName ?? roleForNode(operation.node),
-						toAgent: input.agentName ?? roleForNode(operation.node),
-						replyTo: input.agentName ?? roleForNode(operation.node),
-						payload: {
-							...policyFields,
-							attempt,
-							delayMs,
-							notBefore,
-							classification: classification.reason,
-							reasonCode: retryReason,
-							error: input.error,
-							policy: policyFields,
-						},
-					});
-					return {
-						state,
-						operation: this.getOperation(operation.id),
-						retry: { attempt, modelAttempt: operation.model_attempt, selectedModel: operation.selected_model, delayMs, notBefore },
-					};
-				}
-				const fallback = classification.kind === "transient"
-					? this.modelFallbackFor(input.runId, operation, input.error)
-					: null;
-				if (fallback?.advance) {
-					const delayMs = retryDelayMs(0, this.random);
-					const notBefore = new Date(this.now().getTime() + delayMs).toISOString();
-					this.db
-						.query("UPDATE operations SET status='running',model_attempt=?,selected_model=?,transient_attempts=0,classifier_reason=?,retry_reason=?,fallback_reason=?,last_error=?,retry_not_before=?,finished_at=NULL WHERE id=?")
-						.run(fallback.attempt, fallback.model, classification.reason, classification.reason, fallback.fallbackReason, input.error, notBefore, operation.id);
-					if (operation.agent_id) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
-					this.event({
-						runId: input.runId,
-						type: "model_fallback",
-						node: operation.node,
-						operationId: operation.id,
-						agentId: input.agentId,
-						fromAgent: "supervisor",
-						toAgent: input.agentName ?? roleForNode(operation.node),
-						replyTo: "supervisor",
-						payload: {
-							...this.policyEventContext(input.runId, operation.node, fallback.attempt, 0, classification.reason, fallback.fallbackReason),
-							fromModelAttempt: operation.model_attempt,
-							fromModel: operation.selected_model,
-							reasonCode: fallback.fallbackReason,
-							notBefore,
-						},
-					});
-					return {
-						state,
-						operation: this.getOperation(operation.id),
-						retry: { attempt: 0, modelAttempt: fallback.attempt, selectedModel: fallback.model, delayMs, notBefore },
-					};
-				}
-				this.db
-					.query("UPDATE operations SET status='failed',classifier_reason=?,last_error=?,finished_at=? WHERE id=?")
-					.run(classification.reason, input.error, now, operation.id);
-				if (operation.agent_id) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
-				this.setState(input.runId, state.currentNode, state.round, state.fixIteration, "awaiting_user");
-				this.event({
-					runId: input.runId,
-					type: classification.kind === "transient" ? "retry_exhausted" : "operation_failed",
-					node: operation.node,
-					operationId: operation.id,
-					agentId: input.agentId,
-					fromAgent: input.agentName ?? roleForNode(operation.node),
-					toAgent: "user",
-					replyTo: "user",
-					payload: { classification: classification.reason, error: input.error },
-				});
-				return { state: this.getState(input.runId), operation: this.getOperation(operation.id), requiresUserDecision: true };
-			}
-
-			if (input.status === "blocked" || input.status === "cancelled") {
-				this.db.query("UPDATE operations SET status=?,last_error=?,report_path=?,verdict=?,finished_at=? WHERE id=?").run(
-					input.status,
-					input.error ?? null,
-					input.reportPath ?? null,
-					input.verdict?.toUpperCase() ?? null,
-					now,
-					operation.id,
-				);
-				const runStatus: RunStatus = input.status === "blocked" ? "blocked" : "cancelled";
-				if (operation.agent_id) this.db.query("UPDATE agents SET status=?,last_activity_at=? WHERE id=?").run(input.status === "blocked" ? "failed" : "cancelled", now, operation.agent_id);
-				this.setState(input.runId, state.currentNode, state.round, state.fixIteration, runStatus);
-				this.event({ runId: input.runId, type: `operation_${input.status}`, node: operation.node, operationId: operation.id, toAgent: "user", replyTo: "user" });
-				return { state: this.getState(input.runId), operation: this.getOperation(operation.id) };
-			}
-
-			if (input.status !== "completed") throw new Error(`unsupported record status ${input.status}`);
-			if (operation.status !== "running") throw new Error(`cannot complete operation from ${operation.status}`);
-			this.db
-				.query("UPDATE operations SET status='completed',report_path=?,verdict=?,finished_at=?,retry_not_before=NULL WHERE id=?")
-				.run(input.reportPath ?? null, input.verdict?.toUpperCase() ?? null, now, operation.id);
-			if (operation.agent_id) this.db.query("UPDATE agents SET status='completed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
-
-			const allComplete = this.allCurrentComplete(state);
-			const transition = decideTransition({ ...state, verdict: input.verdict, allComplete });
-			this.event({
-				runId: input.runId,
-				type: "result",
-				node: operation.node,
-				operationId: operation.id,
-				agentId: operation.agent_id ?? undefined,
-				fromAgent: input.agentName ?? roleForNode(operation.node),
-				toAgent: transition.replyTo,
-				replyTo: transition.replyTo,
-				fromNode: state.currentNode,
-				toNode: transition.nextNode,
-				verdict: input.verdict?.toUpperCase(),
-				payload: { reportPath: input.reportPath ?? null, ...input.payload },
-			});
-
-			if (transition.kind === "stay") return { state, operation: this.getOperation(operation.id) };
-			if (transition.kind === "terminal") {
-				this.setState(input.runId, "terminal", transition.round, transition.fixIteration, "terminal");
-			} else if (transition.kind === "blocked") {
-				this.setState(input.runId, state.currentNode, transition.round, transition.fixIteration, "blocked");
-				this.event({
-					runId: input.runId,
-					type: "capsule",
-					fromNode: state.currentNode,
-					toAgent: "user",
-					replyTo: "user",
-					payload: { reason: transition.reason, round: transition.round, fixIteration: transition.fixIteration },
-				});
-			} else {
-				this.setState(input.runId, transition.nextNode, transition.round, transition.fixIteration, "active");
-				this.createNextOperations(state, transition.nextNode, input.payload, transition.round, transition.fixIteration);
-			}
-			this.event({
-				runId: input.runId,
-				type: "handoff",
-				fromAgent: roleForNode(state.currentNode),
-				toAgent: transition.replyTo,
-				replyTo: transition.replyTo,
-				fromNode: state.currentNode,
-				toNode: transition.nextNode,
-				payload: { reason: transition.reason, round: transition.round, fixIteration: transition.fixIteration },
-			});
+			this.db.query("UPDATE operations SET status='cancelled',last_error=?,finished_at=? WHERE id=?").run(input.error ?? null, now, operation.id);
+			if (operation.agent_id) this.db.query("UPDATE agents SET status='cancelled',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
+			this.setState(input.runId, state.currentNode, state.round, state.fixIteration, "cancelled");
+			this.event({ runId: input.runId, type: "operation_cancelled", node: operation.node, operationId: operation.id, toAgent: "user", replyTo: "user" });
 			return { state: this.getState(input.runId), operation: this.getOperation(operation.id) };
 		});
+	}
+
+	/** Completes one running operation and atomically advances the graph when its join is complete. Caller holds the transaction. */
+	private completeOperation(state: RunState, operation: OperationRow, input: { verdict?: string; payload?: Record<string, unknown>; agentName?: string; settlingWhileParked: boolean }): RecordOperationResult {
+		const now = this.iso();
+		this.db
+			.query("UPDATE operations SET status='completed',verdict=?,finished_at=?,retry_not_before=NULL WHERE id=?")
+			.run(input.verdict?.toUpperCase() ?? null, now, operation.id);
+		if (operation.agent_id) this.db.query("UPDATE agents SET status='completed',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
+
+		const allComplete = this.allCurrentComplete(state);
+		const transition = decideTransition({ ...state, verdict: input.verdict, allComplete });
+		this.event({
+			runId: state.runId,
+			type: "result",
+			node: operation.node,
+			operationId: operation.id,
+			agentId: operation.agent_id ?? undefined,
+			fromAgent: input.agentName ?? roleForNode(operation.node),
+			toAgent: transition.replyTo,
+			replyTo: transition.replyTo,
+			fromNode: state.currentNode,
+			toNode: transition.nextNode,
+			verdict: input.verdict?.toUpperCase(),
+			payload: { ...input.payload },
+		});
+
+		if (input.settlingWhileParked || transition.kind === "stay") return { state, operation: this.getOperation(operation.id) };
+		if (transition.kind === "terminal") {
+			this.setState(state.runId, "terminal", transition.round, transition.fixIteration, "terminal");
+		} else if (transition.kind === "blocked") {
+			this.setState(state.runId, state.currentNode, transition.round, transition.fixIteration, "blocked");
+			this.event({
+				runId: state.runId,
+				type: "capsule",
+				fromNode: state.currentNode,
+				toAgent: "user",
+				replyTo: "user",
+				payload: { reason: transition.reason, round: transition.round, fixIteration: transition.fixIteration },
+			});
+		} else {
+			this.setState(state.runId, transition.nextNode, transition.round, transition.fixIteration, "active");
+			this.createNextOperations(state, transition.nextNode, input.payload, transition.round, transition.fixIteration);
+		}
+		this.event({
+			runId: state.runId,
+			type: "handoff",
+			fromAgent: roleForNode(state.currentNode),
+			toAgent: transition.replyTo,
+			replyTo: transition.replyTo,
+			fromNode: state.currentNode,
+			toNode: transition.nextNode,
+			payload: { reason: transition.reason, round: transition.round, fixIteration: transition.fixIteration },
+		});
+		return { state: this.getState(state.runId), operation: this.getOperation(operation.id) };
 	}
 
 	private projectAgent(row: AgentDbRow): AgentRow {
@@ -1248,8 +1733,10 @@ export class GraphStore {
 	}
 
 	/** Applies an explicit recovery choice to the current failed or blocked operation. */
-	resolveExhaustion(runId: string, operationId: string, decision: "retry" | "defer" | "abort" | "escalate", deferredUntil?: string): RunState {
+	/** Applies defer, abort or escalate to the current failed or blocked operation; retry is the fenced runtime replacement. */
+	resolveExhaustion(runId: string, operationId: string, decision: "defer" | "abort" | "escalate", deferredUntil?: string): RunState {
 		return this.transaction(() => {
+			if ((decision as string) === "retry") throw new Error("retry a runtime attempt with retryRuntimeAttempt");
 			const state = this.getState(runId);
 			if (state.status !== "awaiting_user" && state.status !== "deferred" && state.status !== "blocked") throw new Error("run is not awaiting a recovery decision");
 			const operation = this.getOperation(operationId);
@@ -1259,15 +1746,7 @@ export class GraphStore {
 			}
 			if (state.status === "blocked" && operation.status !== "blocked") throw new Error("recovery requires an explicitly blocked operation");
 			if (operation.status !== "blocked" && operation.status !== "failed") throw new Error("operation is not awaiting recovery");
-			if (decision === "retry") {
-				this.db
-					.query("UPDATE operations SET status='pending',agent_id=NULL,report_path=NULL,verdict=NULL,transient_attempts=0,classifier_reason=NULL,last_error=NULL,retry_reason='operator-approved-retry',fallback_reason=NULL,retry_not_before=NULL,started_at=NULL,finished_at=NULL WHERE id=?")
-					.run(operationId);
-				this.setState(runId, operation.node, operation.round, operation.fix_iteration, "active");
-				this.event({ runId, type: "resume", node: operation.node, operationId, agentId: operation.agent_id ?? undefined, toAgent: roleForNode(operation.node), replyTo: roleForNode(operation.node), payload: {
-					previousAttempt: { agentId: operation.agent_id, status: operation.status, reportPath: operation.report_path, verdict: operation.verdict, error: operation.last_error },
-				} });
-			} else if (decision === "defer") {
+			if (decision === "defer") {
 				if (!deferredUntil) throw new Error("deferredUntil is required");
 				this.setState(runId, operation.node, operation.round, operation.fix_iteration, "deferred");
 				this.event({ runId, type: "deferral", node: operation.node, operationId, toAgent: roleForNode(operation.node), replyTo: roleForNode(operation.node), payload: { deferredUntil } });
@@ -1307,3 +1786,9 @@ export class GraphStore {
 		this.db.close();
 	}
 }
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function numberOr(value: unknown): number | null { return typeof value === "number" ? value : null; }
+function stringOr(value: unknown): string | null { return typeof value === "string" ? value : null; }

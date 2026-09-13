@@ -137,13 +137,13 @@ async function loadPackage(piRoot: string, packageRoot: string, agentDir: string
 		await loader.reload();
 		const loaded = loader.getExtensions();
 		expect(loaded.errors).toEqual([]);
-		expect(loaded.extensions).toHaveLength(4);
+		expect(loaded.extensions).toHaveLength(5);
 		expect(loaded.extensions.every((extension: any) => extension.resolvedPath.startsWith(packageRoot))).toBe(true);
 		const tools = loaded.extensions.flatMap((extension: any) => [...extension.tools.keys()]);
 		const commands = loaded.extensions.flatMap((extension: any) => [...extension.commands.keys()]);
 		expect(tools.filter((name: string) => name === "delegate_graph")).toHaveLength(1);
 		expect(tools.filter((name: string) => name === "questionnaire")).toHaveLength(1);
-		for (const command of ["delegate", "graph", "route", "failover"]) expect(commands.filter((name: string) => name === command)).toHaveLength(1);
+		for (const command of ["delegate", "graph", "route", "failover", "claude-headers"]) expect(commands.filter((name: string) => name === command)).toHaveLength(1);
 
 		const policyScript = join(packageRoot, "scripts", "policy-resolver.mjs");
 		const policyProbe = spawnSync("node", [policyScript, "--input", JSON.stringify({ kind: "model", model: "fixture/local", reason: "installation rehearsal" })], { cwd, env: process.env, encoding: "utf8" });

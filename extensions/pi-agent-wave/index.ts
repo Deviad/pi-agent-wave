@@ -1,10 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { chmodSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, type RuntimeAttempt, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
+import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { summarizeAcpxStream, type AcpxStreamSummary } from "./lib/acpx-render.ts";
+import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import { dirname, join } from "node:path";
-import { auditReport, formatDiagnostics } from "./scripts/report-audit.ts";
-import { writeLedgerEntry } from "./scripts/ledger.ts";
 import { renderLog, renderStatus } from "./commands.ts";
 import delegationIdentityExtension from "./delegation-identity.ts";
 import { supervisorContract } from "./contract.ts";
@@ -14,14 +15,13 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
-import { isProjectedSemanticReport, projectedAttemptFailure } from "./lib/projected-report.ts";
-import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
-import { reconcileAcpxSettlementSummary, type AcpxSettlementSummary } from "./lib/acpx-settlement.ts";
-import { validateSettlementIdentity, type SettlementIdentityExpected } from "./lib/acpx-settlement-evidence.ts";
+import { closeAgentList, noteRegisteredAttempt, reopenAgentList } from "./agent-list.ts";
+import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
+import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
 import { selectTransport } from "./scripts/delegate.ts";
-import type { VisibleTransport } from "./store.ts";
-import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, OperationStatus, ResolvedPolicy } from "./types.ts";
+import type { AgentRow, VisibleTransport } from "./store.ts";
+import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, ResolvedPolicy } from "./types.ts";
 
 const EXTENSION_DIR = dirname(new URL(import.meta.url).pathname);
 
@@ -76,6 +76,20 @@ export function parsePolicyArg(raw: string): { policy: ModelPolicyInput | null; 
 	const match = /^\s+(\S+)(?:\s+(.*))?$/.exec(rest);
 	if (!match || !match[1]) throw new Error("--policy requires a value: auto|cheap|balanced|strong|local|long-context");
 	return { policy: policyInputFromName(match[1]), task: (match[2] ?? "").trim() };
+}
+
+/** The only creation flag is --policy; it is consumed before task text. */
+export function parseDelegateArgs(raw: string): { policy: ModelPolicyInput | null; task: string } {
+	let task = raw.trim();
+	let policy: ModelPolicyInput | null = null;
+	const flag = /^--policy(?=\s|$)/.exec(task)?.[0];
+	if (!flag) return { policy, task };
+	const match = /^\s+(\S+)(?:\s+([\s\S]*))?$/.exec(task.slice(flag.length));
+	if (!match) throw new Error("--policy requires a value");
+	policy = policyInputFromName(match[1]);
+	task = (match[2] ?? "").trim();
+	if (/^--policy(?=\s|$)/.test(task)) throw new Error("duplicate --policy");
+	return { policy, task };
 }
 
 /** Selects the policy input: explicit flag wins, headless defaults auto, TUI picker with cancellation-to-auto. */
@@ -169,7 +183,7 @@ const ModelPolicySchema = Type.Union([
 ]);
 
 const GraphParams = Type.Object({
-	op: Type.Union([Type.Literal("init"), Type.Literal("next"), Type.Literal("record"), Type.Literal("status"), Type.Literal("cancel"), Type.Literal("resolve"), Type.Literal("dispatch"), Type.Literal("collect")]),
+	op: Type.Union([Type.Literal("init"), Type.Literal("next"), Type.Literal("record"), Type.Literal("status"), Type.Literal("cancel"), Type.Literal("resolve"), Type.Literal("dispatch"), Type.Literal("collect"), Type.Literal("integrate"), Type.Literal("decide"), Type.Literal("retry"), Type.Literal("watch")]),
 	runId: Type.Optional(Type.String()),
 	story: Type.Optional(Type.String()),
 	graph: Type.Optional(Type.Union([Type.Literal("build"), Type.Literal("research"), Type.Literal("operations")])),
@@ -179,27 +193,21 @@ const GraphParams = Type.Object({
 		name: Type.String({ minLength: 1 }),
 		command: Type.Object({ executable: Type.String({ minLength: 1 }), args: Type.Array(Type.String()), cwd: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
 		ownedPaths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+		checkpoint: Type.Optional(Type.String({ minLength: 1 })),
 	}, { additionalProperties: false }), { minItems: 1 })),
 	modelPolicy: Type.Optional(ModelPolicySchema),
 	policyDigest: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
 	selectedModel: Type.Optional(Type.String({ minLength: 1 })),
 	modelAttempt: Type.Optional(Type.Integer({ minimum: 0 })),
+	transientAttempt: Type.Optional(Type.Integer({ minimum: 0 })),
 	retryReason: Type.Optional(Type.String({ minLength: 1 })),
 	fallbackReason: Type.Optional(Type.String({ minLength: 1 })),
 	operationId: Type.Optional(Type.String()),
-	decision: Type.Optional(Type.Union([Type.Literal("retry"), Type.Literal("defer"), Type.Literal("abort"), Type.Literal("escalate")])),
+	decision: Type.Optional(Type.Union([Type.Literal("retry"), Type.Literal("defer"), Type.Literal("abort"), Type.Literal("escalate"), Type.Literal("accepted"), Type.Literal("rejected")])),
+	reason: Type.Optional(Type.String({ minLength: 1 })),
 	deferredUntil: Type.Optional(Type.String({ minLength: 1 })),
-	status: Type.Optional(
-		Type.Union([
-			Type.Literal("running"),
-			Type.Literal("completed"),
-			Type.Literal("failed"),
-			Type.Literal("blocked"),
-			Type.Literal("cancelled"),
-		]),
-	),
+	status: Type.Optional(Type.Literal("cancelled")),
 	verdict: Type.Optional(Type.String()),
-	reportPath: Type.Optional(Type.String()),
 	error: Type.Optional(Type.String()),
 	agentId: Type.Optional(Type.String()),
 	agentName: Type.Optional(Type.String()),
@@ -250,6 +258,254 @@ function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
  * policy and attempt counters stay untouched, and the reason text is permanent in retry.ts, so an
  * unlaunched command never consumes the same-model budget or advances the frozen chain.
  */
+/**
+ * Materializes the run's evidence for a runtime-v1 worker the way legacy workers find report files on
+ * disk: the derived ledger and every accepted answer, written read-only into the attempt's private run
+ * directory. Without this, review, test and audit workers received only a one-line task and no plan,
+ * implementation answer or ledger (2026-09-12 build measurement: the auditor returned FAIL).
+ */
+export function materializeRuntimeEvidence(graphStore: GraphStore, runId: string, privateRunDir: string): { ledgerPath: string; answers: { node: string; path: string }[]; taskSuffix: string } {
+	const dir = join(privateRunDir, "runtime-evidence");
+	mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700);
+	const ledgerPath = join(dir, "ledger.json");
+	writeFileSync(ledgerPath, `${JSON.stringify(graphStore.runtimeLedger(runId), null, 2)}\n`, { mode: 0o600 }); chmodSync(ledgerPath, 0o600);
+	const answersDir = join(dir, "answers");
+	mkdirSync(answersDir, { recursive: true, mode: 0o700 }); chmodSync(answersDir, 0o700);
+	const content = new RuntimeContentStore(graphStore.dbPath);
+	const answers: { node: string; path: string }[] = [];
+	for (const operation of graphStore.operations(runId)) {
+		if (operation.status !== "completed") continue;
+		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
+		const answer = attempt?.decision?.decision === "accepted" ? attempt.candidate?.answer ?? null : null;
+		if (!answer || answer.bytes === 0) continue;
+		const name = `${operation.node}-round${operation.round}-fix${operation.fix_iteration}${operation.slice_id ? `-${operation.slice_id.replace(/[^A-Za-z0-9._-]/g, "_")}` : ""}.md`;
+		const path = join(answersDir, name);
+		writeFileSync(path, content.read(answer, 16 * 1024 * 1024), { mode: 0o600 }); chmodSync(path, 0o600);
+		answers.push({ node: operation.node, path });
+	}
+	const listed = answers.length ? answers.map((item) => `${item.node}: ${item.path}`).join("; ") : "none yet";
+	const taskSuffix = `\n\nRun evidence, derived and read-only (never modify these files): the run ledger is ${ledgerPath}; the accepted answers of completed operations are ${listed}. Changes already integrated from accepted implementation candidates are present in the workspace.\n`;
+	return { ledgerPath, answers, taskSuffix };
+}
+
+export interface WatchedAgent {
+	readonly operationId: string;
+	readonly node: string;
+	readonly agentName: string | null;
+	readonly transport: string | null;
+	readonly processState: string | null;
+	readonly acceptance: string | null;
+	readonly streamPath: string | null;
+	readonly lastActivity: string | null;
+	readonly recent: readonly string[];
+	readonly prompts: number;
+	readonly toolCalls: number;
+	readonly textBytes: number;
+}
+
+export interface WatchView { readonly runId: string; readonly status: string; readonly node: string; readonly agents: readonly WatchedAgent[] }
+
+/** The last bytes of a file, so a long stream is summarized without reading all of it. */
+function readTail(path: string, limit: number): string {
+	const size = statSync(path).size;
+	const start = Math.max(0, size - limit);
+	const fd = openSync(path, "r");
+	try {
+		const buffer = Buffer.alloc(size - start);
+		readSync(fd, buffer, 0, buffer.length, start);
+		const text = buffer.toString("utf8");
+		return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
+	} finally { closeSync(fd); }
+}
+
+/**
+ * A read-only view of what each running worker is doing right now, rendered from the ACPX stream the runtime
+ * is retaining for the attempt. It reads the private files, decides nothing, and is consulted by no gate.
+ */
+export function watchRun(graphStore: GraphStore, runId: string): WatchView {
+	const state = graphStore.getState(runId);
+	const agents = graphStore.agents(runId);
+	const rows: WatchedAgent[] = [];
+	for (const operation of graphStore.operations(runId, true)) {
+		if (operation.status !== "running") continue;
+		const agent = agents.find((candidate) => candidate.id === operation.agent_id);
+		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
+		let streamPath: string | null = null;
+		let summary: AcpxStreamSummary | null = null;
+		if (agent?.acpx_cancel_script) {
+			const candidate = join(dirname(agent.acpx_cancel_script), "runtime-output", "worker.stdout.ndjson");
+			if (existsSync(candidate)) { streamPath = candidate; summary = summarizeAcpxStream(readTail(candidate, 256 * 1024)); }
+		}
+		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt?.processState ?? null, acceptance: attempt?.acceptance ?? null, streamPath, lastActivity: summary?.lastActivity ?? null, recent: summary?.recent ?? [], prompts: summary?.prompts ?? 0, toolCalls: summary?.toolCalls ?? 0, textBytes: summary?.textBytes ?? 0 });
+	}
+	return { runId, status: state.status, node: state.currentNode, agents: rows };
+}
+
+export function renderWatch(view: WatchView): string {
+	const lines = [`run ${view.runId} | node=${view.node} | status=${view.status}`];
+	if (!view.agents.length) lines.push("(no running workers)");
+	for (const agent of view.agents) {
+		lines.push(`${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
+		for (const recent of agent.recent.slice(0, -1)) lines.push(`    ${recent}`);
+	}
+	return lines.join("\n");
+}
+
+/** The follow view: the watch overview redrawn in a widget while the operator holds it open, with number keys that focus a worker. */
+export function renderFollow(view: WatchView): string[] {
+	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | keys: 1-9 focus worker, r refresh, q close`];
+	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
+	view.agents.forEach((agent, index) => {
+		lines.push(`${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
+		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
+	});
+	return lines;
+}
+
+const FOLLOW_WIDGET = "delegate-graph-watch";
+let followSession: { runId: string; timer: ReturnType<typeof setInterval> | null; unsubscribe: () => void; ctx: ExtensionContext } | null = null;
+
+function stopFollow(reason: string): void {
+	const session = followSession;
+	if (!session) return;
+	followSession = null;
+	if (session.timer) clearInterval(session.timer);
+	session.unsubscribe();
+	session.ctx.ui.setWidget(FOLLOW_WIDGET, undefined);
+	session.ctx.ui.notify(`watch ${session.runId} closed (${reason})`, "info");
+}
+
+/**
+ * Keeps the watch overview on screen and current while the operator holds it open. The redraw timer exists
+ * only for that time: it stops when the run leaves `active`, when the operator presses q, or when a new
+ * follow replaces it. Number keys focus a Herdr worker; headless workers have no pane to focus.
+ */
+/** The redraw interval for interactive views, from the environment with a floor so a typo cannot spin the terminal. */
+export function watchIntervalMs(): number {
+	const interval = Number.parseInt(process.env.PI_GRAPH_WATCH_INTERVAL_MS ?? "2000", 10);
+	return Number.isFinite(interval) && interval >= 50 ? interval : 2000;
+}
+
+export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore: GraphStore, runId: string, intervalMs: number): void {
+	stopFollow("replaced");
+	closeAgentList("replaced by watch --follow");
+	graphStore.getRun(runId);
+	let latest: WatchView = watchRun(graphStore, runId);
+	const draw = () => {
+		latest = watchRun(graphStore, runId);
+		ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest));
+		if (latest.status !== "active" && followSession?.timer) { clearInterval(followSession.timer); followSession.timer = null; }
+	};
+	const unsubscribe = ctx.ui.onTerminalInput((data) => {
+		if (data === "q" || data === "\u001b") { stopFollow("closed by operator"); return { consume: true }; }
+		if (data === "r") { draw(); return { consume: true }; }
+		if (/^[1-9]$/.test(data)) {
+			const agent = latest.agents[Number(data) - 1];
+			if (!agent) { ctx.ui.notify(`no worker ${data} in the watch view`, "warning"); return { consume: true }; }
+			if (agent.transport !== "herdr" || !agent.agentName) { ctx.ui.notify(`${agent.agentName ?? agent.operationId} is a headless worker; it has no pane to focus`, "warning"); return { consume: true }; }
+			focusRegisteredAgent(graphStore.agents(runId), agent.agentName, process.env.HERDR_ENV === "1", executor(pi)).catch((error: unknown) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+			return { consume: true };
+		}
+		return undefined;
+	});
+	const timer = setInterval(draw, intervalMs);
+	timer.unref?.();
+	followSession = { runId, timer, unsubscribe, ctx };
+	draw();
+}
+
+function runtimeSettlementFile(privateRunDir: string): string | undefined {
+	const name = readdirSync(privateRunDir).find((entry) => entry.startsWith("runtime-settlement-") && entry.endsWith(".json"));
+	return name ? join(privateRunDir, name) : undefined;
+}
+
+function settlementFromEvidence(attemptKey: string, evidencePath: string): RuntimeSettlementInput {
+	const evidence: unknown = JSON.parse(readFileSync(evidencePath, "utf8"));
+	if (!isRecord(evidence) || evidence.resultContract !== "runtime-v1" || evidence.attemptKey !== attemptKey) throw new Error("runtime settlement evidence does not belong to this attempt");
+	return {
+		attemptKey,
+		outcome: parseRuntimeOutcome(evidence.outcome),
+		candidate: evidence.candidate === null || evidence.candidate === undefined ? undefined : parseRuntimeCandidate(evidence.candidate),
+		observation: evidence.observation === null || evidence.observation === undefined ? undefined : parseRuntimeObservation(evidence.observation),
+	};
+}
+
+/**
+ * Settles a runtime-v1 attempt from durable evidence. The process outcome and retained candidate are
+ * facts written before any close or cleanup; a failure after them is reported, never used to discard
+ * the candidate, and acceptance remains an explicit op=decide call.
+ */
+async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, runId: string, operationId: string, agent: AgentRow, privateRunDir: string, progress: (kind: string, details: Record<string, unknown>) => void): Promise<Record<string, unknown>> {
+	const attemptKey = agent.acpx_attempt_key;
+	if (!attemptKey) throw new Error(`operation ${operationId} has no runtime attempt key`);
+	const registered = graphStore.runtimeAttempt(attemptKey);
+	const postSettlementFailures: string[] = [];
+	const configurationSelfWrites: Record<string, unknown>[] = [];
+	let captureRetainedPath: string | undefined;
+	let cleanupEvidencePath: string | undefined;
+	let settlementEvidencePath = registered.outcome ? undefined : runtimeSettlementFile(privateRunDir);
+	if (!registered.outcome && !settlementEvidencePath) {
+		const execute = executor(pi);
+		const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
+		const waited = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", agent.transport, "--", "wait", privateRunDir, agent.name]);
+		if (waited.exitCode !== 0) {
+			const reason = (waited.stderr || waited.stdout || "worker wait failed").trim();
+			settlementEvidencePath = runtimeSettlementFile(privateRunDir);
+			if (!settlementEvidencePath) {
+				const diagnostics = retainedFailureDiagnostics(privateRunDir);
+				const attempt = graphStore.settleRuntimeAttempt({ attemptKey, outcome: { kind: "failed", exitCode: null, error: diagnostics ? `${reason}\nretained worker diagnostics: ${diagnostics}` : reason } });
+				progress("runtime_attempt_failed", { runId, operationId, agentName: agent.name, attemptKey, diagnosticsPath: diagnostics ?? null });
+				return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: null, reason, diagnosticsPath: diagnostics ?? null, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
+			}
+			postSettlementFailures.push(reason);
+		} else {
+			const waitedValue: unknown = JSON.parse(waited.stdout);
+			if (!isRecord(waitedValue) || typeof waitedValue.settlementEvidencePath !== "string") throw new Error("runtime wait returned invalid settlement");
+			settlementEvidencePath = waitedValue.settlementEvidencePath;
+			cleanupEvidencePath = typeof waitedValue.cleanupEvidencePath === "string" ? waitedValue.cleanupEvidencePath : undefined;
+			if (Array.isArray(waitedValue.postSettlementFailures)) postSettlementFailures.push(...waitedValue.postSettlementFailures.filter((item): item is string => typeof item === "string"));
+			if (Array.isArray(waitedValue.configurationSelfWrites)) configurationSelfWrites.push(...waitedValue.configurationSelfWrites.filter(isRecord));
+			if (typeof waitedValue.captureRetainedPath === "string") captureRetainedPath = waitedValue.captureRetainedPath;
+		}
+	}
+	const attempt = registered.outcome ? registered : graphStore.settleRuntimeAttempt(settlementFromEvidence(attemptKey, required(settlementEvidencePath, "runtime settlement evidence")));
+	progress("runtime_attempt_settled", { runId, operationId, agentName: agent.name, attemptKey, processState: attempt.processState, candidate: attempt.candidate?.kind ?? null, acceptance: attempt.acceptance, postSettlementFailures: postSettlementFailures.length, configurationSelfWrites: configurationSelfWrites.length });
+	return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: attempt.candidate?.kind ?? null, ...decisionBrief(graphStore, runId, operationId, attempt), settlementEvidencePath: settlementEvidencePath ?? null, cleanupEvidencePath: cleanupEvidencePath ?? null, captureRetainedPath: captureRetainedPath ?? null, postSettlementFailures, configurationSelfWrites, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
+}
+
+const ANSWER_PREVIEW_BYTES = 16 * 1024;
+const VERDICT_NODES: Partial<Record<string, readonly string[]>> = { review: ["PASS", "FAIL"], test: ["GREEN", "NOT_OK"], audit: ["PASS", "FAIL"], source_search: ["DONE", "BLOCKED"], thinker_synthesize: ["DONE"] };
+
+/**
+ * What the supervisor needs in order to decide a settled candidate, so it never has to find the answer on disk:
+ * the retained answer (bounded), the answer's final VERDICT line when the node carries one, and a template of
+ * the op=decide call for this node. It reads retained content and graph state; it decides nothing.
+ */
+export function decisionBrief(graphStore: GraphStore, runId: string, operationId: string, attempt: RuntimeAttempt): Record<string, unknown> {
+	const operation = graphStore.getOperation(operationId);
+	const reference = attempt.candidate?.answer ?? null;
+	let answer: string | null = null;
+	if (reference && reference.bytes > 0) answer = new RuntimeContentStore(graphStore.dbPath).read(reference, ANSWER_PREVIEW_BYTES).toString("utf8");
+	const verdictLines = answer ? [...answer.matchAll(/^\s*VERDICT:\s*([A-Z_]+)\s*$/gm)] : [];
+	const verdict = verdictLines.length ? verdictLines[verdictLines.length - 1]![1]! : null;
+	const expectedVerdicts = VERDICT_NODES[operation.node] ?? null;
+	const needsSlices = operation.node === "thinker_plan" || operation.node === "thinker_split";
+	const decide: Record<string, unknown> = { op: "decide", runId, operationId, decision: "accepted | rejected", reason: "<required: why the answer is accepted or rejected>" };
+	if (expectedVerdicts) decide.verdict = verdict ?? `<the answer has no VERDICT line; expected one of ${expectedVerdicts.join("|")}>`;
+	if (needsSlices) decide.payload = { slices: [{ id: "<slug>", name: "<short name>", task: "<what one worker does>", ...(operation.node === "thinker_plan" ? { ownedPaths: ["<paths this slice may change; disjoint across slices>"] } : {}) }] };
+	const kind = attempt.candidate?.kind ?? null;
+	const note = !attempt.candidate
+		? "No candidate was retained; a failed or interrupted attempt is replaced with op=retry."
+		: needsSlices
+			? "Derive payload.slices from the retained answer; each slice becomes one parallel worker at the next node."
+			: kind === "coding" || kind === "operational"
+				? "Call op=integrate for this operationId before op=decide accepted."
+				: expectedVerdicts && !verdict
+					? "The answer lacks the VERDICT line this node requires; decide rejected with that reason or supply the verdict the answer supports."
+					: "Read the retained answer, then op=decide.";
+	return { answer, answerBytes: reference?.bytes ?? 0, answerTruncated: (reference?.bytes ?? 0) > ANSWER_PREVIEW_BYTES, verdict, decide, note };
+}
+
 function settleUnlaunchedOperation(graphStore: GraphStore, runId: string, operation: OperationRow, status: "failed" | "cancelled"): Record<string, unknown> {
 	if (operation.status !== "pending" && operation.status !== "running") return { settled: false, reason: `operation already ${operation.status}` };
 	// Checked before anything is written: a mistyped runId is a refusal, not a place to put a file.
@@ -277,85 +533,6 @@ function settleUnlaunchedOperation(graphStore: GraphStore, runId: string, operat
 	return { settled: true, recorded: status, reason, diagnosticsPath, state: recorded.state, operation: recorded.operation };
 }
 
-interface AcpxRegistrationPayload {
-	acpAgent: AcpAgent;
-	acpxRecordId: string;
-	acpxSessionId: string;
-	acpxState: AcpxState;
-	acpxAttemptKey: string;
-	agentFsSessionId: string;
-	agentFsDbPath: string;
-	herdrPaneId?: string;
-	acpxCancelScript: string;
-}
-
-function acpxRegistrationPayload(payload: unknown, transport: VisibleTransport): AcpxRegistrationPayload {
-	if (!isRecord(payload) || !isRecord(payload.acpx)) throw new Error("running operation requires payload.acpx provenance");
-	const acpx = payload.acpx;
-	const text = (key: string): string => {
-		const value = acpx[key];
-		if (typeof value !== "string" || !value.trim()) throw new Error(`running operation requires payload.acpx.${key}`);
-		return value;
-	};
-	const herdrPaneId = transport === "herdr" ? text("herdrPaneId") : undefined;
-	if (transport === "headless" && acpx.herdrPaneId !== undefined && acpx.herdrPaneId !== null) throw new Error("headless ACPX provenance cannot contain herdrPaneId");
-	return {
-		acpAgent: parseAcpAgent(acpx.agent),
-		acpxRecordId: text("recordId"),
-		acpxSessionId: text("sessionId"),
-		acpxState: parseAcpxState(acpx.state),
-		acpxAttemptKey: text("attemptKey"),
-		agentFsSessionId: text("agentFsSessionId"),
-		agentFsDbPath: text("agentFsDbPath"),
-		herdrPaneId,
-		acpxCancelScript: text("acpxCancelScript"),
-	};
-}
-
-interface SettlementEvidence {
-	path: string;
-	value: Record<string, unknown>;
-	summary: Omit<AcpxSettlementSummary, "reportValid" | "graphStatus">;
-}
-
-function acpxSettlementEvidence(payload: unknown): SettlementEvidence {
-	if (!isRecord(payload) || typeof payload.acpxSettlementEvidencePath !== "string" || !payload.acpxSettlementEvidencePath.trim()) {
-		throw new Error("completed operation requires payload.acpxSettlementEvidencePath");
-	}
-	const path = payload.acpxSettlementEvidencePath;
-	let parsed: unknown;
-	try { parsed = JSON.parse(readFileSync(path, "utf8")); }
-	catch (error) { throw new Error(`settlement evidence unavailable: ${error instanceof Error ? error.message : String(error)}`); }
-	if (!isRecord(parsed) || parsed.schemaVersion !== 1) throw new Error("invalid settlement evidence schema");
-	const boolean = (key: string): boolean => {
-		if (typeof parsed[key] !== "boolean") throw new Error(`settlement evidence requires ${key}`);
-		return parsed[key];
-	};
-	const number = (key: string): number => {
-		if (typeof parsed[key] !== "number" || !Number.isInteger(parsed[key])) throw new Error(`settlement evidence requires ${key}`);
-		return parsed[key];
-	};
-	const terminalKind = parsed.terminalKind;
-	if (terminalKind !== "completed" && terminalKind !== "cancelled" && terminalKind !== "failed") throw new Error("invalid settlement evidence terminalKind");
-	const transport = parseWorkerTransportKind(parsed.transport ?? "herdr");
-	return {
-		path,
-		value: parsed,
-		summary: {
-			processExitCode: number("processExitCode"),
-			terminalKind,
-			acpxState: parseAcpxState(parsed.acpxState),
-			transport,
-			presentationVerified: transport === "headless" ? boolean("presentationVerified") : undefined,
-			herdrVisible: transport === "herdr" ? boolean("herdrVisible") : undefined,
-			identityMatches: boolean("identityMatches"),
-			ledgerValid: boolean("ledgerValid"),
-			agentFsExported: boolean("agentFsExported"),
-			agentFsViolationCount: number("agentFsViolationCount"),
-		},
-	};
-}
-
 function slug(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 36) || "delegate";
 }
@@ -380,13 +557,11 @@ function executor(pi: ExtensionAPI, cwd?: string): CommandExecutor {
 	};
 }
 
-export async function notifyExhausted(pi: ExtensionAPI, runId: string): Promise<void> {
-	const message = `Delegate Graph ${runId} exhausted transient retries and needs your decision.`;
-	await Promise.all([
-		pi.exec("afplay", ["/System/Library/Sounds/Glass.aiff"]),
-		pi.exec("say", [message]),
-		pi.exec("osascript", ["-e", `display alert "Delegate Graph" message ${JSON.stringify(message)}`]),
-	]);
+export function notifyExhausted(ctx: ExtensionContext, runId: string): void {
+	// In-session only: the former afplay/say/osascript trio opened a modal macOS alert
+	// that blocked headless gate runs until dismissed.
+	if (ctx.mode !== "tui") return;
+	ctx.ui.notify(`Delegate Graph ${runId} exhausted transient retries and needs your decision.`, "warning");
 }
 
 export async function resolveUserDecision(
@@ -396,11 +571,11 @@ export async function resolveUserDecision(
 	runId: string,
 	operationId: string,
 ): Promise<Record<string, unknown>> {
-	await notifyExhausted(pi, runId);
+	notifyExhausted(ctx, runId);
 	if (ctx.mode !== "tui") return { action: "awaiting_user", runId, operationId };
 	const choice = await ctx.ui.select("Delegate Graph retries exhausted", ["Retry now", "Defer", "Abort", "Escalate"]);
 	if (!choice) return { action: "awaiting_user", runId, operationId };
-	if (choice === "Retry now") return { action: "retry", state: store.resolveExhaustion(runId, operationId, "retry") };
+	if (choice === "Retry now") return { action: "retry", state: store.retryRuntimeAttempt({ runId, operationId, approved: true }).state };
 	if (choice === "Abort") return { action: "abort", state: store.resolveExhaustion(runId, operationId, "abort") };
 	if (choice === "Escalate") return { action: "escalate", state: store.resolveExhaustion(runId, operationId, "escalate") };
 
@@ -428,13 +603,17 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 		name: "delegate_graph",
 		label: "Delegate Graph",
 		description:
-			"Operate the durable delegation state machine. Initialize a build, research, or operations run, read pending graph operations with their frozen model route, record dispatches/results, or inspect state. A running dispatch echoes modelPolicy and policyDigest from op=next plus selectedModel and modelAttempt; same-model retryReason and cross-model fallbackReason remain distinct. Graph edges, joins, retry caps, review/test loops, and evidence gates are enforced by the extension.",
+			"Operate the durable delegation state machine. Initialize a build, research, or operations run, read pending graph operations with their frozen model route, dispatch and collect workers, decide their retained answers, or inspect state. A running dispatch echoes modelPolicy and policyDigest from op=next plus selectedModel and modelAttempt; same-model retryReason and cross-model fallbackReason remain distinct. Graph edges, joins, retry caps, review/test loops, and evidence gates are enforced by the extension.",
 		promptSnippet: "Use delegate_graph for every /delegate graph transition; never invent or skip edges.",
 		promptGuidelines: [
-			"Call op=next before dispatch and op=record for every pending/running/completed/failed operation.",
+			"Per operation: op=next, op=dispatch, op=collect, op=decide, then op=next again. op=record is only for status=cancelled.",
+			"op=collect returns the retained answer, its VERDICT line and a decide template: reuse that template's operationId, verdict and payload shape in op=decide.",
+			"op=decide takes decision accepted or rejected plus a reason; thinker_plan and thinker_split also need payload.slices (id, name, task, ownedPaths on the build graph); coding and operational candidates need op=integrate first.",
+			"op=resolve (retry, defer, abort, escalate) is only for a parked run (awaiting_user, deferred, blocked); it is refused while the run is active.",
 			"Pass the frozen modelPolicy, policyDigest, route model, and model attempt from op=next unchanged on every dispatch; never open a picker during resume.",
 			"Parallelize only operations returned together at a fan-out node; wait for the join before advancing.",
 			"Opaque delegates are never polled. Follow retry not-before timestamps and user-decision states exactly.",
+			"On runtime-v1 runs a failed or interrupted attempt is replaced only through op=retry, which applies the frozen same-model budget and chain fallback; an exited attempt must be decided with op=decide.",
 		],
 		parameters: GraphParams,
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
@@ -456,6 +635,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					return textResult({ state, next: graphStore.next(state.runId) });
 				}
 				const runId = required(params.runId, "runId");
+				graphStore.getRun(runId);
 				if (params.op === "next") {
 					const next = graphStore.next(runId);
 					progress("operations_ready", { runId, operationCount: next.operations.length, status: next.state.status });
@@ -466,9 +646,15 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					progress("status", { runId, status: state.status, node: state.currentNode });
 					return textResult(renderStatus(graphStore, runId));
 				}
+				if (params.op === "watch") {
+					const view = watchRun(graphStore, runId);
+					progress("watch", { runId, status: view.status, node: view.node, agents: view.agents.map((agent) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, lastActivity: agent.lastActivity })) });
+					return textResult(view);
+				}
 				if (params.op === "dispatch") {
 					const operationId = required(params.operationId, "operationId");
 					const next = graphStore.next(runId);
+					if (next.state.status !== "active") throw new Error(`run ${runId} is ${next.state.status}; resolve it before dispatching operations`);
 					const operation = next.operations.find((candidate) => candidate.id === operationId);
 					if (!operation) throw new Error(`pending operation ${operationId} not found`);
 					if (!operation.route) throw new Error(`operation ${operationId} has no frozen route`);
@@ -486,11 +672,12 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					if (initialized.exitCode !== 0) throw new Error(initialized.stderr || initialized.stdout || "headless init failed");
 					const privateRunDir = initialized.stdout.trim();
 					const taskFile = join(privateRunDir, "task.md");
-					const reportPath = join(privateRunDir, `report-${operationId}.json`);
-					writeFileSync(taskFile, `${operation.task}\n`, { mode: 0o600 });
+					const evidence = materializeRuntimeEvidence(graphStore, runId, privateRunDir);
+					writeFileSync(taskFile, `${operation.task}\n${evidence.taskSuffix}`, { mode: 0o600 });
 					chmodSync(taskFile, 0o600);
+					progress("runtime_evidence_materialized", { runId, operationId, ledgerPath: evidence.ledgerPath, answers: evidence.answers.length });
 					const role = roleForNode(operation.node);
-					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", operation.owned_paths_json, "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--report", reportPath, "--task-file", taskFile];
+					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
 					if (operation.command_json) startArgs.push("--command-json", operation.command_json);
 					const started = await execute(process.execPath, startArgs);
 					if (started.exitCode !== 0) {
@@ -498,7 +685,8 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						const preflight = /worker preflight:/.exec(startOutput);
 						if (preflight) {
 							const reason = startOutput.slice(preflight.index).split("\n")[0].trim();
-							const blocked = graphStore.record({ runId, operationId, status: "failed", error: reason });
+							// No worker was registered, so the launch failure is classified through the fenced replacement path.
+							const blocked = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
 							progress("dispatch_blocked_by_preflight", { runId, operationId, reason, status: blocked.state.status, modelAttempt: blocked.operation.model_attempt });
 							return textResult({
 								runId,
@@ -523,112 +711,69 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const agentName = launchText("agent");
 					const sessionId = launchText("acpx-session");
 					const agentId = graphStore.registerAgent({ runId, name: agentName, node: operation.node, role, transport: workerTransport, herdrAgent: workerTransport === "herdr" ? launchText("agent") : undefined, tabId: workerTransport === "herdr" ? launchText("tab") : undefined, herdrPaneId: workerTransport === "herdr" ? launchText("pane") : undefined, policyDigest: next.policy.digest, selectedModel, modelAttempt: operation.model_attempt, acpAgent: parseAcpAgent(launchText("acp-agent")), acpxRecordId: sessionId, acpxSessionId: sessionId, acpxState: "alive", acpxAttemptKey: launchText("acpx-attempt-key"), agentFsSessionId: launchText("agentfs-session"), agentFsDbPath: launchText("agentfs-db"), acpxCancelScript: launchText("acpx-cancel-script"), currentTask: operation.task });
-					const result = graphStore.record({ runId, operationId, status: "running", agentId, agentName, transport: workerTransport, modelPolicy: next.policy.input, policyDigest: next.policy.digest, selectedModel, modelAttempt: operation.model_attempt });
-					progress("operation_started", { runId, operationId, agentName, transport: workerTransport, status: result.state.status });
-					return textResult({ state: result.state, operation: result.operation, agentId, agentName, transport: workerTransport, reportPath, launch });
+					{
+						// The launch identity is re-derived from frozen graph facts and must reproduce the worker's attempt key.
+						const identity = resolveAcpxPlan({ runId, operationId, role, modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts, selectedModel, transport: workerTransport, herdrAgent: workerTransport === "herdr" ? launchText("agent") : undefined, herdrTabId: workerTransport === "herdr" ? launchText("tab") : undefined, herdrPaneId: workerTransport === "herdr" ? launchText("pane") : undefined });
+						if (identity.attemptKey !== launchText("acpx-attempt-key")) throw new Error("launched worker attempt key does not match the frozen operation identity");
+						const attempt = graphStore.beginRuntimeAttempt({ identity, sessionId, requestId: null, policyDigest: next.policy.digest, agentId });
+						progress("runtime_attempt_registered", { runId, operationId, agentName, transport: workerTransport, attemptKey: attempt.attemptKey });
+						// The worker is registered; presentation runs after that fact and a UI failure cannot reclassify the dispatch.
+						try {
+							if (ctx.mode === "tui") stopFollow("replaced by agent list");
+							noteRegisteredAttempt(graphStore, ctx, { attemptKey: attempt.attemptKey, runId, operationId }, watchIntervalMs());
+						} catch (error) {
+							ctx.ui.notify(`agent list unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+						}
+						return textResult({ state: graphStore.getState(runId), operation: graphStore.getOperation(operationId), attempt, agentId, agentName, transport: workerTransport, launch });
+					}
 				}
 				if (params.op === "collect") {
 					const operationId = required(params.operationId, "operationId");
 					const operation = graphStore.getOperation(operationId);
 					const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
-					if (!agent) {
-						const settled = settleUnlaunchedOperation(graphStore, runId, operation, "failed");
-						progress("unlaunched_operation_settled", { runId, operationId, via: "collect", recorded: settled.recorded ?? operation.status, reason: settled.reason });
-						return textResult(settled);
-					}
+					if (!agent) throw new Error(`operation ${operationId} has no registered runtime attempt to collect`);
 					if (!agent.acpx_cancel_script) throw new Error(`operation ${operationId} has no collectable worker`);
 					const privateRunDir = dirname(dirname(dirname(agent.acpx_cancel_script)));
-					const existingSettlement = readdirSync(privateRunDir).find((name) => name.startsWith("settlement-") && name.endsWith(".json"));
-					let settlement: Record<string, unknown>;
-					let settlementEvidencePath: string;
-					let cleanupEvidencePath: string | undefined;
-					if (existingSettlement) {
-						settlementEvidencePath = join(privateRunDir, existingSettlement);
-						settlement = JSON.parse(readFileSync(settlementEvidencePath, "utf8"));
-						cleanupEvidencePath = typeof settlement.cleanupEvidencePath === "string" ? settlement.cleanupEvidencePath : undefined;
-					} else {
-						const execute = executor(pi);
-						const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
-						const waited = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", agent.transport, "--", "wait", privateRunDir, agent.name]);
-						if (waited.exitCode !== 0) {
-							const reason = (waited.stderr || waited.stdout || "worker wait failed").trim();
-							const diagnostics = retainedFailureDiagnostics(privateRunDir);
-							let recorded;
-							try {
-								recorded = graphStore.record({
-									runId,
-									operationId,
-									status: "failed",
-									agentId: agent.id ?? undefined,
-									agentName: agent.name,
-									error: diagnostics ? `${reason}\nretained worker diagnostics: ${diagnostics}` : reason,
-								});
-							} catch (recordError) {
-								throw new Error(`${reason}${diagnostics ? `\nretained worker diagnostics: ${diagnostics}` : ""}\nand the attempt could not be recorded: ${String(recordError)}`);
-							}
-							progress("worker_attempt_failed", { runId, operationId, agentName: agent.name, diagnosticsPath: diagnostics ?? null, status: recorded.state.status });
-							return textResult({
-								runId,
-								operationId,
-								agentName: agent.name,
-								settled: false,
-								recorded: "failed",
-								reason,
-								diagnosticsPath: diagnostics ?? null,
-								state: recorded.state,
-								operation: recorded.operation,
-								retry: recorded.retry ?? null,
-							});
-						}
-						const waitedValue: unknown = JSON.parse(waited.stdout);
-						if (!isRecord(waitedValue) || typeof waitedValue.settlementEvidencePath !== "string") throw new Error("headless wait returned invalid settlement");
-						settlementEvidencePath = waitedValue.settlementEvidencePath;
-						cleanupEvidencePath = typeof waitedValue.cleanupEvidencePath === "string" ? waitedValue.cleanupEvidencePath : undefined;
-						settlement = JSON.parse(readFileSync(settlementEvidencePath, "utf8"));
-					}
-					const reportPath = typeof settlement.reportPath === "string" ? settlement.reportPath : operation.report_path;
-					let verdict: string | null = null;
-					let report: unknown;
-					if (reportPath && existsSync(reportPath)) {
-						report = JSON.parse(readFileSync(reportPath, "utf8"));
-						if (isRecord(report) && typeof report.verdict === "string") verdict = report.verdict;
-					}
-					const projectedFailure = projectedAttemptFailure(operation.node, report);
-					if (projectedFailure) {
-						const diagnostics = retainedFailureDiagnostics(privateRunDir);
-						const recorded = graphStore.record({
-							runId,
-							operationId,
-							status: "failed",
-							agentId: agent.id ?? undefined,
-							agentName: agent.name,
-							error: diagnostics ? `${projectedFailure}\nretained worker diagnostics: ${diagnostics}` : projectedFailure,
-						});
-						progress("worker_attempt_failed", { runId, operationId, agentName: agent.name, reason: "report-missing", diagnosticsPath: diagnostics ?? null, status: recorded.state.status });
-						return textResult({
-							runId,
-							operationId,
-							agentName: agent.name,
-							settled: false,
-							recorded: "failed",
-							reason: projectedFailure,
-							verdict: null,
-							reportPath,
-							settlementEvidencePath,
-							cleanupEvidencePath,
-							diagnosticsPath: diagnostics ?? null,
-							state: recorded.state,
-							operation: recorded.operation,
-							retry: recorded.retry ?? null,
-						});
-					}
-					progress("worker_settled", { runId, operationId, agentName: agent.name, verdict });
-					return textResult({ runId, operationId, agentName: agent.name, reportPath, settlementEvidencePath, cleanupEvidencePath, verdict, settlement });
+					return textResult(await collectRuntimeAttempt(graphStore, pi, runId, operationId, agent, privateRunDir, progress));
+				}
+				if (params.op === "integrate") {
+					const operationId = required(params.operationId, "operationId");
+					const attempt = graphStore.runtimeAttemptByOperation(operationId);
+					if (!attempt) throw new Error(`operation ${operationId} has no registered runtime attempt`);
+					const manifest = attempt.observation?.manifest ?? null;
+					if (!manifest) throw new Error("integration requires a settled coding candidate with an observed staging manifest");
+					const direction = params.decision === "rejected" ? "rollback" : "apply";
+					const status = graphStore.applyRuntimeIntegration(attempt.attemptKey, manifest, direction);
+					progress("runtime_integration", { runId, operationId, attemptKey: attempt.attemptKey, direction, state: status.state });
+					return textResult({ runId, operationId, attemptKey: attempt.attemptKey, integration: status });
+				}
+				if (params.op === "decide") {
+					const operationId = required(params.operationId, "operationId");
+					const attempt = graphStore.runtimeAttemptByOperation(operationId);
+					if (!attempt) throw new Error(`operation ${operationId} has no registered runtime attempt`);
+					if (params.decision === "retry" || params.decision === "defer" || params.decision === "abort" || params.decision === "escalate") throw new Error(`op=decide takes accepted or rejected with a reason; ${params.decision} is an op=resolve choice for a parked run`);
+					const decision = parseRuntimeDecisionKind(params.decision);
+					const decided = graphStore.decideRuntimeCandidate({ attemptKey: attempt.attemptKey, decision, reason: required(params.reason, "reason"), verdict: params.verdict, payload: params.payload });
+					progress("runtime_candidate_decided", { runId, operationId, decision, status: decided.state.status, node: decided.state.currentNode });
+					return textResult({ runId, operationId, ...decided, next: decided.state.status === "active" ? graphStore.next(runId) : null });
+				}
+				if (params.op === "retry") {
+					const operationId = required(params.operationId, "operationId");
+					const launched = params.modelAttempt !== undefined && params.transientAttempt !== undefined ? { modelAttempt: params.modelAttempt, transientAttempt: params.transientAttempt } : undefined;
+					const retried = graphStore.retryRuntimeAttempt({ runId, operationId, error: params.error, retryReason: params.retryReason, launched });
+					progress(retried.exhausted ? "runtime_retry_exhausted" : "runtime_attempt_replaced", { runId, operationId, classification: retried.classification, status: retried.state.status, modelAttempt: retried.operation.model_attempt, transientAttempt: retried.operation.transient_attempts, notBefore: retried.retry?.notBefore ?? null });
+					return textResult({ runId, operationId, ...retried, next: retried.state.status === "active" ? graphStore.next(runId) : null });
 				}
 				if (params.op === "resolve") {
 					const operationId = required(params.operationId, "operationId");
 					const decision = params.decision;
 					if (!decision) throw new Error("decision is required");
+					if (decision === "accepted" || decision === "rejected") throw new Error("op=resolve takes retry, defer, abort or escalate; candidate decisions use op=decide");
+					if (decision === "retry") {
+						const retried = graphStore.retryRuntimeAttempt({ runId, operationId, approved: true, retryReason: params.retryReason });
+						progress("recovery_resolved", { runId, operationId, decision, status: retried.state.status });
+						return textResult({ state: retried.state, operation: retried.operation, previousAttempt: retried.previousAttempt });
+					}
 					const state = graphStore.resolveExhaustion(runId, operationId, decision, params.deferredUntil);
 					progress("recovery_resolved", { runId, operationId, decision, status: state.status });
 					return textResult({ state, operation: graphStore.getOperation(operationId) });
@@ -653,164 +798,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					return textResult(result);
 				}
 
-				const operationId = required(params.operationId, "operationId");
-				const status = required(params.status, "status") as OperationStatus;
-				let agentId = params.agentId;
-				let transport = params.transport as VisibleTransport | undefined;
-				let reportSchemaVersion: number | undefined;
-				let acpxProvenance: AcpxRegistrationPayload | undefined;
-				if (status === "running") {
-					if (!agentId && !params.agentName) throw new Error("running operation requires agentId or agentName");
-					required(params.policyDigest, "frozen policy digest");
-					if (!params.modelPolicy) throw new Error("running operation requires the frozen modelPolicy from op=next");
-					transport = parseWorkerTransportKind(required(params.transport, "worker transport"));
-					if (transport === "herdr" && (!params.herdrAgent || !params.tabId)) throw new Error("Herdr dispatch requires herdrAgent and tabId for native identity/focus");
-					if (transport === "headless" && (params.herdrAgent !== undefined || params.tabId !== undefined)) throw new Error("headless dispatch cannot contain Herdr identity");
-					acpxProvenance = acpxRegistrationPayload(params.payload, transport);
-					if (!agentId && params.agentName) {
-						const operation = graphStore.getOperation(operationId);
-						agentId = graphStore.registerAgent({
-							runId,
-							name: params.agentName,
-							node: operation.node,
-							role: roleForNode(operation.node),
-							transport,
-							herdrAgent: params.herdrAgent,
-							tabId: params.tabId,
-							policyDigest: params.policyDigest,
-							selectedModel: params.selectedModel,
-							modelAttempt: params.modelAttempt,
-							currentTask: operation.task,
-							...acpxProvenance,
-						});
-					}
-				}
-				const operation = graphStore.getOperation(operationId);
-				const isOperationalSource = operation.node === "source_search";
-				let ledgerPath: string | undefined;
-				if (status === "completed" || (isOperationalSource && status === "blocked")) {
-					const reportPath = required(params.reportPath, "reportPath");
-					const audit = await auditReport(reportPath, {
-						node: operation.node,
-						privateRoot: dirname(reportPath),
-						ownedRoots: isOperationalSource ? JSON.parse(operation.owned_paths_json) as string[] : undefined,
-					});
-					if (!audit.valid) throw new Error(`delegate report rejected: ${formatDiagnostics(audit.errors)}`);
-					if (isProjectedSemanticReport(audit.report, operation.node)) {
-						throw new Error(`delegate report rejected: projected execution-only report cannot complete the semantic ${operation.node} operation ${operationId}; the worker never authored its report, so redispatch the operation`);
-					}
-					if (status === "completed") {
-						const evidence = acpxSettlementEvidence(params.payload);
-						const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
-						if (!agent) throw new Error("settlement evidence has no registered agent");
-						if (agent.acpx_state !== "alive") throw new Error(`registered ACPX state is ${agent.acpx_state ?? "unknown"}, expected alive`);
-						const registered = (name: string, value: string | null): string => {
-							if (!value) throw new Error(`registered agent lacks ${name}`);
-							return value;
-						};
-						const settlementTransport = parseWorkerTransportKind(agent.transport);
-						const expected: SettlementIdentityExpected = {
-							transport: settlementTransport,
-							runId,
-							operationId,
-							agentName: agent.name,
-							herdrAgent: settlementTransport === "herdr" ? registered("herdrAgent", agent.herdr_agent) : undefined,
-							tabId: settlementTransport === "herdr" ? registered("tabId", agent.tab_id) : undefined,
-							herdrPaneId: settlementTransport === "herdr" ? registered("herdrPaneId", agent.herdr_pane_id) : undefined,
-							acpxCancelScript: registered("acpxCancelScript", agent.acpx_cancel_script),
-							acpAgent: registered("acpAgent", agent.acp_agent),
-							acpxRecordId: registered("acpxRecordId", agent.acpx_record_id),
-							acpxSessionId: registered("acpxSessionId", agent.acpx_session_id),
-							acpxAttemptKey: registered("acpxAttemptKey", agent.acpx_attempt_key),
-							agentFsSessionId: registered("agentFsSessionId", agent.agentfs_session_id),
-							agentFsDbPath: registered("agentFsDbPath", agent.agentfs_db_path),
-							reportPath,
-							reportSha256: createHash("sha256").update(readFileSync(reportPath)).digest("hex"),
-						};
-						validateSettlementIdentity(evidence.value, expected);
-						if (evidence.value.cleanupVerified !== true || typeof evidence.value.cleanupEvidencePath !== "string") throw new Error("settlement evidence cleanup audit is missing");
-						let cleanup: unknown;
-						try { cleanup = JSON.parse(readFileSync(evidence.value.cleanupEvidencePath, "utf8")); }
-						catch (error) { throw new Error(`cleanup evidence unavailable: ${error instanceof Error ? error.message : String(error)}`); }
-						if (!isRecord(cleanup) || cleanup.tabAbsent !== true || cleanup.paneAbsent !== true || cleanup.agentAbsent !== true || cleanup.attemptDirectoryAbsent !== true || cleanup.ownedProcessesAbsent !== true || cleanup.sessionClosed !== true) throw new Error("cleanup evidence is incomplete");
-						if (dirname(evidence.value.cleanupEvidencePath) !== dirname(reportPath)) throw new Error("cleanup evidence must share the private report directory");
-						if (dirname(evidence.path) !== dirname(reportPath)) throw new Error("settlement evidence must share the private report directory");
-						if (operation.status !== "running") throw new Error(`graph operation is ${operation.status}, expected running`);
-						const settlement = reconcileAcpxSettlementSummary({ ...evidence.summary, reportValid: audit.valid, graphStatus: "running" });
-						if (settlement.outcome !== "completed") throw new Error(`ACPX settlement blocked: ${settlement.blockers.join("; ") || settlement.outcome}`);
-					}
-					reportSchemaVersion = audit.report?.schemaVersion;
-					if (params.verdict && audit.verdict !== params.verdict.toUpperCase()) {
-						throw new Error(`reported verdict ${audit.verdict} does not match ${params.verdict.toUpperCase()}`);
-					}
-					params.verdict = audit.verdict;
-					if (isOperationalSource) {
-						const run = graphStore.getRun(runId);
-						ledgerPath = await writeLedgerEntry({
-							story: run.story,
-							topic: operation.slice_id ?? operation.node,
-							operationId,
-							runId,
-							tier: "tools",
-							model: params.selectedModel ?? operation.selected_model ?? "unselected",
-							outcome: status === "completed" ? "accepted" : "blocked",
-							task: operation.task,
-							reportPath,
-							base: process.env.DELEGATE_GRAPH_LEDGER_BASE,
-						});
-					}
-				}
-				if (status === "failed") required(params.error, "error");
-				const result = graphStore.record({
-					runId,
-					operationId,
-					status,
-					verdict: params.verdict,
-					reportPath: params.reportPath,
-					error: params.error,
-					agentId,
-					agentName: params.agentName,
-					transport,
-					modelPolicy: params.modelPolicy,
-					policyDigest: params.policyDigest,
-					selectedModel: params.selectedModel,
-					modelAttempt: params.modelAttempt,
-					retryReason: params.retryReason,
-					fallbackReason: params.fallbackReason,
-					payload: { ...params.payload, ...(reportSchemaVersion === undefined ? {} : { reportSchemaVersion }) },
-				});
-				const progressKind = status === "running" ? "operation_started" : result.requiresUserDecision ? "awaiting_user" : result.retry ? "retrying" : status;
-				progress(progressKind, { runId, operationId, status, graphStatus: result.state.status, retryAttempt: result.retry?.attempt ?? null });
-				if (isOperationalSource && status === "failed" && !result.retry) {
-					const run = graphStore.getRun(runId);
-					ledgerPath = await writeLedgerEntry({
-						story: run.story,
-						topic: operation.slice_id ?? operation.node,
-						operationId,
-						runId,
-						tier: "tools",
-						model: params.selectedModel ?? operation.selected_model ?? "unselected",
-						outcome: "failed",
-						task: operation.task,
-						reportPath: params.reportPath ?? join(process.cwd(), `.missing-${operationId}.json`),
-						allowInvalidReport: true,
-						rejectionDiagnostics: [{ code: "REPORT_UNAVAILABLE", path: "$.report", message: params.error ?? "worker report unavailable" }],
-						base: process.env.DELEGATE_GRAPH_LEDGER_BASE,
-					});
-				}
-				if (result.retry) {
-					const timer = setTimeout(() => {
-						pi.sendUserMessage(
-							`Delegate Graph retry ${result.retry?.attempt}/3 is due for run ${runId}, operation ${operationId}. Call delegate_graph op=status, then redispatch the same operation and record it.`,
-							{ deliverAs: "followUp" },
-						);
-					}, result.retry.delayMs);
-					timer.unref?.();
-				}
-				if (result.requiresUserDecision && !isOperationalSource) {
-					return textResult({ result, decision: await resolveUserDecision(pi, ctx, graphStore, runId, operationId) });
-				}
-				return textResult({ ...result, ...(ledgerPath ? { ledgerPath } : {}) });
+				throw new Error(`op=record accepts only status=cancelled (use op=cancel); ${params.op === "record" ? `status=${params.status ?? "missing"}` : `op=${params.op}`} is not a runtime-v1 transition`);
 			} catch (error) {
 				return textResult({ error: error instanceof Error ? error.message : String(error) });
 			}
@@ -820,7 +808,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("delegate", {
 		description: "Start a build or research delegation graph.",
 		handler: async (args, ctx) => {
-			const parsed = parsePolicyArg(args);
+			const parsed = parseDelegateArgs(args);
 			const raw = parsed.task.trim() || (await ctx.ui.input("Delegate task", "Prefix research tasks with: research"));
 			if (!raw) return;
 			const selected = graphFromTask(raw);
@@ -833,14 +821,32 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.on("session_shutdown", () => { closeAgentList("session ended"); stopFollow("session ended"); });
+
 	pi.registerCommand("graph", {
 		description: "Inspect, focus, resume, or prune Delegate Graph runs.",
 		handler: async (args, ctx) => {
 			try {
 				const [subcommand, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 				const graphStore = getStore();
-				if (subcommand === "status") {
+				if (subcommand === "agents") {
+					if (ctx.mode !== "tui") { ctx.ui.notify("the agent list needs the interactive terminal", "warning"); return; }
+					if (!reopenAgentList(graphStore, ctx, watchIntervalMs())) ctx.ui.notify("no worker has registered in this session yet", "info");
+					return;
+				}
+				// `status --follow <runId>` and `status <runId> --follow` are aliases of `watch <runId> --follow`; bare status stays one-shot.
+				if (subcommand === "status" && !rest.includes("--follow")) {
 					ctx.ui.notify(renderStatus(graphStore, required(rest[0], "runId")), "info");
+					return;
+				}
+				if (subcommand === "watch" || subcommand === "status") {
+					const runId = required(rest.find((item) => !item.startsWith("--")), "runId");
+					if (rest.includes("--follow")) {
+						if (ctx.mode !== "tui") { ctx.ui.notify("watch --follow needs the interactive terminal; ACP clients receive the same summary through op=watch progress events", "warning"); return; }
+						startFollow(pi, ctx, graphStore, runId, watchIntervalMs());
+						return;
+					}
+					ctx.ui.notify(renderWatch(watchRun(graphStore, runId)), "info");
 					return;
 				}
 				if (subcommand === "log") {
@@ -860,10 +866,23 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 				if (subcommand === "resume") {
 					const runId = required(rest[0], "runId");
 					const operationId = required(rest[1], "operationId");
-					const state = graphStore.resolveExhaustion(runId, operationId, "retry");
+					const state = graphStore.retryRuntimeAttempt({ runId, operationId, approved: true }).state;
 					const digest = graphStore.policy(runId).digest;
 					pi.sendUserMessage(`Resume Delegate Graph run ${runId}, operation ${operationId}, with stored policy digest ${digest}. Do not open a picker or re-resolve routes. Call delegate_graph op=next and continue from its frozen modelPolicy, policyDigest, and route.`);
 					ctx.ui.notify(`resumed ${state.runId}`, "info");
+					return;
+				}
+				if (subcommand === "ledger") {
+					const runId = required(rest[0], "runId");
+					const ledger = graphStore.runtimeLedger(runId);
+					const target = rest[1];
+					if (target) {
+						writeFileSync(target, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 });
+						chmodSync(target, 0o600);
+						ctx.ui.notify(`derived ledger for ${runId} written to ${target} (${ledger.operations.length} operations, ${ledger.events.length} events)`, "info");
+					} else {
+						ctx.ui.notify(JSON.stringify(ledger, null, 2), "info");
+					}
 					return;
 				}
 				if (subcommand === "prune") {
@@ -871,7 +890,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					ctx.ui.notify(`pruned ${graphStore.prune(days)} settled runs`, "info");
 					return;
 				}
-				ctx.ui.notify("usage: /graph status|log|focus|resume|prune", "warning");
+				ctx.ui.notify("usage: /graph agents|status [--follow]|watch [--follow]|log|focus|resume|ledger|prune", "warning");
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}

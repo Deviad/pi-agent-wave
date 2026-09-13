@@ -1,24 +1,27 @@
 #!/usr/bin/env -S node --experimental-strip-types
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { parseAcpAgent, type AcpAgent } from "../lib/acpx-types.ts";
 import { acpxModelArgument } from "../lib/acpx-select.ts";
 import { acpxPermissionPolicy } from "../lib/acpx-permissions.ts";
 import { parseAcpxNdjson, parseAcpxStatus, type AcpxLifecycleEvent } from "../lib/acpx-events.ts";
-import { validateReport } from "./report-audit.ts";
 import type { NodeName } from "../types.ts";
+import { parseResultContract, type ResultContract } from "../lib/runtime-results.ts";
+import { AcpxRenderer } from "../lib/acpx-render.ts";
+import { runRuntimeProcess } from "../lib/runtime-process.ts";
 
 export interface AcpxWorkerConfig {
 	readonly schemaVersion: 1;
+	readonly resultContract?: ResultContract;
+	readonly attemptKey?: string;
 	readonly acpxExecutable: string;
 	readonly agent: AcpAgent;
 	readonly selectedModel: string;
 	readonly sessionName: string;
 	readonly workspaceRelative: string;
 	readonly node: NodeName;
-	readonly reportPath: string;
 	readonly claudeTokenFile?: string;
 	readonly acpxHome: string;
 	readonly mode?: "prompt" | "close";
@@ -44,7 +47,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function parseWorkerConfig(value: unknown): AcpxWorkerConfig {
 	if (!isRecord(value) || value.schemaVersion !== 1) throw new Error("invalid ACPX worker config schema");
-	const required = ["acpxExecutable", "selectedModel", "sessionName", "workspaceRelative", "node", "reportPath", "acpxHome", "promptFile", "resultPath", "stdoutPath", "stderrPath"] as const;
+	if (value.resultContract === undefined) throw new Error("worker config requires resultContract");
+	const resultContract = parseResultContract(value.resultContract);
+	if (typeof value.attemptKey !== "string" || !value.attemptKey.trim()) throw new Error("runtime-v1 worker requires attemptKey");
+	const required = ["acpxExecutable", "selectedModel", "sessionName", "workspaceRelative", "node", "acpxHome", "promptFile", "resultPath", "stdoutPath", "stderrPath"] as const;
 	for (const key of required) if (typeof value[key] !== "string" || !value[key].trim()) throw new Error(`ACPX worker config requires ${key}`);
 	if (!Number.isInteger(value.timeoutSeconds) || Number(value.timeoutSeconds) <= 0) throw new Error("ACPX worker timeoutSeconds must be positive integer");
 	if (typeof value.hostReadOnly !== "boolean") throw new Error("ACPX worker config requires hostReadOnly boolean");
@@ -56,13 +62,14 @@ export function parseWorkerConfig(value: unknown): AcpxWorkerConfig {
 	if (!node) throw new Error(`unsupported ACPX worker node: ${String(value.node)}`);
 	return Object.freeze({
 		schemaVersion: 1,
+		resultContract,
+		attemptKey: typeof value.attemptKey === "string" ? value.attemptKey : undefined,
 		acpxExecutable: String(value.acpxExecutable),
 		agent: parseAcpAgent(value.agent),
 		selectedModel: String(value.selectedModel),
 		sessionName: String(value.sessionName),
 		workspaceRelative: String(value.workspaceRelative),
 		node,
-		reportPath: resolve(String(value.reportPath)),
 		claudeTokenFile: typeof value.claudeTokenFile === "string" ? resolve(value.claudeTokenFile) : undefined,
 		acpxHome: resolve(String(value.acpxHome)),
 		mode: value.mode === "close" ? "close" : "prompt",
@@ -97,8 +104,8 @@ export function buildPromptArgv(config: AcpxWorkerConfig): string[] {
 	return args;
 }
 
-function workerEnvironment(config: AcpxWorkerConfig): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...process.env, HOME: config.acpxHome };
+export function workerEnvironment(config: Pick<AcpxWorkerConfig, "agent" | "acpxHome" | "claudeTokenFile">): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env, HOME: config.acpxHome, GIT_OPTIONAL_LOCKS: "0" };
 	if (config.agent === "claude") {
 		if (!config.claudeTokenFile) throw new Error("PI_CLAUDE_OAUTH_TOKEN_FILE is required for Claude");
 		const token = readFileSync(config.claudeTokenFile, "utf8").trim();
@@ -153,41 +160,7 @@ export function ensureAcpxSession(config: AcpxWorkerConfig, env: NodeJS.ProcessE
 	return { ...ensure, attempts };
 }
 
-function canonicalPositiveVerdict(node: NodeName): string {
-	if (node === "thinker_plan" || node === "thinker_split") return "READY";
-	if (node === "review" || node === "audit") return "PASS";
-	if (node === "test") return "GREEN";
-	return "DONE";
-}
 
-/**
- * True when a Pi worker completed its turn without any assistant or tool activity. Pi reports a failed model
- * request (for example a keychain-backed API key that an attempt-private HOME cannot resolve) as an assistant
- * message with empty content, so the ACP turn is indistinguishable from a successful no-op.
- */
-const ACTIVITY_UPDATE_TYPES: readonly string[] = Object.freeze(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"]);
-
-export function isSilentTurn(events: readonly AcpxLifecycleEvent[]): boolean {
-	return !events.some((event) => event.kind === "progress" && ACTIVITY_UPDATE_TYPES.includes(event.updateType));
-}
-
-function projectPiReport(config: AcpxWorkerConfig, silentTurn: boolean): string[] {
-	if (config.agent !== "pi" || silentTurn || existsSync(config.reportPath)) return [];
-	const projected = {
-		schemaVersion: 1,
-		verdict: canonicalPositiveVerdict(config.node),
-		claims: [{
-			statement: `Supervisor projection: Pi ACPX session ${config.sessionName} exited 0 with structured end_turn; no semantic task claim is inferred.`,
-			evidence: [{ kind: "command", source: config.stdoutPath, detail: "ACPX process exit 0 and structured terminal kind completed" }],
-			verification: "verified",
-		}],
-	};
-	const audit = validateReport(projected, config.node);
-	if (!audit.valid || !audit.report) return audit.errors.map((error) => `${error.code} ${error.path}: ${error.message}`);
-	writeFileSync(config.reportPath, `${JSON.stringify(audit.report, null, 2)}\n`, { mode: 0o600 });
-	chmodSync(config.reportPath, 0o600);
-	return [];
-}
 
 /**
  * acpx exits with EXIT_CODES.PERMISSION_DENIED (5) and reports `permission_denied`
@@ -205,6 +178,8 @@ export function detectApprovalBlock(exitCode: number, output: string): boolean {
 
 /** Runs one ACPX operation-attempt session and writes a structured result for the Herdr supervisor. */
 export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
+	// The private worker config written by the supervisor selects the result contract; adapter
+	// enablement is checked by the store before any runtime-v1 dispatch reaches this process.
 	const sandboxRoot = process.cwd();
 	const workspace = resolve(sandboxRoot, config.workspaceRelative);
 	if (workspace !== sandboxRoot && !workspace.startsWith(`${sandboxRoot}/`)) throw new Error("ACPX workspace escapes AgentFS sandbox");
@@ -221,38 +196,19 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 	}
 	const ensure = ensureAcpxSession(config, env);
 	if (ensure.exitCode !== 0) throw new Error(`ACPX session ensure failed after ${ensure.attempts} attempt(s): ${ensure.stderr || ensure.stdout}`);
-	const prompt = await runStreaming(config, buildPromptArgv(config), env);
-	writeFileSync(config.stdoutPath, prompt.stdout, { mode: 0o600 });
-	writeFileSync(config.stderrPath, prompt.stderr, { mode: 0o600 });
-	const events = parseAcpxNdjson(prompt.stdout);
-	const terminal = [...events].reverse().find((event) => event.kind === "completed" || event.kind === "cancelled" || event.kind === "failed");
-	const silentTurn = config.agent === "pi" && terminal?.kind === "completed" && isSilentTurn(events);
-	const projectionErrors = terminal?.kind === "completed" && !silentTurn ? projectPiReport(config, silentTurn) : [];
-	const statusResult = runCaptured(config, [...commonArgs(config), config.agent, "status", "--session", config.sessionName], env);
-	let status: string = "unknown";
-	if (statusResult.exitCode === 0) status = parseAcpxStatus(statusResult.stdout);
-	const result = {
-		schemaVersion: 1,
-		agent: config.agent,
-		selectedModel: config.selectedModel,
-		sessionName: config.sessionName,
-		processExitCode: prompt.exitCode,
-		status,
-		terminal: terminal ? { kind: terminal.kind, sessionId: terminal.sessionId, requestId: terminal.requestId } : null,
-		stdoutPath: config.stdoutPath,
-		stderrPath: config.stderrPath,
-		piReportProjected: config.agent === "pi" && !silentTurn && projectionErrors.length === 0 && existsSync(config.reportPath),
-		hostReadOnly: config.hostReadOnly,
-		discardAllChanges: config.discardAllChanges,
-		noTerminal: config.noTerminal,
-		ensureAttempts: ensure.attempts,
-		silentTurn,
-		permissionDenied: detectApprovalBlock(prompt.exitCode, `${prompt.stdout}\n${prompt.stderr}`),
-		projectionErrors: silentTurn ? ["worker-silent-turn: the attempt produced no assistant or tool activity; Pi records a failed model request as an empty assistant message"] : projectionErrors,
-	};
-	writeFileSync(config.resultPath, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
-	chmodSync(config.resultPath, 0o600);
-	return prompt.exitCode || (silentTurn ? 2 : 0) || (projectionErrors.length ? 2 : 0);
+	{
+		const ensured = jsonAction(ensure.stdout, "session_ensured");
+		if (!config.attemptKey || typeof ensured?.acpxSessionId !== "string") throw new Error("runtime output requires exact attempt and ensured session identity");
+		const outputDir = join(dirname(config.resultPath), "runtime-output");
+		// Whoever watches the launcher (a Herdr pane) sees rendered content; the JSON stream itself goes only to the retained files.
+		const renderer = new AcpxRenderer((piece) => process.stdout.write(piece), { color: process.stdout.isTTY === true });
+		const output = await runRuntimeProcess({ executable: config.acpxExecutable, args: buildPromptArgv(config), cwd: process.cwd(), env, outputDir, identity: { attemptKey: config.attemptKey, sessionId: ensured.acpxSessionId, requestId: null }, timeoutMs: config.timeoutSeconds * 1000, onStdout: (bytes) => renderer.push(bytes) });
+		renderer.end();
+		const result = { schemaVersion: 2, resultContract: "runtime-v1", agent: config.agent, selectedModel: config.selectedModel, sessionName: config.sessionName, attemptKey: config.attemptKey, outputDir, output };
+		const fd = openSync(config.resultPath, "wx", 0o600);
+		try { writeFileSync(fd, JSON.stringify(result, null, 2) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+		return output.outcome.kind === "exited" ? output.outcome.exitCode : 2;
+	}
 }
 
 async function main(): Promise<void> {

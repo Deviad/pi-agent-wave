@@ -153,6 +153,71 @@ describe("ACPX AgentFS targeted cleanup", () => {
 		});
 	}
 
+	test("supervisor lines never count as surviving owned processes", () => {
+		const result = driver("inventory", "supervisor-noise");
+		assert.deepEqual(result.ownedProcessMatches, [], JSON.stringify(result));
+		assert.ok(!(result.falseFields as string[]).includes("ownedProcessesAbsent"), JSON.stringify(result));
+	});
+
+	for (const [resource, expectedPid] of [["session-worker", "204"], ["attempt-worker", "205"], ["launcher-worker", "202"], ["supervisor-named-argument", "206"]] as const) {
+		test(`owned process ${resource} still fails closed beside supervisor noise`, () => {
+			const result = driver("inventory", resource);
+			assert.ok((result.falseFields as string[]).includes("ownedProcessesAbsent"), JSON.stringify(result));
+			assert.deepEqual((result.ownedProcessMatches as string[]).map((line) => line.split(" ")[0]), [expectedPid], JSON.stringify(result));
+		});
+	}
+
+	test("settlement waits for the worker process to exit after its result file appears", () => {
+		const script = `
+import json, os, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import delegate_core as core
+core.ACTIVE_TRANSPORT = 'headless'
+root = Path(sys.argv[2])
+result_path = root / 'worker-result.json'
+# A worker that writes its result and then lingers, like the AgentFS/acpx teardown does.
+child = subprocess.Popen(['sh', '-c', 'printf \\'{"processExitCode":0,"terminal":{"kind":"completed"}}\\' > "$0"; sleep 0.6', str(result_path)])
+resource = {'execution': 'acpx-agentfs', 'agent': 'fixture', 'worker_result': str(result_path), 'worker_pid': child.pid, 'report_repair_attempts': 0}
+started = time.monotonic()
+core.wait_for_settled_agent(root, resource)
+settled = {'exited': resource['worker_exit']['exited'], 'pid': resource['worker_exit']['pid'] == child.pid, 'aliveAfter': core.process_alive(child.pid) and child.poll() is None,
+           'waitedMs': resource['worker_exit']['waitedMs'], 'elapsedMs': int((time.monotonic() - started) * 1000), 'terminal': resource['worker_observation']['terminal']['kind']}
+child.wait()
+# A worker that never exits fails closed within the bounded timeout instead of being audited live.
+lingering = subprocess.Popen(['sleep', '30'])
+try:
+    try:
+        core.wait_for_worker_exit({'worker_pid': lingering.pid}, timeout_ms=300)
+    except core.DelegateError as error:
+        bounded = {'raised': True, 'message': str(error)}
+    else:
+        bounded = {'raised': False}
+finally:
+    lingering.kill(); lingering.wait()
+# Herdr transport has no pid to wait for and records that instead of blocking.
+core.ACTIVE_TRANSPORT = 'herdr'
+herdr = core.wait_for_worker_exit({'worker_pid': None})
+print(json.dumps({'settled': settled, 'bounded': bounded, 'herdr': herdr}))
+`;
+		const root = spawnSync("mktemp", ["-d"], { encoding: "utf8" }).stdout.trim();
+		try {
+			const result = spawnSync("python3", ["-c", script, new URL("../scripts", import.meta.url).pathname, root], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+			assert.equal(result.status, 0, result.stderr);
+			const { settled, bounded, herdr } = JSON.parse(result.stdout);
+			assert.equal(settled.exited, true);
+			assert.equal(settled.pid, true);
+			assert.equal(settled.aliveAfter, false, "the audit must not start while the worker process is alive");
+			assert.ok(settled.waitedMs >= 300, `the wait must actually cover the lingering process: ${JSON.stringify(settled)}`);
+			assert.equal(settled.terminal, "completed");
+			assert.equal(bounded.raised, true);
+			assert.match(String(bounded.message), /did not exit within 300ms/);
+			assert.deepEqual(herdr, { pid: null, exited: null, waitedMs: 0 });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("cleanup is idempotent for an owned empty run", () => {
 		const script = new URL("../scripts/herdr_delegate.py", import.meta.url).pathname;
 		const env = { ...process.env, HERDR_ENV: "1", HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID ?? "workspace", HERDR_TAB_ID: process.env.HERDR_TAB_ID ?? "tab" };

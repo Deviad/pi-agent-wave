@@ -52,27 +52,6 @@ print(json.dumps({'state':state,'mode':oct((run_dir / 'state.json').stat().st_mo
 		assert.equal(proof.lock, false);
 	});
 
-	test("preserves close and report-repair diagnostics under contention", () => {
-		const probe = String.raw`
-import concurrent.futures, json, pathlib, runpy, sys, tempfile
-run_dir = pathlib.Path(tempfile.mkdtemp(prefix='herdr-close-repair-'))
-module = runpy.run_path(sys.argv[1])
-state = {'caller_tab':'caller','closed_tabs':[],'resources':[{'agent':'worker','tab':'worker-tab','model_attempt':2,'report_repair_attempts':0,'report_repair_diagnostics':[]}],'run_label':'test','run_slug':'test'}
-module['write_state'](run_dir, state)
-class Result:
-    stdout = ''
-module['close_created_tab'].__globals__['run'] = lambda argv: Result()
-with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-    list(pool.map(lambda fn: fn(), [lambda: module['close_created_tab'](run_dir, 'worker-tab'), lambda: module['record_repair_attempt'](run_dir, 'worker', 1, [{'code':'REPORT'}])]))
-final = json.loads((run_dir / 'state.json').read_text())
-resource = final['resources'][0]
-print(json.dumps({'closed':final['closed_tabs'],'model_attempt':resource['model_attempt'],'repair_attempts':resource['report_repair_attempts'],'diagnostics':resource['report_repair_diagnostics']}))
-`;
-		const result = spawnSync("python3", ["-c", probe, script], { encoding: "utf8", timeout: 10_000 });
-		assert.equal(result.status, 0, result.stderr);
-		assert.deepEqual(JSON.parse(result.stdout), { closed: ["worker-tab"], model_attempt: 2, repair_attempts: 1, diagnostics: [[{ code: "REPORT" }]] });
-	});
-
 	test("lets a blocked agent proceed to report audit instead of rejecting before cleanup", () => {
 		const probe = String.raw`
 import json, pathlib, runpy, sys, tempfile

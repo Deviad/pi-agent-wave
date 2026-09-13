@@ -5,8 +5,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { auditReport } from "../scripts/report-audit.ts";
-import { GraphStore } from "../store.ts";
+import { GraphStore, roleForNode } from "../store.ts";
+import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
+import { selectAcpAgent } from "../lib/acpx-select.ts";
 import type { ResolvedPolicy } from "../types.ts";
 
 const dirs: string[] = [];
@@ -21,25 +22,34 @@ afterEach(() => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function start(store: GraphStore, runId: string, operationId: string, agentId?: string): void {
+/** Registers a runtime attempt for a pending operation the way dispatch does, with a headless worker and the frozen identity. */
+function start(store: GraphStore, runId: string, operationId: string, agentId?: string): string {
 	const next = store.next(runId);
 	const operation = next.operations.find((candidate) => candidate.id === operationId);
-	store.record({
-		runId,
-		operationId,
-		status: "running",
-		agentId,
-		agentName: "worker",
-		transport: "herdr",
-		modelPolicy: next.policy.input,
-		policyDigest: next.policy.digest,
-		selectedModel: operation?.route?.chain[0],
-		modelAttempt: operation?.route ? 0 : undefined,
-	});
+	if (!operation) throw new Error(`operation ${operationId} is not pending`);
+	const selectedModel = operation.route?.chain[operation.model_attempt] ?? "openai-codex/gpt-5.6-sol";
+	const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId, role: roleForNode(operation.node), modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts, selectedModel, agent: selectAcpAgent(selectedModel) });
+	const registered = agentId ?? store.registerAgent({ runId, name: `worker-${operationId.slice(-8)}-${operation.transient_attempts}`, node: operation.node, role: roleForNode(operation.node), transport: "headless", currentTask: operation.task });
+	store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: next.policy.digest, agentId: registered });
+	return identity.attemptKey;
 }
 
+/** Settles the operation's attempt as exited with a retained answer and accepts it with the given verdict and payload. */
 function complete(store: GraphStore, runId: string, operationId: string, verdict?: string, payload?: Record<string, unknown>): void {
-	store.record({ runId, operationId, status: "completed", verdict, payload, reportPath: `/tmp/${operationId}.json` });
+	const attempt = store.runtimeAttemptByOperation(operationId);
+	if (!attempt) throw new Error(`operation ${operationId} has no runtime attempt`);
+	const answer = store.retainRuntimeContent(Buffer.from(`answer for ${operationId}${verdict ? `\n\nVERDICT: ${verdict}` : ""}\n`));
+	store.settleRuntimeAttempt({ attemptKey: attempt.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer, sources: [] }, observation: { sessionId: attempt.attemptKey, requestId: "1", sessionOrigin: "created", captureStatus: "complete", manifest: null } });
+	store.decideRuntimeCandidate({ attemptKey: attempt.attemptKey, decision: "accepted", reason: `test acceptance of ${operationId}`, verdict, payload });
+	void runId;
+}
+
+/** Settles the operation's attempt as failed and lets the runtime classify the retry. */
+function fail(store: GraphStore, runId: string, operationId: string, error: string) {
+	const attempt = store.runtimeAttemptByOperation(operationId);
+	if (!attempt) throw new Error(`operation ${operationId} has no runtime attempt`);
+	store.settleRuntimeAttempt({ attemptKey: attempt.attemptKey, outcome: { kind: "failed", exitCode: 1, error } });
+	return store.retryRuntimeAttempt({ runId, operationId });
 }
 
 function runConcurrencyWorker(dbPath: string, runId: string, operationId: string): Promise<void> {
@@ -96,6 +106,9 @@ function balancedPolicy(): ResolvedPolicy {
 				promotedFrom: "coding",
 				promotionReason: "capability floor independent_review",
 			},
+			...(["tester", "auditor", "searcher"] as const).map((role) => ({
+				role, tier: "review", chain: ["claude-code/claude-opus-5"], thinking: "high" as const, session: false, capabilityFloor: "independent_review", selectionSource: "preset:balanced", promoted: false, promotionReason: null,
+			})),
 		],
 	};
 }
@@ -112,7 +125,7 @@ describe("SQLite state store", () => {
 
 	test("rejects non-Herdr agent registration", () => {
 		const { store } = fixture();
-		const state = store.initRun("transport", "build", "Use Herdr");
+		const state = store.initRun("transport", "build", "Use Herdr", balancedPolicy());
 		const operation = store.next(state.runId).operations[0]!;
 		const registration = {
 			runId: state.runId,
@@ -140,7 +153,7 @@ describe("SQLite state store", () => {
 
 	test("rejects invalid run and operation lifecycle states at the database boundary", () => {
 		const { dbPath, store } = fixture();
-		const state = store.initRun("invalid-state", "build", "Plan");
+		const state = store.initRun("invalid-state", "build", "Plan", balancedPolicy());
 		const operation = store.next(state.runId).operations[0];
 		const db = new Database(dbPath);
 		expect(() => db.query("UPDATE operations SET status='invalid' WHERE id=?").run(operation.id)).toThrow(/CHECK constraint/);
@@ -149,26 +162,9 @@ describe("SQLite state store", () => {
 		store.close();
 	});
 
-	test("requires a valid headless or Herdr transport before an operation starts", () => {
-		const { store } = fixture();
-		const headlessState = store.initRun("headless-transport", "build", "Plan");
-		const headlessOperation = store.next(headlessState.runId).operations[0];
-		expect(() => store.record({ runId: headlessState.runId, operationId: headlessOperation.id, status: "running" })).toThrow("worker transport");
-		expect(() => store.record({ runId: headlessState.runId, operationId: headlessOperation.id, status: "running", transport: "delegate" as never })).toThrow("unsupported worker transport");
-		store.record({ runId: headlessState.runId, operationId: headlessOperation.id, status: "running", transport: "headless" });
-		const headlessDispatch = store.events(headlessState.runId).find((event) => event.type === "operation_running");
-		expect(JSON.parse(headlessDispatch?.payload_json ?? "{}").transport).toBe("headless");
-		const herdrState = store.initRun("herdr-transport", "build", "Plan");
-		const herdrOperation = store.next(herdrState.runId).operations[0];
-		store.record({ runId: herdrState.runId, operationId: herdrOperation.id, status: "running", transport: "herdr" });
-		const herdrDispatch = store.events(herdrState.runId).find((event) => event.type === "operation_running");
-		expect(JSON.parse(herdrDispatch?.payload_json ?? "{}").transport).toBe("herdr");
-		store.close();
-	});
-
 	test("rolls back a transition and result event when slice creation fails", () => {
 		const { store } = fixture();
-		const state = store.initRun("rollback", "build", "Plan");
+		const state = store.initRun("rollback", "build", "Plan", balancedPolicy());
 		const thinker = store.next(state.runId).operations[0];
 		start(store, state.runId, thinker.id);
 		expect(() => complete(store, state.runId, thinker.id, "PASS")).toThrow("at least one slice");
@@ -179,7 +175,7 @@ describe("SQLite state store", () => {
 
 	test("joins parallel operations before advancing", () => {
 		const { store } = fixture();
-		const state = store.initRun("join", "build", "Plan");
+		const state = store.initRun("join", "build", "Plan", balancedPolicy());
 		const thinker = store.next(state.runId).operations[0];
 		start(store, state.runId, thinker.id);
 		complete(store, state.runId, thinker.id, "PASS", {
@@ -198,9 +194,46 @@ describe("SQLite state store", () => {
 		store.close();
 	});
 
+	test("settles running siblings while awaiting recovery without dispatching or advancing", () => {
+		const { store } = fixture();
+		const state = store.initRun("parked-siblings", "build", "Plan", balancedPolicy());
+		const thinker = store.next(state.runId).operations[0];
+		start(store, state.runId, thinker.id);
+		complete(store, state.runId, thinker.id, "PASS", {
+			slices: ["a", "b", "c", "d"].map((id) => ({ id, name: id, task: id, ownedPaths: [`${id}.ts`] })),
+		});
+		const operations = store.next(state.runId).operations;
+		const [first, second, finished, pending] = operations;
+		for (const operation of [first, second, finished]) start(store, state.runId, operation.id);
+		const parked = fail(store, state.runId, first.id, "AgentFS contains unowned changes: .git/config");
+		assert.equal(parked.exhausted, true);
+		assert.equal(store.getState(state.runId).status, "awaiting_user");
+		// Siblings still settle their facts while the run is parked, but nothing advances or retries until the operator resolves.
+		const siblingAttempt = store.runtimeAttemptByOperation(second.id)!;
+		store.settleRuntimeAttempt({ attemptKey: siblingAttempt.attemptKey, outcome: { kind: "failed", exitCode: 1, error: "HTTP 429" } });
+		assert.equal(store.runtimeAttempt(siblingAttempt.attemptKey).processState, "failed");
+		assert.throws(() => store.retryRuntimeAttempt({ runId: state.runId, operationId: second.id }), /run is awaiting_user/);
+		const finishedAttempt = store.runtimeAttemptByOperation(finished.id)!;
+		store.settleRuntimeAttempt({ attemptKey: finishedAttempt.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer: store.retainRuntimeContent(Buffer.from("done")), sources: [] } });
+		assert.throws(() => store.decideRuntimeCandidate({ attemptKey: finishedAttempt.attemptKey, decision: "accepted", reason: "done" }), /run is awaiting_user/);
+		assert.equal(store.getState(state.runId).currentNode, "implement");
+		assert.equal(store.next(state.runId).state.status, "awaiting_user");
+		assert.throws(() => start(store, state.runId, pending.id), /run is awaiting_user/);
+		const foreign = store.initRun("foreign-sibling", "build", "Plan", balancedPolicy());
+		assert.throws(() => store.retryRuntimeAttempt({ runId: foreign.runId, operationId: second.id, approved: true }), /does not belong/);
+		assert.equal(store.retryRuntimeAttempt({ runId: state.runId, operationId: first.id, approved: true }).state.status, "active");
+		assert.equal(store.getOperation(first.id).status, "pending");
+		const siblingRetry = store.retryRuntimeAttempt({ runId: state.runId, operationId: second.id });
+		assert.deepEqual([siblingRetry.classification, siblingRetry.operation.status], ["http-429", "pending"]);
+		store.decideRuntimeCandidate({ attemptKey: finishedAttempt.attemptKey, decision: "accepted", reason: "done", verdict: "DONE" });
+		assert.equal(store.getOperation(finished.id).status, "completed");
+		assert.equal(store.getState(state.runId).status, "active");
+		store.close();
+	});
+
 	test("serializes concurrent WAL writers without losing results or duplicating the join", async () => {
 		const { dbPath, store } = fixture();
-		const state = store.initRun("concurrency", "build", "Plan");
+		const state = store.initRun("concurrency", "build", "Plan", balancedPolicy());
 		const thinker = store.next(state.runId).operations[0];
 		start(store, state.runId, thinker.id);
 		complete(store, state.runId, thinker.id, "PASS", {
@@ -223,7 +256,7 @@ describe("SQLite state store", () => {
 
 	test("rejects overlapping writable ownership before implementer dispatch", () => {
 		const { store } = fixture();
-		const state = store.initRun("ownership", "build", "Plan");
+		const state = store.initRun("ownership", "build", "Plan", balancedPolicy());
 		const thinker = store.next(state.runId).operations[0];
 		start(store, state.runId, thinker.id);
 		expect(() =>
@@ -240,7 +273,7 @@ describe("SQLite state store", () => {
 
 	test("routes reviewer and tester feedback through implementers before terminal success", () => {
 		const { store } = fixture();
-		const state = store.initRun("full-loop", "build", "Plan");
+		const state = store.initRun("full-loop", "build", "Plan", balancedPolicy());
 		let operation = store.next(state.runId).operations[0];
 		start(store, state.runId, operation.id);
 		complete(store, state.runId, operation.id, "PASS", { slices: [{ id: "core", name: "Core", task: "Implement core", ownedPaths: ["extensions/pi-agent-wave/**"] }] });
@@ -281,14 +314,15 @@ describe("SQLite state store", () => {
 		start(store, state.runId, operation.id);
 		complete(store, state.runId, operation.id, "PASS");
 		expect(store.getState(state.runId).status).toBe("terminal");
-		assert.throws(() => store.resolveExhaustion(state.runId, operation.id, "retry"), /recovery decision/);
-		const results = store.events(state.runId).filter((event) => event.type === "result");
+		// A terminal run has no current operation: the last audit is stale for the terminal node, so no retry can reopen it.
+		assert.throws(() => store.retryRuntimeAttempt({ runId: state.runId, operationId: operation.id, approved: true }), /stale for current graph state/);
+		const results = store.events(state.runId, 10_000).filter((event) => event.type === "result");
 		expect(results).toHaveLength(10);
 		for (const result of results) {
-			const payload = JSON.parse(result.payload_json) as { reportPath?: string };
-			expect(payload.reportPath).toBe(`/tmp/${result.operation_id}.json`);
+			const payload = JSON.parse(result.payload_json) as Record<string, unknown>;
+			expect("reportPath" in payload).toBe(false);
 		}
-		const handoffs = store.events(state.runId).filter((event) => event.type === "handoff").map((event) => event.to_node);
+		const handoffs = store.events(state.runId, 10_000).filter((event) => event.type === "handoff").map((event) => event.to_node);
 		expect(handoffs).toEqual([
 			"implement",
 			"review",
@@ -306,7 +340,7 @@ describe("SQLite state store", () => {
 
 	test("marks research fan-out read-only and never enters implementation", () => {
 		const { store } = fixture();
-		const state = store.initRun("research", "research", "Explore");
+		const state = store.initRun("research", "research", "Explore", balancedPolicy());
 		let operation = store.next(state.runId).operations[0];
 		start(store, state.runId, operation.id);
 		complete(store, state.runId, operation.id, "PASS", {
@@ -332,16 +366,20 @@ describe("SQLite state store", () => {
 
 	test("records three transient retries without consuming a semantic round then awaits user", () => {
 		const { store } = fixture(() => 0.5);
-		const state = store.initRun("retry", "build", "Plan");
+		// One frozen model: the same-model budget is the whole chain, so the fourth failure parks the run.
+		const singleChain = balancedPolicy();
+		singleChain.routes[0] = { ...singleChain.routes[0], chain: [singleChain.routes[0].chain[0]] };
+		const state = store.initRun("retry", "build", "Plan", singleChain);
 		const operation = store.next(state.runId).operations[0];
-		start(store, state.runId, operation.id);
 		for (let attempt = 1; attempt <= 3; attempt += 1) {
-			const result = store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "HTTP 429" });
+			start(store, state.runId, operation.id);
+			const result = fail(store, state.runId, operation.id, "HTTP 429");
 			expect(result.retry?.attempt).toBe(attempt);
 			expect(result.state.round).toBe(1);
 		}
-		const exhausted = store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "HTTP 429" });
-		expect(exhausted.requiresUserDecision).toBe(true);
+		start(store, state.runId, operation.id);
+		const exhausted = fail(store, state.runId, operation.id, "HTTP 429");
+		expect(exhausted.exhausted).toBe(true);
 		expect(exhausted.state.status).toBe("awaiting_user");
 		expect(store.events(state.runId).filter((event) => event.type === "retry")).toHaveLength(3);
 		store.close();
@@ -349,11 +387,11 @@ describe("SQLite state store", () => {
 
 	test("resumes the same exhausted operation idempotently", () => {
 		const { store } = fixture();
-		const state = store.initRun("resume", "build", "Plan");
+		const state = store.initRun("resume", "build", "Plan", balancedPolicy());
 		const operation = store.next(state.runId).operations[0];
 		start(store, state.runId, operation.id);
-		store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "compile error" });
-		const resumed = store.resolveExhaustion(state.runId, operation.id, "retry");
+		expect(fail(store, state.runId, operation.id, "compile error").exhausted).toBe(true);
+		const resumed = store.retryRuntimeAttempt({ runId: state.runId, operationId: operation.id, approved: true }).state;
 		expect(resumed.status).toBe("active");
 		expect(store.next(state.runId).operations[0].id).toBe(operation.id);
 		expect(store.getOperation(operation.id).status).toBe("pending");
@@ -365,67 +403,69 @@ describe("SQLite state store", () => {
 		const state = store.initRun("approval-block", "build", "Plan", balancedPolicy());
 		const operation = store.next(state.runId).operations[0];
 		const agentId = store.registerAgent({ runId: state.runId, node: operation.node, role: "thinker", currentTask: operation.task, name: "blocked-worker", transport: "herdr", herdrAgent: "blocked-worker", tabId: "fixture-tab", herdrPaneId: "fixture-pane" });
-		start(store, state.runId, operation.id, agentId);
-		const reportPath = join(dir, "blocked-report.json");
-		store.record({ runId: state.runId, operationId: operation.id, status: "blocked", verdict: "NOT_OK", reportPath, error: "approval required" });
+		const attemptKey = start(store, state.runId, operation.id, agentId);
+		void dir;
+		const parked = fail(store, state.runId, operation.id, "permission denied for fs/read_text_file");
+		assert.deepEqual([parked.exhausted, parked.classification], [true, "approval-block"]);
 		const before = store.getOperation(operation.id);
 		const policy = store.policy(state.runId);
-		store.resolveExhaustion(state.runId, operation.id, "retry");
+		store.retryRuntimeAttempt({ runId: state.runId, operationId: operation.id, approved: true });
 		const retried = store.getOperation(operation.id);
 		assert.equal(store.getState(state.runId).status, "active");
 		assert.equal(retried.status, "pending");
-		for (const key of ["agent_id", "report_path", "verdict", "finished_at"] as const) assert.equal(retried[key], null);
+		for (const key of ["agent_id", "verdict", "finished_at"] as const) assert.equal(retried[key], null);
 		for (const key of ["id", "node", "round", "fix_iteration", "owned_paths_json", "selected_model", "model_attempt"] as const) assert.equal(retried[key], before[key]);
+		assert.equal(retried.transient_attempts, before.transient_attempts + 1, "the replacement identity is fresh without restoring the budget");
 		assert.deepEqual(store.policy(state.runId), policy);
 		assert.equal(retried.retry_reason, "operator-approved-retry");
 		assert.equal(retried.fallback_reason, null);
-		const event = store.events(state.runId).find((entry) => entry.type === "resume");
-		assert.ok(event);
-		assert.deepEqual(JSON.parse(event.payload_json).previousAttempt, { agentId, status: "blocked", reportPath, verdict: "NOT_OK", error: "approval required" });
+		assert.ok(store.runtimeAttempt(attemptKey).supersededAt, "the failed attempt is superseded, never reused");
 		assert.equal(store.agents(state.runId).find((entry) => entry.id === agentId)?.status, "failed");
-		assert.throws(() => complete(store, state.runId, operation.id, "READY"), /cannot complete operation from pending/);
+		assert.throws(() => complete(store, state.runId, operation.id, "READY"), /has no runtime attempt/);
 		store.close();
 	});
 
 	test("explicit blocks support defer, abort and escalate without changing semantic rounds", () => {
 		for (const decision of ["defer", "abort", "escalate"] as const) {
 			const { store } = fixture();
-			const state = store.initRun(`block-${decision}`, "build", "Plan");
+			const state = store.initRun(`block-${decision}`, "build", "Plan", balancedPolicy());
 			const operation = store.next(state.runId).operations[0];
 			start(store, state.runId, operation.id);
-			store.record({ runId: state.runId, operationId: operation.id, status: "blocked", error: "operator decision required" });
+			assert.equal(fail(store, state.runId, operation.id, "permission denied for fs/read_text_file").exhausted, true);
 			const result = store.resolveExhaustion(state.runId, operation.id, decision, "2026-08-18T12:00:00.000Z");
 			assert.equal(result.status, { defer: "deferred", abort: "cancelled", escalate: "blocked" }[decision]);
 			assert.equal(result.round, state.round);
-			if (decision !== "abort") assert.equal(store.resolveExhaustion(state.runId, operation.id, "retry").status, "active");
-			else assert.throws(() => store.resolveExhaustion(state.runId, operation.id, "retry"), /recovery decision/);
+			if (decision !== "abort") assert.equal(store.retryRuntimeAttempt({ runId: state.runId, operationId: operation.id, approved: true }).state.status, "active");
+			else assert.throws(() => store.retryRuntimeAttempt({ runId: state.runId, operationId: operation.id, approved: true }), /recovery decision/);
 			store.close();
 		}
 	});
 
 	test("recovery rejects foreign and stale operations without mutating either run", () => {
 		const { store } = fixture();
-		const first = store.initRun("first-recovery", "build", "Plan");
-		const second = store.initRun("second-recovery", "build", "Plan");
+		const first = store.initRun("first-recovery", "build", "Plan", balancedPolicy());
+		const second = store.initRun("second-recovery", "build", "Plan", balancedPolicy());
 		const original = store.next(first.runId).operations[0];
 		const foreign = store.next(second.runId).operations[0];
 		start(store, first.runId, original.id);
 		complete(store, first.runId, original.id, "READY", { slices: [{ id: "slice", name: "Slice", task: "Implement", ownedPaths: ["owned.ts"] }] });
 		const current = store.next(first.runId).operations[0];
 		start(store, first.runId, current.id);
-		store.record({ runId: first.runId, operationId: current.id, status: "failed", error: "approval denied" });
+		assert.equal(fail(store, first.runId, current.id, "permission denied for fs/read_text_file").exhausted, true);
 		const before = [store.getState(first.runId), store.getState(second.runId), store.operations(first.runId), store.operations(second.runId), store.events(first.runId)];
-		for (const decision of ["retry", "defer", "abort", "escalate"] as const) {
+		for (const decision of ["defer", "abort", "escalate"] as const) {
 			assert.throws(() => store.resolveExhaustion(first.runId, foreign.id, decision, "2026-08-18T12:00:00.000Z"), /does not belong to run/);
 			assert.throws(() => store.resolveExhaustion(first.runId, original.id, decision, "2026-08-18T12:00:00.000Z"), /stale/);
 		}
+		assert.throws(() => store.retryRuntimeAttempt({ runId: first.runId, operationId: foreign.id, approved: true }), /does not belong to run/);
+		assert.throws(() => store.retryRuntimeAttempt({ runId: first.runId, operationId: original.id, approved: true }), /stale/);
 		assert.deepEqual([store.getState(first.runId), store.getState(second.runId), store.operations(first.runId), store.operations(second.runId), store.events(first.runId)], before);
 		store.close();
 	});
 
 	test("recovery cannot reopen a completed semantic-cap block", () => {
 		const { store } = fixture();
-		const state = store.initRun("semantic-cap-recovery", "build", "Plan");
+		const state = store.initRun("semantic-cap-recovery", "build", "Plan", balancedPolicy());
 		let operation = store.next(state.runId).operations[0];
 		start(store, state.runId, operation.id);
 		complete(store, state.runId, operation.id, "READY", { slices: [{ id: "slice", name: "Slice", task: "Implement", ownedPaths: ["owned.ts"] }] });
@@ -437,42 +477,8 @@ describe("SQLite state store", () => {
 		const before = store.getState(state.runId);
 		assert.equal(before.status, "blocked");
 		assert.equal(store.getOperation(operation.id).status, "completed");
-		assert.throws(() => store.resolveExhaustion(state.runId, operation.id, "retry"), /explicitly blocked operation/);
+		assert.throws(() => store.retryRuntimeAttempt({ runId: state.runId, operationId: operation.id, approved: true }), /explicitly blocked operation/);
 		assert.deepEqual(store.getState(state.runId), before);
-		store.close();
-	});
-
-	test("validates canonical private JSON reports", async () => {
-		const { dir, store } = fixture();
-		const report = join(dir, "report.json");
-		const valid = (verdict: string) => JSON.stringify({
-			schemaVersion: 1,
-			verdict,
-			claims: [{
-				statement: "targeted verification completed",
-				evidence: [{ kind: "command", source: "node --test", detail: "exit 0" }],
-				verification: "verified",
-			}],
-		});
-		writeFileSync(report, valid("PASS"));
-		const accepted = await auditReport(report, { node: "review", privateRoot: dir });
-		expect(accepted.valid).toBe(true);
-		expect(accepted.verdict).toBe("PASS");
-		expect(statSync(report).mode & 0o777).toBe(0o600);
-		writeFileSync(report, JSON.stringify({ schemaVersion: 1, verdict: "PASS", claims: [] }));
-		expect((await auditReport(report, { node: "review", privateRoot: dir })).valid).toBe(false);
-		writeFileSync(report, valid("NOT_OK"));
-		const tester = await auditReport(report, { node: "test", privateRoot: dir });
-		expect(tester.valid).toBe(true);
-		expect(tester.verdict).toBe("NOT_OK");
-		const cliAudit = spawnSync(process.execPath, [
-			"--experimental-strip-types",
-			new URL("../scripts/report-audit.ts", import.meta.url).pathname,
-			"--report", report,
-			"--node", "test",
-			"--private-root", dir,
-		]);
-		expect(cliAudit.status).toBe(0);
 		store.close();
 	});
 
@@ -513,7 +519,7 @@ describe("SQLite state store", () => {
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM operations WHERE id='op_v1'").get()?.selected_model).toBe(null);
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM agents WHERE id='agent_v1'").get()?.selected_model).toBe(null);
 		const version = db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get();
-		expect(version?.version).toBe(5);
+		expect(version?.version).toBe(11);
 		db.close();
 		migrated.close();
 		const reopened = new GraphStore({ dbPath });
@@ -561,158 +567,18 @@ describe("SQLite state store", () => {
 		store.close();
 	});
 
-	test("dispatch events carry the frozen policy digest, role, tier, and chain", () => {
-		const { store } = fixture();
-		const state = store.initRun("events-policy", "build", "Plan", balancedPolicy());
-		const next = store.next(state.runId);
-		const operation = next.operations[0];
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			transport: "herdr",
-			modelPolicy: next.policy.input,
-			policyDigest: next.policy.digest,
-			selectedModel: operation.route?.chain[0],
-			modelAttempt: 0,
-		});
-		const dispatch = store.events(state.runId).find((event) => event.type === "operation_running");
-		const payload = JSON.parse(dispatch?.payload_json ?? "{}") as Record<string, any>;
-		expect(payload.policy.policyDigest).toBe(store.policy(state.runId).digest);
-		expect(payload.policy.inputKind).toBe("preset");
-		expect(payload.policy.role).toBe("thinker");
-		expect(payload.policy.tier).toBe("reasoning");
-		expect(payload.policy.selectedModel).toBe("openai-codex/gpt-5.6-sol");
-		expect(payload.policy.chainLength).toBe(2);
-		expect(payload.policy.modelAttempt).toBe(0);
-		expect(payload.policy.retryAttempt).toBe(0);
-		expect(payload.policy.session).toBe(true);
-		expect(payload.policy.capabilityFloor).toBe("planning");
-		expect(payload.policy.fallbackReason).toBe(null);
-		store.close();
-	});
-
 	test("rejects a conflicting policy or digest on every frozen-route dispatch", () => {
 		const { store } = fixture();
 		const state = store.initRun("immutable-policy", "build", "Plan", balancedPolicy());
 		const next = store.next(state.runId);
 		const operation = next.operations[0];
-		const dispatch = {
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running" as const,
-			transport: "herdr" as const,
-			selectedModel: operation.route?.chain[0],
-			modelAttempt: 0,
-		};
-		expect(() => store.record({ ...dispatch, modelPolicy: next.policy.input, policyDigest: "0".repeat(64) })).toThrow(/digest conflicts/);
-		expect(() =>
-			store.record({
-				...dispatch,
-				modelPolicy: { kind: "preset", preset: "strong" },
-				policyDigest: next.policy.digest,
-			}),
-		).toThrow(/modelPolicy conflicts/);
+		const selectedModel = operation.route?.chain[0] ?? "";
+		const identity = createHeadlessAcpxAttemptIdentity({ runId: state.runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel, agent: selectAcpAgent(selectedModel) });
+		expect(() => store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: "0".repeat(64) })).toThrow(/policy digest mismatch/);
+		const foreignModel = createHeadlessAcpxAttemptIdentity({ ...identity, selectedModel: "openai-codex/gpt-5.5-unfrozen" });
+		expect(() => store.beginRuntimeAttempt({ identity: foreignModel, sessionId: foreignModel.sessionName, requestId: null, policyDigest: next.policy.digest })).toThrow(/conflicts with frozen policy/);
 		expect(store.policy(state.runId).input).toEqual({ kind: "preset", preset: "balanced" });
-		store.close();
-	});
-
-	test("exact model locks reject cross-model fallback", () => {
-		const { store } = fixture();
-		const exact: ResolvedPolicy = {
-			input: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "required for this run" },
-			routes: [{
-				role: "thinker",
-				tier: "exact",
-				chain: ["openai-codex/gpt-5.6-sol"],
-				thinking: "high",
-				session: true,
-				capabilityFloor: "planning",
-				selectionSource: "exact-model",
-				promoted: false,
-				promotionReason: null,
-			}],
-		};
-		const state = store.initRun("exact-lock", "build", "Plan", exact);
-		const next = store.next(state.runId);
-		const operation = next.operations[0];
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			transport: "herdr",
-			modelPolicy: exact.input,
-			policyDigest: next.policy.digest,
-			selectedModel: exact.routes[0].chain[0],
-			modelAttempt: 0,
-		});
-		expect(() => store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			transport: "herdr",
-			modelPolicy: exact.input,
-			policyDigest: next.policy.digest,
-			selectedModel: "another/model",
-			modelAttempt: 1,
-			fallbackReason: "http-429",
-		})).toThrow(/outside the frozen chain|cannot fall back/);
-		store.close();
-	});
-
-	test("keeps same-model retry attempts separate from cross-model fallback attempts", () => {
-		const { store } = fixture();
-		const state = store.initRun("attempts", "build", "Plan", balancedPolicy());
-		const next = store.next(state.runId);
-		const operation = next.operations[0];
-		const binding = { modelPolicy: next.policy.input, policyDigest: next.policy.digest };
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			transport: "herdr",
-			...binding,
-			selectedModel: operation.route?.chain[0],
-			modelAttempt: 0,
-		});
-		const failed = store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "failed",
-			error: "429 rate limit",
-			retryReason: "provider_rate_limit",
-		});
-		expect(failed.retry?.attempt).toBe(1);
-		expect(failed.retry?.modelAttempt).toBe(0);
-		expect(failed.retry?.selectedModel).toBe("openai-codex/gpt-5.6-sol");
-		expect(failed.operation.transient_attempts).toBe(1);
-		expect(failed.operation.model_attempt).toBe(0);
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			transport: "herdr",
-			...binding,
-			selectedModel: operation.route?.chain[1],
-			modelAttempt: 1,
-			fallbackReason: "same_model_retries_exhausted",
-		});
-		const advanced = store.operations(state.runId).find((candidate) => candidate.id === operation.id);
-		expect(advanced?.model_attempt).toBe(1);
-		expect(advanced?.selected_model).toBe("claude-code/claude-opus-5");
-		expect(advanced?.transient_attempts).toBe(0);
-		expect(advanced?.fallback_reason).toBe("same_model_retries_exhausted");
-		const retry = store.events(state.runId).find((event) => event.type === "retry");
-		const retryPayload = JSON.parse(retry?.payload_json ?? "{}");
-		expect(retryPayload.modelAttempt).toBe(0);
-		expect(retryPayload.retryAttempt).toBe(1);
-		expect(retryPayload.retryReason).toBe("provider_rate_limit");
-		expect(retryPayload.fallbackReason).toBe(null);
-		const fallback = store.events(state.runId).find((event) => event.type === "model_fallback");
-		const fallbackPayload = JSON.parse(fallback?.payload_json ?? "{}");
-		expect(fallbackPayload.modelAttempt).toBe(1);
-		expect(fallbackPayload.retryAttempt).toBe(0);
-		expect(fallbackPayload.fallbackReason).toBe("same_model_retries_exhausted");
+		expect(store.runtimeAttemptByOperation(operation.id)).toBe(undefined);
 		store.close();
 	});
 });
@@ -720,7 +586,7 @@ describe("SQLite state store", () => {
 describe("transport-aware agent persistence", () => {
 	test("projects complete headless and Herdr presentation identities", () => {
 		const { store } = fixture();
-		const state = store.initRun("transport-identities", "build", "Plan");
+		const state = store.initRun("transport-identities", "build", "Plan", balancedPolicy());
 		const operation = store.next(state.runId).operations[0]!;
 		const core = { runId: state.runId, node: operation.node, role: "thinker", currentTask: operation.task, acpAgent: "codex" as const, acpxRecordId: "session", acpxSessionId: "session", acpxState: "alive" as const, acpxAttemptKey: "attempt", agentFsSessionId: "session", agentFsDbPath: "/tmp/delta.db", acpxCancelScript: "/tmp/cancel.sh" };
 		store.registerAgent({ ...core, name: "headless-worker", transport: "headless" });
@@ -733,7 +599,7 @@ describe("transport-aware agent persistence", () => {
 
 	test("rejects mixed and partial presentation identity", () => {
 		const { store } = fixture();
-		const state = store.initRun("transport-invalid", "build", "Plan");
+		const state = store.initRun("transport-invalid", "build", "Plan", balancedPolicy());
 		const operation = store.next(state.runId).operations[0]!;
 		const base = { runId: state.runId, node: operation.node, role: "thinker", currentTask: operation.task };
 		assert.throws(() => store.registerAgent({ ...base, name: "mixed", transport: "headless", herdrAgent: "agent", tabId: "tab", herdrPaneId: "pane" }), /cannot contain Herdr identity/);

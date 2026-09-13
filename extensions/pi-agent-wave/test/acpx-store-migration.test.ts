@@ -25,7 +25,7 @@ function fixture(): { directory: string; dbPath: string; store: GraphStore } {
 	return { directory, dbPath, store: new GraphStore({ dbPath }) };
 }
 
-describe("GraphStore transport-aware provenance schema v5", () => {
+describe("GraphStore transport-aware provenance through schema v6", () => {
 	test("migrates idempotently and round-trips complete private provenance", () => {
 		const { dbPath, store } = fixture();
 		const state = store.initRun("acpx-v4", "build", "Plan");
@@ -68,12 +68,12 @@ describe("GraphStore transport-aware provenance schema v5", () => {
 		const columns = db.query<{ name: string }, []>("PRAGMA table_info(agents)").all().map((row) => row.name);
 		const version = db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version;
 		assert.deepEqual(columns.filter((name) => name.startsWith("acp") || name.startsWith("agentfs") || name === "herdr_pane_id"), ["acp_agent", "acpx_record_id", "acpx_session_id", "acpx_state", "acpx_attempt_key", "agentfs_session_id", "agentfs_db_path", "herdr_pane_id", "acpx_cancel_script"]);
-		assert.equal(version, 5);
+		assert.equal(version, 11);
 		db.close();
 	});
 
-	for (const sourceVersion of [1, 2, 3, 4]) {
-		test(`migrates a directly seeded v${sourceVersion} database to v5 preserving rows`, () => {
+	for (const sourceVersion of [1, 2, 3, 4, 5]) {
+		test(`migrates a directly seeded v${sourceVersion} database to v8 preserving rows`, () => {
 			const { dbPath, store } = fixture();
 			const state = store.initRun(`seeded-v${sourceVersion}`, "build", "Plan");
 			const operation = store.next(state.runId).operations[0];
@@ -81,6 +81,7 @@ describe("GraphStore transport-aware provenance schema v5", () => {
 			store.registerAgent({ runId: state.runId, name: "legacy-agent", node: operation.node, role: "thinker", transport: "herdr", herdrAgent: "legacy-herdr", tabId: "legacy-tab", herdrPaneId: "legacy-pane", currentTask: operation.task });
 			store.close();
 			const seeded = new Database(dbPath);
+			seeded.exec("DROP TABLE runtime_decisions; DROP TABLE IF EXISTS runtime_adapters; DROP TABLE runtime_attempts; DROP TRIGGER IF EXISTS runs_result_contract_immutable; DROP TRIGGER IF EXISTS runs_result_contract_graph");
 			seeded.exec("DROP TRIGGER agents_acpx_identity_insert; DROP TRIGGER agents_acpx_identity_update");
 			if (sourceVersion <= 3) for (const column of ["acp_agent", "acpx_record_id", "acpx_session_id", "acpx_state", "acpx_attempt_key", "agentfs_session_id", "agentfs_db_path", "herdr_pane_id", "acpx_cancel_script"]) seeded.exec(`ALTER TABLE agents DROP COLUMN ${column}`);
 			if (sourceVersion <= 2) seeded.exec("ALTER TABLE operations DROP COLUMN command_json");
@@ -99,17 +100,18 @@ describe("GraphStore transport-aware provenance schema v5", () => {
 			seeded.close();
 			const migrated = new GraphStore({ dbPath });
 			assert.equal(migrated.getRun(state.runId).story, `seeded-v${sourceVersion}`);
+			assert.equal("result_contract" in migrated.getRun(state.runId), false);
 			assert.equal(migrated.agents(state.runId)[0]?.name, "legacy-agent");
 			migrated.close();
 			const db = new Database(dbPath, { readonly: true });
-			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 5);
+			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
 			for (const table of ["runs", "operations", "agents", "events"] as const) {
 				const observed = db.query<Record<string, unknown>, []>(`SELECT ${expected[table].columns.join(",")} FROM ${table} ORDER BY rowid`).all();
 				assert.deepEqual(observed, expected[table].rows, `${table} legacy state changed during v${sourceVersion} migration`);
 			}
 			const legacyAgent = db.query<Record<string, unknown>, []>("SELECT acp_agent,acpx_record_id,acpx_session_id,acpx_state,acpx_attempt_key,agentfs_session_id,agentfs_db_path,herdr_pane_id,acpx_cancel_script FROM agents WHERE name='legacy-agent'").get();
 			assert.ok(legacyAgent);
-			assert.ok(Object.entries(legacyAgent).every(([key, value]) => sourceVersion === 4 && key === "herdr_pane_id" ? value === "legacy-pane" : value === null));
+			assert.ok(Object.entries(legacyAgent).every(([key, value]) => sourceVersion >= 4 && key === "herdr_pane_id" ? value === "legacy-pane" : value === null));
 			assert.equal(db.query("PRAGMA foreign_key_check").get(), undefined);
 			assert.ok(db.query<{ name: string }, []>("PRAGMA table_info(agents)").all().some((row) => row.name === "herdr_pane_id"));
 			db.close();
@@ -129,7 +131,7 @@ describe("GraphStore transport-aware provenance schema v5", () => {
 		const db = new Database(dbPath, { readonly: true });
 		const columns = db.query<{ name: string }, []>("PRAGMA table_info(agents)").all().map((row) => row.name);
 		assert.ok(columns.includes("agentfs_db_path"));
-		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 5);
+		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
 		db.close();
 	});
 
@@ -158,7 +160,7 @@ describe("GraphStore transport-aware provenance schema v5", () => {
 			migrated.close();
 
 			const db = new Database(dbPath, { readonly: true });
-			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 5);
+			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
 			const after = db.query<Record<string, unknown>, []>("SELECT * FROM agents ORDER BY rowid").all().map((row) => ({ ...row, transport: "<retired>" }));
 			assert.deepEqual(after, expected, `retired ${retiredTransport} row lost data during migration`);
 			assert.equal(db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM agents").get()?.count, 1);

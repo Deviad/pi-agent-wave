@@ -13,7 +13,7 @@ describe("production evidence-only review gate", () => {
 		try {
 			const prompt = join(directory, "prompt.md");
 			writeFileSync(prompt, "Inspect durable evidence.\n");
-			const config = parseWorkerConfig({ schemaVersion: 1, acpxExecutable: "/usr/bin/false", agent: "codex", selectedModel: "openai-codex/gpt-5.6-sol", sessionName: "review", workspaceRelative: ".", node: "review", reportPath: join(directory, "report.json"), acpxHome: directory, mode: "prompt", promptFile: prompt, resultPath: join(directory, "result.json"), stdoutPath: join(directory, "stdout"), stderrPath: join(directory, "stderr"), timeoutSeconds: 5, hostReadOnly: true, discardAllChanges: true, noTerminal: true });
+			const config = parseWorkerConfig({ schemaVersion: 1, resultContract: "runtime-v1", attemptKey: "fixture-attempt", acpxExecutable: "/usr/bin/false", agent: "codex", selectedModel: "openai-codex/gpt-5.6-sol", sessionName: "review", workspaceRelative: ".", node: "review", acpxHome: directory, mode: "prompt", promptFile: prompt, resultPath: join(directory, "result.json"), stdoutPath: join(directory, "stdout"), stderrPath: join(directory, "stderr"), timeoutSeconds: 5, hostReadOnly: true, discardAllChanges: true, noTerminal: true });
 			const args = buildPromptArgv(config);
 			assert.ok(args.includes("--no-terminal"));
 			assert.ok(args.indexOf("--no-terminal") < args.indexOf("codex"));

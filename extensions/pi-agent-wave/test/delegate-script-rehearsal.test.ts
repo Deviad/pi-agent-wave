@@ -31,7 +31,7 @@ describe("TypeScript Delegate Graph script rehearsal", () => {
 		assert.ok(!JSON.stringify(herdr).includes("bash -lc"));
 	});
 
-	test("renders concise operational command and report-repair prompts without workflow duplication", () => {
+	test("renders a concise operational command instruction without workflow duplication", () => {
 		const helper = fileURLToPath(new URL("../scripts/herdr_delegate.py", import.meta.url));
 		const command = JSON.stringify({ executable: "node", args: ["/opt/search.mjs", "--source", "linkedin"], cwd: "/work" });
 		const commandProbe = spawnSync("python3", ["-c", "import runpy,sys; print(runpy.run_path(sys.argv[1])['operational_instruction'](sys.argv[2]))", helper, command], { encoding: "utf8" });
@@ -39,12 +39,6 @@ describe("TypeScript Delegate Graph script rehearsal", () => {
 		assert.match(commandProbe.stdout, /first execution command/);
 		assert.match(commandProbe.stdout, /\["node", "\/opt\/search\.mjs", "--source", "linkedin"\]/);
 		assert.doesNotMatch(commandProbe.stdout, /jh-doctor|cdp-preflight|salary|scoring/);
-		const reportPrompt = fileURLToPath(new URL("../scripts/report-prompt.ts", import.meta.url));
-		const repair = spawnSync("node", ["--experimental-strip-types", reportPrompt, "--node", "source_search", "--report", "/tmp/report.json", "--repair-json", JSON.stringify([{ code: "EXECUTION_REQUIRED", path: "$.execution", message: "missing" }])], { encoding: "utf8" });
-		assert.equal(repair.status, 0, repair.stderr);
-		assert.equal(repair.stdout.length < 2_000, true);
-		assert.match(repair.stdout, /EXECUTION_REQUIRED|execution/);
-		assert.doesNotMatch(repair.stdout, /Read and execute the complete assigned task|jh-doctor|cdp-preflight/);
 	});
 
 	test("deferred runner propagates Pi exit and removes its plist", () => {

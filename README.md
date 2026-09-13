@@ -1,22 +1,22 @@
 # pi-agent-wave
 
-pi-agent-wave adds reliable multi-agent orchestration to Pi. JetBrains Air can launch Pi through ACP and control delegated work while pi-agent-wave runs Pi, Codex, and Claude workers through ACPX inside AgentFS sandboxes. Herdr is optional.
+pi-agent-wave turns Pi into a supervisor for ordered, evidence-gated multi-agent work. It runs Pi, Codex, and Claude workers through ACPX, gives each attempt its own AgentFS copy-on-write sandbox, and records every run in a durable graph that JetBrains Air or a terminal can drive and inspect. Herdr is an optional presentation layer, never a requirement.
 
 ## Why use it?
 
-- **Control Pi from Air.** Air owns the `pi-acp` session; pi-agent-wave returns structured progress, status, questions, cancellation, and results through Pi.
-- **Keep complex work ordered.** A graph prevents review or testing from starting before its dependencies finish.
-- **Isolate every attempt.** Each ACPX worker receives its own AgentFS copy-on-write sandbox and exports only audited owned paths.
-- **Require proof.** Reports, process state, ACPX state, graph state, cleanup, and ledger evidence must agree before settlement.
-- **Keep presentation optional.** Headless mode needs no Herdr process or workspace. Existing Herdr tabs and focus remain available when Herdr is active.
+- **Control Pi from Air.** Air owns the `pi-acp` session. pi-agent-wave reports structured progress, status, questions, cancellation, and results back through Pi's tool channel, so an ACP client can run a whole delegation without a terminal.
+- **Keep complex work ordered.** A graph fixes the sequence of planning, implementation, review, testing, and audit. Nothing starts before its dependencies settle, and fan-outs join before the next node begins.
+- **Isolate every attempt.** One ACPX session and one AgentFS sandbox per attempt. Writable roles stage only audited owned paths, placed into your workspace through a journal you can roll back; read-only roles stage nothing.
+- **Require proof.** A run retains the worker's answer and audited changes as immutable facts before anything is closed or cleaned up, and advances only on an explicit, reasoned decision.
+- **Keep presentation optional.** Headless mode needs no Herdr process or workspace. Inside a Herdr workspace the same runs gain visible worker tabs, a rendered view of each worker's stream, and a numbered agent list that opens by itself when a worker starts and shows each worker's details inside the terminal.
 
-pi-agent-wave provides `/delegate`, `/graph`, the `delegate_graph` tool, ACP-safe structured questions, session metadata hooks, and model failover.
+The package provides `/delegate`, `/graph`, `/failover`, the `delegate_graph` and `questionnaire` tools, cmux session metadata hooks, native model failover, and the integrated `claude-code` authentication provider.
 
 ## How it works
 
-A **supervisor** (Pi running the `delegate_graph` tool) coordinates a run. It does not do the work itself: it pulls the next pending operation from a shared **GraphStore**, dispatches one **worker** for it, and verifies the result before the graph advances. **Workers never talk to each other directly** — every hand-off flows through the supervisor and the GraphStore event ledger.
+A **supervisor** (Pi running the `delegate_graph` tool) coordinates a run without doing the work itself. It reads the next pending operation from a shared **GraphStore**, dispatches one **worker** for it, collects the worker's evidence, and advances the graph only when that evidence satisfies the operation's gate. Workers never talk to each other; every hand-off flows through the supervisor and the GraphStore event ledger.
 
-Each worker is one ACPX agent — Pi, Codex, or Claude — chosen by the run's frozen policy for that role, and it runs in its own AgentFS copy-on-write sandbox. The worker writes a private JSON report; the supervisor collects it and checks that report, process state, ACPX state, graph state, cleanup, and ledger evidence all agree before settling the operation.
+Each worker is one ACPX agent, chosen by the run's frozen model policy for its role: `openai-codex/*` models run on Codex, `claude-code/*` models run on Claude, and every other model runs on Pi. The worker executes inside an AgentFS sandbox with a materialized, provider-scoped credential and a private configuration snapshot.
 
 ```mermaid
 flowchart TB
@@ -25,34 +25,36 @@ flowchart TB
     subgraph SUP["Supervisor: Pi running delegate_graph"]
         next["op=next<br/>pending operation + frozen route"]
         dispatch["op=dispatch<br/>launch one worker"]
-        collect["op=collect<br/>verify settlement evidence"]
+        collect["op=collect<br/>settle from evidence"]
+        decide["op=decide<br/>advance the graph"]
     end
 
-    ledger[("GraphStore<br/>run state + event ledger")]
+    ledger[("GraphStore<br/>runs · operations · attempts · event ledger")]
 
-    subgraph WORK["Workers: one ACPX agent per role (Pi · Codex · Claude)"]
+    subgraph WORK["Workers: one ACPX agent per attempt (Pi · Codex · Claude)"]
         thinker["thinker<br/>plan · split · synthesize"]
         impl["implementer<br/>write code"]
         rev["reviewer<br/>PASS / FAIL"]
         test["tester<br/>GREEN / NOT_OK"]
         aud["auditor<br/>evidence PASS"]
-        search["searcher<br/>source search"]
+        search["searcher<br/>read-only research"]
     end
 
     fs["AgentFS sandbox<br/>copy-on-write, one per attempt"]
-    report["private JSON report + settlement evidence"]
+    evidence["private evidence<br/>retained answer + audited changes"]
 
     user --> SUP
     SUP <--> ledger
     dispatch -->|"task + frozen route"| WORK
     WORK -.->|"runs inside"| fs
-    WORK -->|"writes"| report
-    report --> collect
-    collect -->|"verdict + evidence"| ledger
+    WORK -->|"produces"| evidence
+    evidence --> collect
+    collect --> decide
+    decide --> ledger
     ledger -.->|"next operation"| next
 ```
 
-In the **build** graph the supervisor walks the roles in order, with review and test able to loop back to implementation:
+The **build** graph walks its roles in order, with review and test able to loop back to implementation within fixed budgets:
 
 ```mermaid
 flowchart LR
@@ -65,7 +67,13 @@ flowchart LR
     AU -->|"PASS"| DONE(["terminal"])
 ```
 
-The **research** graph is `thinker_split → search (fan-out) → thinker_synthesize`, and the **operations** graph is `source_search (fan-out) → thinker_synthesize → audit`; each ends at a terminal node once its final audit passes.
+The **research** graph is `thinker_split → search (fan-out) → thinker_synthesize`, and the **operations** graph is `source_search (fan-out) → thinker_synthesize → audit`. Every graph ends at a terminal node once its last gate passes.
+
+### Result contract
+
+Every run uses one result contract, frozen at creation.
+
+- **`runtime-v1`** is the only result contract. The supervisor retains the worker's public answer and, for implementation and operational sources, its audited AgentFS changes as immutable content before anything is closed or cleaned up. An `exited` attempt with a candidate must then be accepted or rejected with a reason through `op=decide`; a `failed`, `interrupted` or candidate-less attempt is replaced through `op=retry` under a three-attempt same-model budget and the frozen model chain. Every run is refused until `/graph enable-adapter` has recorded real capture evidence for every adapter the run can route to. No adapter is enabled by default, so a fresh installation refuses `/delegate` until that act, and the contract has no autonomous scheduling. Its status and remaining work are recorded in [the runtime-owned results issue](tasks/prd-runtime-owned-results.md). The earlier report contract, `legacy-v1`, was removed on 2026-09-12.
 
 ## Requirements
 
@@ -75,7 +83,7 @@ The **research** graph is `thinker_split → search (fan-out) → thinker_synthe
 - For JetBrains Air: `pi-acp` `0.0.31` and an absolute Node/npx path.
 - Optional: Herdr for visible worker tabs and focus.
 
-ACPX, AgentFS, `pi-acp`, and Herdr are external runtimes and are not bundled.
+ACPX, AgentFS, `pi-acp`, and Herdr are external runtimes. pi-agent-wave bundles none of them.
 
 ## 1. Install ACPX and AgentFS
 
@@ -89,7 +97,7 @@ agentfs --version
 
 AgentFS release downloads and checksums: https://github.com/tursodatabase/agentfs/releases/tag/v0.6.4
 
-Claude execution requires a token created by `claude setup-token` and exposed only through a mode-600 file path in `PI_CLAUDE_OAUTH_TOKEN_FILE`. The doctor reports missing or insecure configuration without printing token values.
+Claude workers need a token created by `claude setup-token`, exposed only through a mode-600 file whose path is in `PI_CLAUDE_OAUTH_TOKEN_FILE`. The doctor reports a missing or insecure file without printing token values.
 
 ## 2. Install pi-agent-wave
 
@@ -107,7 +115,7 @@ pi install npm:@dpugliese/pi-agent-wave
 
 Do not use the npm command before publication.
 
-Preview and apply configuration from the source checkout:
+Preview the configuration, apply it, and run the read-only doctor:
 
 ```bash
 node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs
@@ -117,17 +125,21 @@ node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs
 
 After npm publication, the package binaries will be `pi-agent-wave-init`, `pi-agent-wave-init apply`, and `pi-agent-wave-doctor`.
 
-The default Pi home is `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` or pass `--agent-dir` when another temporary Pi home is required.
+Pi's home defaults to `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` or pass `--agent-dir` to use another one. Pi loads the extension from the checkout path at startup, so restart Pi after installing or changing it.
+
+No enablement step exists: a worker runs on the adapter its frozen model selects. Put a Pi-adapter model behind every Codex or Claude entry in `~/.pi/agent/model-routing.jsonc` so an exhausted quota falls over to another provider.
+
+Pi and Codex are proven on every graph (Codex: `agent-output/runtime-measure-codex-20260912/`, `runtime-measure-codex-build-20260912/`, `runtime-measure-codex-operations-20260912/`); Claude has passed its probe (`agent-output/runtime-result-probe-run4-20260912/claude.json`) but not a graph run. Runs and their retained evidence live under `~/.cache/delegate-graph/`; see [environment and storage](extensions/pi-agent-wave/README.md#environment-and-storage).
 
 ## 3. Add Pi to JetBrains Air
 
-In Air, open the agent selector and choose **Add ACP Agent**. Air opens its global `acp.json`. First obtain the absolute npx path:
+In Air, open the agent selector and choose **Add ACP Agent**. Air opens its global `acp.json`. Find the absolute npx path first:
 
 ```bash
 command -v npx
 ```
 
-Add Pi using that exact path:
+Register Pi with that exact path:
 
 ```json
 {
@@ -143,33 +155,36 @@ Add Pi using that exact path:
 }
 ```
 
-Save `acp.json`, start a new Air task, and select **Pi**. Air launches and owns the Pi ACP process; pi-agent-wave does not claim that Air attaches to an externally owned ACPX worker session.
+Save `acp.json`, start a new Air task, and select **Pi**. Air launches and owns the Pi ACP process. pi-agent-wave never attaches Air to an externally owned ACPX worker session.
 
 ## 4. Run from Air
 
-Ask Pi to use `delegate_graph`, for example:
+Ask Pi to use `delegate_graph`:
 
 ```text
 Use delegate_graph to implement tenant-scoped API keys. Keep me updated and ask before resolving blocked recovery choices.
 ```
 
-Air receives structured tool progress and final results. Pi slash commands may not be exposed by every ACP client, so Air workflows use the equivalent `delegate_graph` operations for initialization, status, cancellation, recovery, and resume.
+Air receives structured tool progress and final results. Because not every ACP client exposes Pi slash commands, Air workflows use the equivalent `delegate_graph` operations for initialization, status, cancellation, recovery, and resume. The structured question tool renders as native pickers in Air, with explicit Back, Cancel, and Submit steps.
 
 For structured source-command workflows, see [operational search delegation](extensions/pi-agent-wave/README.md#operational-search-delegation).
 
-In a Pi terminal, the existing commands remain available:
+In a Pi terminal the commands are:
 
 ```text
 /delegate Implement tenant-scoped API keys
 /graph status <runId>
+/graph watch <runId> --follow
 /graph log <runId>
 ```
 
-Headless workers cannot be focused. Use status and log inspection instead.
+When the first worker of a Pi session registers, a numbered agent list opens above the editor and later workers append to it with stable numbers, including retries and workers from other runs started in the same session. Type a number and press Enter to open that worker's details in the terminal: run, node and role, model, task, process state and acceptance, the rendered tail of its live output, and its retained answer after settlement. `r` refreshes, `q` or Escape returns to the list and then closes it, and `/graph agents` reopens it. The list reads keys only while the editor is empty, so typing a command is never interrupted. Details never depend on a Herdr tab still existing and nothing in the list dispatches, cancels, settles or decides work.
+
+`/graph watch` shows what every running worker is doing right now, rendered from its stream; with `--follow` (also `/graph status <runId> --follow`) it stays on screen as the run-scoped follow view, where number keys jump to a worker's Herdr tab. Headless workers appear in the follow view but cannot be focused. Air receives the same summary as `watch` progress events.
 
 ## Optional: Herdr presentation
 
-Install Herdr only if visible worker tabs and focus are desired:
+Install Herdr only if you want visible worker tabs and focus:
 
 ```bash
 brew install herdr
@@ -177,20 +192,21 @@ cd /path/to/project
 herdr
 ```
 
-Start Pi inside the Herdr workspace. `auto` transport selects Herdr only when the executable and complete workspace/tab identity are present; otherwise it selects headless. Explicit `herdr` fails closed outside a valid workspace, while explicit `headless` never creates worker tabs.
+Start Pi inside the Herdr workspace (Ghostty or any terminal Herdr manages). The `auto` transport selects Herdr only when the executable and complete workspace and tab identity are present; otherwise it selects headless. An explicit `herdr` transport fails closed outside a valid workspace, and an explicit `headless` transport never creates worker tabs.
+
+Each worker owns one tab named after the story and role. The tab shows the worker's stream rendered as content, never the JSON-RPC envelope: assistant text as it streams, thoughts dimmed when the role's tier enables thinking, one line per tool call, and short rules at turn boundaries. `/graph focus` and the number keys of `/graph watch --follow` bring a tab forward.
 
 ## Worker execution and cleanup
 
-pi-agent-wave uses **ACPX-only worker execution** through a shared transport-neutral lifecycle:
+Worker execution is **ACPX-only** through one transport-neutral lifecycle:
 
-- `openai-codex/*` routes use ACPX Codex, `claude-code/*` routes use ACPX Claude, and other configured models use ACPX Pi.
-- Every operation attempt gets a unique ACPX session and AgentFS overlay.
-- Writable nodes export only audited graph-owned paths. Read-only nodes discard all overlay changes.
-- Headless and Herdr adapters share planning, launch, report audit/repair, cancellation, export, settlement, and granular cleanup.
-- Headless settlement records verified headless presentation identity and never invents Herdr visibility evidence.
-- Pi execution-only supervisor reports are non-semantic. Provider credentials never enter package state or evidence.
+- Every attempt gets a unique ACPX session and AgentFS overlay, keyed by run, operation, model attempt, and transient attempt. A retry or fallback mints a new identity; it never reuses a closed session.
+- The credential store of the agent that will actually execute the model is preflighted, then materialized as a mode-600 file holding only the selected provider. The live Pi `auth.json` is never linked into an attempt.
+- Writable roles stage only audited graph-owned paths as content; `integrate` places them through a journal with preimages and rollback. Read-only roles discard the whole overlay. A worker that uses an absolute host path bypasses the overlay on this host; workers are told to stay in their working directory, and this is a known open limitation.
+- Headless and Herdr adapters share planning, launch, audit, cancellation, settlement, and cleanup. Cleanup is audited resource by resource, and any remaining resource is a failure.
+- A retry-exhausted run parks with an in-session notification only. No modal dialog or sound is raised.
 
-For release verification, run `node --experimental-strip-types extensions/pi-agent-wave/scripts/production-audit.ts` outside AgentFS. Reviewers consume its source-current hash-indexed evidence through ACPX `--no-terminal` without rerunning nested package or AgentFS commands.
+For release verification, run `node --experimental-strip-types extensions/pi-agent-wave/scripts/production-audit.ts` outside AgentFS. A reviewer consumes its hash-indexed evidence through ACPX `--no-terminal` without re-running package or AgentFS commands.
 
 ## Uninstall
 
@@ -204,11 +220,11 @@ After npm publication:
 pi remove npm:@dpugliese/pi-agent-wave
 ```
 
-Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs.
+Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs under `~/.cache/delegate-graph/`.
 
 ## Security
 
-Pi extensions run with the user's system access. Review launch and configuration code before installation. pi-agent-wave packages no external runtimes, credentials, user settings, databases, or generated evidence.
+Pi extensions run with your user account's full system access. Review the source before installation, especially the worker-launch and migration scripts. pi-agent-wave packages no external runtimes, credentials, user settings, databases, or generated evidence.
 
 ## Compatibility
 
@@ -219,10 +235,18 @@ Pi extensions run with the user's system access. Review launch and configuration
 | AgentFS | `0.6.4` |
 | pi-acp | `0.0.31` |
 
-JetBrains Air support requires the real installed-application rehearsal defined by `tasks/prd-air-controlled-editor-independent-orchestration.md`; no final compatibility claim is made until that proof passes.
+JetBrains Air support is claimed only to the extent proven by the installed-application rehearsal in `tasks/prd-air-controlled-editor-independent-orchestration.md`.
 
 ## For contributors
 
-Package source is under [`extensions/pi-agent-wave/`](extensions/pi-agent-wave/). Development rules are in [`AGENTS.md`](AGENTS.md). The active plan is [`tasks/prd-air-controlled-editor-independent-orchestration.md`](tasks/prd-air-controlled-editor-independent-orchestration.md).
+Package source is under [`extensions/pi-agent-wave/`](extensions/pi-agent-wave/). The development contract is [`AGENTS.md`](AGENTS.md). The canonical scope record is [`tasks/prd-package-delegate-graph.md`](tasks/prd-package-delegate-graph.md); the runtime-v1 work is tracked in [`tasks/prd-runtime-owned-results.md`](tasks/prd-runtime-owned-results.md).
 
 pi-agent-wave is available under the [MIT License](extensions/pi-agent-wave/LICENSE).
+
+## Claude provider and header updates
+
+The package includes a locally maintained adaptation of `@cgaravitoq/pi-claude-code-auth` 2.2.2. It lets a Pi supervisor select `claude-code` models using the existing Claude Code OAuth session. Graph workers still use Claude Code through ACPX.
+
+When replacing the separate auth package, remove `npm:@cgaravitoq/pi-claude-code-auth` from Pi’s package list and restart Pi after installing this build’s dependencies. Keep just one provider registration. Existing `claude-code` login credentials remain usable; `/login claude-code` is available when needed.
+
+After upgrading the Claude Code CLI, run `/claude-headers update` in Pi. It reads `claude --version` and saves version-dependent request metadata to `$PI_CODING_AGENT_DIR/claude-code-headers.json` (default `~/.pi/agent/claude-code-headers.json`). `/claude-headers status` shows the effective version. The next request uses the update without restarting. The command does not install CLI releases or discover new protocol/beta flags. See the [provider reference](extensions/pi-agent-wave/README.md#claude-provider-and-header-updates) for configuration and migration details.

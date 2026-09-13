@@ -11,7 +11,7 @@ import { detectPiFzf, fzfCommandTargets, packageRoutePicker } from "../lib/pi-fz
 import { DELEGATE_GRAPH_ROLES, REQUIRED_TIERS } from "../lib/routing-template.mjs";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const PACKAGE_ENTRY_POINTS = ["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts"];
+const PACKAGE_ENTRY_POINTS = ["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts", "claude-code-auth.ts"];
 const FZF_TARGET_COMMANDS = ["route", "delegate-model"];
 const FZF_TARGET_FIELDS = ["list", "preview"];
 

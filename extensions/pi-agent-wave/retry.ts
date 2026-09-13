@@ -26,6 +26,14 @@ const TRANSIENT_PATTERNS: Array<[RegExp, string]> = [
 	[/provider credential target changed/i, "provider-link-churn"],
 	[/\breport-missing\b|without authoring its report/i, "worker-report-missing"],
 	[/worker preflight|no usable credential/i, "worker-credential-preflight"],
+	[/\bREPORT_UNAVAILABLE\b/, "worker-report-unavailable"],
+	[/exited before result/i, "worker-exited-before-result"],
+	[/exited without a candidate/i, "worker-empty-answer"],
+	[/runtime configuration snapshot changed/i, "runtime-snapshot-churn"],
+	// The audit could not read an overlay path; a genuine "unowned changes" verdict is not here and stays permanent.
+	[/AgentFS audit error/i, "agentfs-audit-error"],
+	[/AgentFS snapshot failed/i, "agentfs-snapshot-error"],
+	[/ACPX worker result present but worker process \d+ did not exit within/i, "timeout"],
 ];
 
 /**
@@ -49,6 +57,8 @@ const NEVER_LAUNCHED_PATTERN = /no worker was registered|command never started|w
 /** Classifies infrastructure-shaped failures without treating semantic verdicts as retryable. */
 export function classifyFailure(message: string, semanticVerdict = false): FailureClassification {
 	if (semanticVerdict) return { kind: "permanent", reason: "semantic-verdict" };
+	// Ownership failures stay permanent even when their path names resemble provider errors.
+	if (/\[owned_path_escape\]|AgentFS (?:contains unowned changes|export failed[^\n]*: unowned changes)/i.test(message)) return { kind: "permanent", reason: "unclassified" };
 	if (APPROVAL_BLOCK_PATTERN.test(message)) return { kind: "permanent", reason: "approval-block" };
 	for (const [pattern, reason] of TRANSIENT_PATTERNS) {
 		if (pattern.test(message)) return { kind: "transient", reason };

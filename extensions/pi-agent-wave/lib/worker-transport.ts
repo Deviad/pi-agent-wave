@@ -24,7 +24,6 @@ export type WorkerAttemptIdentity = Readonly<WorkerAttemptIdentityInput>;
 export interface WorkerLaunchRequest {
 	identity: WorkerAttemptIdentity;
 	taskFile: string;
-	reportPath: string;
 	readOnly: boolean;
 	ownedPaths: readonly string[];
 }
@@ -37,7 +36,6 @@ export interface WorkerHandle {
 export interface WorkerSettlement {
 	identity: WorkerAttemptIdentity;
 	verdict: string;
-	reportPath: string;
 	settlementEvidencePath: string;
 	cleanupEvidencePath: string;
 }

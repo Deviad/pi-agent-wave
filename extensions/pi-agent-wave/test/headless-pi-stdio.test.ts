@@ -15,7 +15,7 @@ describe("headless Pi ACP stdio lifecycle", () => {
 			const count = join(root, "count");
 			writeFileSync(executable, `#!/bin/sh\nn=0; [ -f '${count}' ] && n=$(cat '${count}'); n=$((n+1)); echo "$n" > '${count}'\nif [ "$n" -eq 1 ]; then printf '%s\\n' '{"error":{"message":"Cannot call write after a stream was destroyed"}}'; exit 1; fi\nprintf '%s\\n' '{"action":"session_ensured"}'\n`, { mode: 0o700 });
 			chmodSync(executable, 0o700);
-			const config = parseWorkerConfig({ schemaVersion: 1, acpxExecutable: executable, agent: "pi", selectedModel: "anthropic/claude-fable-5", sessionName: "retry", workspaceRelative: ".", node: "audit", reportPath: join(root, "report.json"), acpxHome: root, mode: "prompt", promptFile: join(root, "prompt.md"), resultPath: join(root, "result.json"), stdoutPath: join(root, "stdout"), stderrPath: join(root, "stderr"), timeoutSeconds: 5, hostReadOnly: true, discardAllChanges: true, noTerminal: false });
+			const config = parseWorkerConfig({ schemaVersion: 1, resultContract: "runtime-v1", attemptKey: "fixture-attempt", acpxExecutable: executable, agent: "pi", selectedModel: "anthropic/claude-fable-5", sessionName: "retry", workspaceRelative: ".", node: "audit", acpxHome: root, mode: "prompt", promptFile: join(root, "prompt.md"), resultPath: join(root, "result.json"), stdoutPath: join(root, "stdout"), stderrPath: join(root, "stderr"), timeoutSeconds: 5, hostReadOnly: true, discardAllChanges: true, noTerminal: false });
 			writeFileSync(config.promptFile, "fixture");
 			const retried = ensureAcpxSession(config, process.env);
 			assert.equal(retried.exitCode, 0);

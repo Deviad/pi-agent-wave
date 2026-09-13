@@ -18,7 +18,7 @@ function config() {
 	directories.push(directory);
 	const prompt = join(directory, "prompt.md");
 	writeFileSync(prompt, "unused\n");
-	return parseWorkerConfig({ schemaVersion: 1, acpxExecutable: FAKE_ACPX, agent: "codex", selectedModel: "openai-codex/gpt-5.6-sol", sessionName: "cancel-session", workspaceRelative: ".", node: "implement", reportPath: join(directory, "report.json"), acpxHome: directory, mode: "close", promptFile: prompt, resultPath: join(directory, "result.json"), stdoutPath: join(directory, "stdout"), stderrPath: join(directory, "stderr"), timeoutSeconds: 5, hostReadOnly: false, discardAllChanges: false, noTerminal: false });
+	return parseWorkerConfig({ schemaVersion: 1, resultContract: "runtime-v1", attemptKey: "fixture-attempt", acpxExecutable: FAKE_ACPX, agent: "codex", selectedModel: "openai-codex/gpt-5.6-sol", sessionName: "cancel-session", workspaceRelative: ".", node: "implement", acpxHome: directory, mode: "close", promptFile: prompt, resultPath: join(directory, "result.json"), stdoutPath: join(directory, "stdout"), stderrPath: join(directory, "stderr"), timeoutSeconds: 5, hostReadOnly: false, discardAllChanges: false, noTerminal: false });
 }
 
 describe("structured ACPX cancellation and close", () => {

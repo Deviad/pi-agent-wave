@@ -453,10 +453,28 @@ def inventory_case(case: str) -> dict[str, object]:
         owned["provider_links"] = [str(link)]
     elif case == "report-repair-child": processes = f"125 report repair {owned['attempt_dir']}"
     elif case == "attempt-directory": Path(str(owned["attempt_dir"])).mkdir(parents=True)
+    elif case == "supervisor-noise":
+        # Supervisor lines carry the session name / attempt directory as arguments.
+        processes = "\n".join([
+            f"200 python3 scripts/herdr_delegate.py wait {owned['run_dir']} session-owned",
+            f"201 python3 scripts/headless_supervisor.py --session session-owned {owned['attempt_dir']}",
+            "203 python3 scripts/herdr_delegate.py start session-owned",
+        ])
+    elif case == "launcher-worker":
+        processes = f"202 /bin/sh {owned['attempt_dir']}/launch-acpx.sh"
+    elif case == "supervisor-named-argument":
+        processes = "206 agentfs run --session session-owned node worker.ts herdr_delegate.py"
+    elif case == "session-worker":
+        processes = "\n".join([
+            f"200 python3 scripts/herdr_delegate.py wait {owned['run_dir']} session-owned",
+            "204 agentfs run --session session-owned --no-default-allows node acpx-worker.ts",
+        ])
+    elif case == "attempt-worker":
+        processes = f"205 node --experimental-strip-types acpx-worker.ts {owned['attempt_dir']}/worker-config.json"
     else: raise ValueError(case)
     try:
         inventory = module.cleanup_absence_inventory(owned, tabs, pane_exists, agent_exists, processes, mounts)
-        return {"case": case, "falseFields": sorted(key for key, value in inventory.items() if value is False)}
+        return {"case": case, "falseFields": sorted(key for key, value in inventory.items() if value is False), "ownedProcessMatches": inventory["ownedProcessMatches"]}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

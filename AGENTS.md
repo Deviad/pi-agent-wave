@@ -1,61 +1,82 @@
 # pi-agent-wave development contract
 
-## Scope and plan of record
+This repository develops `@dpugliese/pi-agent-wave`, a Pi package whose source lives in `extensions/pi-agent-wave/`. Every agent or person working here follows this file.
 
-This repository develops `@dpugliese/pi-agent-wave`. The package root is `extensions/pi-agent-wave/`.
+## Plan of record
 
-`tasks/prd-package-delegate-graph.md` is the canonical issue and scope record. Before implementing any behavior, architecture, approach, or acceptance-criteria change, update that PRD first. Implement only the recorded scope. A specific documentation or maintenance edit explicitly requested by the user does not require a second issue.
+`tasks/prd-package-delegate-graph.md` is the canonical issue and scope record. `tasks/prd-runtime-owned-results.md` governs the `runtime-v1` result contract, and `tasks/prd-air-controlled-editor-independent-orchestration.md` governs the transport-neutral Air/headless work. Before changing behavior, architecture, approach, or acceptance criteria, update the governing PRD first, then implement only what it records. A documentation or maintenance edit the user asked for explicitly needs no separate issue.
 
 ## Product invariants
 
-- Preserve the public `/delegate`, `/graph`, and `delegate_graph` contracts.
-- Preserve graph topology, scheduling, retries, evidence gates, and model-policy behavior unless the PRD explicitly changes them.
-- A Pi worker turn with no assistant or tool activity is a failed attempt, never a projected verdict.
-- A credential preflight checks the store of the agent that will execute the model (Codex, Claude, or Pi), never a different agent's store; `agent_for_model()` in `scripts/delegate_core.py`, `agentForModel()` in `scripts/doctor.mjs`, and `selectAcpAgent()` in `lib/acpx-select.ts` must agree, and a test pins all three.
-- The live `~/.pi/agent/auth.json` is never linked into a worker attempt. Provider credentials are preflighted with `pi auth check --no-refresh` and materialized as a mode-600 file for the selected provider only.
-- A positive graph verdict never originates from the supervisor projection. A Pi worker that exits without authoring its report leaves the operation to be redispatched; `op=record status=completed` rejects the projection for every semantic node.
-- Transient worker failures (429/5xx, quota, timeout, connection loss, `ACPX worker failed`, provider-link churn) advance the operation to the next model of its frozen chain once the current model's same-model budget is spent; semantic verdicts never trigger failover and exact-model locks never advance.
-- A terminated worker attempt must always settle: `op=collect` records the failure and names the retained `failure-<operationId>.json` diagnostic instead of leaving the operation running.
-- Worker execution is transport-neutral and ACPX-only. Headless operation must load with ACPX and AgentFS alone; Herdr is an optional presentation adapter selected only with complete executable/workspace identity. Implement this change only under `tasks/prd-air-controlled-editor-independent-orchestration.md` while preserving existing graph, settlement, and evidence behavior.
-- Package exactly the pi-agent-wave graph extension plus questionnaire, cmux-session, and model-failover entry points.
-- Herdr executables and Herdr-managed files remain external and must not enter the npm artifact.
-- Do not recreate the legacy loose-install source directory; only migration code and migration tests may identify it.
-- Do not restore retired orchestration instructions, files, environment aliases, fixed-role pane layouts, or generated workflow artifacts.
+Public surface:
+
+- Keep the `/delegate`, `/graph`, `/failover`, `delegate_graph`, and `questionnaire` contracts.
+- Keep graph topology, joins, retry budgets, evidence gates, and model-policy behavior unless a PRD changes them.
+- Package exactly the graph extension plus the `questionnaire`, `cmux-session`, `model-failover`, and `claude-code-auth` entry points. The Claude auth provider is adapted from upstream MIT source; preserve its license in `lib/claude-auth-LICENSE` and maintain integration documentation in this package’s READMEs. Its pinned core and SDK are declared runtime dependencies. Herdr executables, Herdr-managed files, credentials, databases, and generated evidence never enter the npm artifact.
+
+Result contracts:
+
+- `runtime-v1` is the only result contract; `legacy-v1` (worker-authored JSON reports, `op=record` settlement, the file ledger, report repair, owned-path export) was removed on 2026-09-12 and must not be reintroduced. Operations runs settle operational candidates: answer, staged owned artifacts, observed checkpoint; placement through the journal without Git checks. There is no adapter enablement gate: schema v11 dropped `runtime_adapters` and `/graph enable-adapter` on 2026-09-12; a worker runs on the adapter its frozen model selects, and provider exhaustion is the frozen chain's job (`retry.ts` transient classification, three transient attempts, then `awaiting_user`). Do not reintroduce a per-adapter switch.
+- Runtime answers for `review`, `test`, `audit` and `source_search` end with one `VERDICT: <value>` line; `op=decide` takes the value the caller reads there.
+- Claude's attempt copies of `settings.json` and `.claude.json` are tolerated self-writes: still a regular mode-600 JSON object, every change recorded as `configurationSelfWrites`, never a boundary failure. Every other snapshot keeps exact bytes. Codex is proven on the research, build and operations graphs with its terminal present (graph dispatch never passes `--no-terminal`); without a terminal it has no file access, which only the evidence-only review gate removes. Codex's own `sandbox-exec` can be refused inside the AgentFS overlay; a worker then reports a verification blocker and the graph recovers through its verdict edge, so an extra implement/review/test cycle is an observed cost, not a defect. A dispatch resource carries no legacy export configuration: settlement passes the AgentFS snapshot path straight into `runtime-settle.json`, and the lifecycle proof settles a real owned write through `agentfs run` from the resource `prepare_acpx_attempt` builds.
+- Runtime attempts settle only through `op=collect`, which records facts: process outcome, retained candidate, observed session identity. Retention precedes session close, provider verification, and cleanup; a failure after retention is reported, never used to discard a candidate.
+- Runtime attempts advance only through `op=decide` with a reason. A `failed` or `interrupted` attempt is replaced only through `op=retry` (or the operator's `op=resolve decision=retry` / `/graph resume`), which supersedes the attempt and mints the next frozen identity. `op=record` exists only for cancellation; `defer`, `abort` and `escalate` are graph transitions, and an escalated run can be resumed by the operator. Settlement evidence is published atomically (temporary file, fsync, exclusive link) and never rewritten. `/graph ledger` is derived output and is consulted by no gate. `/graph watch` and `op=watch` are likewise read-only: they render the tail of a running worker's retained ACPX stream and never decide, settle or retry anything; the worker's pane shows the same rendering (`lib/acpx-render.ts`) while the JSON stream goes only to the capture files. `/graph watch --follow` and the numbered agent list (`agent-list.ts`) are the only places a redraw timer is allowed: it runs only while the widget is open and something listed is running, stops on `q`, and one interactive view replaces the other. The agent list opens by itself when a worker registers in a TUI session (`runtime_attempt_registered`, after the registration succeeded), appends later attempts with session-local numbers that are never persisted, opens details by number plus Enter without any Herdr focus or cancel command, reads keys only while the editor is empty, and is absent in headless and ACP modes.
+- A positive semantic verdict never originates from an exit code. An attempt that exits without a candidate (empty or incomplete capture) is a transient `worker-empty-answer` failure replaced through `op=retry`, and its raw stream is retained for diagnosis.
+
+Workers and credentials:
+
+- Worker execution is transport-neutral and ACPX-only. Headless must load with ACPX and AgentFS alone; Herdr is an optional presentation adapter selected only with complete executable and workspace identity.
+- The credential preflight checks the store of the agent that will execute the model, never another agent's store. `agent_for_model()` in `scripts/delegate_core.py`, `agentForModel()` in `scripts/doctor.mjs`, and `selectAcpAgent()` in `lib/acpx-select.ts` must agree, and a test pins all three.
+- The live `~/.pi/agent/auth.json` is never linked into an attempt. Credentials are preflighted with `pi auth check --no-refresh` and materialized as a mode-600 file for the selected provider only.
+- Transient failures (429/5xx, quota, timeout, connection loss, `ACPX worker failed`, provider-link churn, audit or snapshot errors, exit without a candidate) spend the three-attempt same-model budget, then advance along the frozen chain. Semantic verdicts never trigger failover, denied authorizations are permanent, and exact-model locks never advance. `op=retry` is the only path that applies this classification.
+- The frozen route's `thinking` level is written into the worker's private Pi settings as `defaultThinkingLevel` at dispatch; the supervisor's own default is only the fallback. Ignored overlay paths default to `.git/index` in both the launcher and the staging library, and the two defaults must stay identical. An operational command's `checkpoint` must lie under one of its owned paths; its `cwd` must be the worker's working directory, and the instruction to the worker names it as `.`.
+- Known open hazard: inside `agentfs run` on this host, a process that changes into an absolute host path writes to the host outside the overlay, invisible to the audit. Never put absolute host paths into a worker's task or instruction, and do not treat a host file that has no overlay change as audited work; settlement refuses a declared checkpoint in that state.
+- A terminated attempt always settles: `op=collect` records the failure and names the retained diagnostic instead of leaving the operation running.
+- User notification is in-session only (`ctx.ui.notify`). Never spawn modal dialogs, speech, or sounds; a headless gate must never block on a desktop prompt.
+
+History:
+
+- Do not recreate the legacy loose-install source directory; only migration code and its tests may name it.
+- Do not restore retired orchestration instructions, environment aliases, fixed-role pane layouts, or generated workflow artifacts.
 
 ## Source ownership
 
-- `extensions/pi-agent-wave/*.ts` — extension entry points and runtime.
-- `extensions/pi-agent-wave/lib/` — package-private portable helpers and declarations.
-- `extensions/pi-agent-wave/scripts/` — transport-neutral worker lifecycle, headless and optional Herdr adapters, evidence tooling, policy resolution, and migration.
-- `extensions/pi-agent-wave/test/` — all automated verification.
-- `extensions/pi-agent-wave/README.md` — user-facing installation and operations documentation.
-- `README.md` — user-first product overview and install, run, inspection, and uninstall guide.
-- `tasks/prd-package-delegate-graph.md` — issue and acceptance proof.
-- `agent-output/` — generated evidence only; never package it.
+| Path | Contents |
+| --- | --- |
+| `extensions/pi-agent-wave/*.ts` | Extension entry points, `GraphStore`, retry classification, route picker |
+| `extensions/pi-agent-wave/lib/` | Package-private portable helpers: ACPX identity, events and stream rendering, runtime capture, process, output, content, staging, integration, results, AgentFS audit, worker transport |
+| `extensions/pi-agent-wave/scripts/` | Transport-neutral worker lifecycle (Python), headless and Herdr adapters, the ACPX worker, runtime settlement, cancellation, policy resolution, route picker, init, doctor, migration, production audit and scans |
+| `extensions/pi-agent-wave/test/` | All automated verification; `test/support/` holds the fake ACPX, lifecycle and cleanup drivers, the live probe, the measurement driver, and the test-only AgentFS export harness (`agentfs-export.ts`, never shipped) |
+| `extensions/pi-agent-wave/README.md` | User-facing installation, configuration, and operations reference |
+| `README.md` | Product overview and the install, Air, run, and uninstall journey |
+| `tasks/` | PRDs and acceptance records |
+| `agent-output/` | Generated evidence only; never packaged, never a substitute for a fresh run |
 
-When parallel workers are used, assign every writable path to exactly one worker. All unowned paths are read-only.
+When parallel workers are used, assign every writable path to exactly one worker; every other path is read-only to it.
 
 ## Implementation rules
 
-- Take a restore point before editing. Use the current commit for clean tracked files; copy untracked or already-dirty files before changing them.
-- Make surgical changes and match the surrounding TypeScript, JavaScript, and Python style.
-- Prefer types that make invalid states unconstructible. Do not use `any`, casts, or ignore directives merely to silence a valid type error.
-- Comments document usage or constraints that code cannot express. Remove or update stale comments in the same change.
-- Keep callers, declarations, tests, README files, package metadata, and migration behavior synchronized.
-- Shipped code must use package-relative imports or the declared Pi peer packages. Never add `/Users/...`, Homebrew, npm-cache, or package-root escape imports.
-- Use `PI_CODING_AGENT_DIR`, `PI_MODEL_ROUTING`, and `PI_MODEL_CATALOG` for configurable paths. Tests must use temporary agent directories.
+- Take a restore point before editing: the current commit covers clean tracked files; copy untracked or already-dirty files before touching them.
+- Make surgical changes in the surrounding TypeScript, JavaScript, or Python style.
+- Prefer types that make invalid states unconstructible. No `any`, casts, or ignore directives to silence a valid type error.
+- Comments state usage or constraints the code cannot express. Remove or update stale comments in the same change.
+- Keep callers, declarations, tests, both READMEs, package metadata, and migrations synchronized in one change.
+- Shipped code uses package-relative imports, the declared Pi peer packages, or explicitly declared runtime dependencies. Never add `/Users/...`, Homebrew, npm-cache, or package-root escape imports.
+- Configurable paths come from `PI_CODING_AGENT_DIR`, `PI_MODEL_ROUTING`, and `PI_MODEL_CATALOG`. Tests use temporary agent directories.
+- Schema changes are migrations with seeded tests for every earlier version; historical rows must survive byte-for-byte. Additive changes use `ensureColumn`; a change SQLite cannot make in place (dropping a constrained column, a unique constraint) rebuilds the table the way v8 and v10 do: foreign keys off, one immediate transaction re-checked under the lock, dependent triggers dropped first and recreated after, copy, drop, rename, index recreation, `PRAGMA foreign_key_check` before commit. Repairs that run on every open (the v6 pattern) must be gated below the version that removed what they create.
 
 ## Tests and proof
 
-Write a focused failing test before a behavioral fix, then make it pass. Use real reachable dependencies; fixtures are allowed for temporary Pi homes and seeded loose-install layouts, not as substitutes for installed Pi versions, npm, Git, SQLite, or the actual package loader.
+Write a focused failing test before a behavioral change, then make it pass. Use real reachable dependencies: temporary Pi homes, temporary Git repositories, real SQLite, and real AgentFS where the host permits. Fixtures never stand in for installed Pi versions, npm, Git, SQLite, or the package loader. Literal ACP event inputs prove parser behavior only, never adapter compatibility.
 
-From the repository root, the completion gate is:
+Completion gate, from the repository root:
 
 ```bash
 node --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts
+git diff --check
 ```
 
-Package-focused Bun checks:
+Package-focused Bun checks (single files only; Bun cannot run the whole directory because the matrix imports `node:sqlite`):
 
 ```bash
 bun test \
@@ -69,46 +90,62 @@ bun test \
   extensions/pi-agent-wave/test/model-failover.test.ts
 ```
 
-The real installation matrix is intentionally Node-only because it exercises `node:sqlite`:
+Node-only installation rehearsal:
 
 ```bash
 node --experimental-strip-types --test extensions/pi-agent-wave/test/package-install-rehearsal.test.ts
 ```
 
-`test/acpx-real-matrix.test.ts` sits in the completion glob above, but its three cases skip unless `RUN_REAL_ACPX_MATRIX=1` and a `PI_CLAUDE_OAUTH_TOKEN_FILE` are present. To run them for real, use the guard from the package directory; it refuses when the configuration is missing rather than reporting three skips as a pass, and it dispatches live worker sessions that spend provider credits:
+Package checks, from `extensions/pi-agent-wave/`:
+
+```bash
+npm run typecheck
+npm pack --dry-run --json --ignore-scripts
+npm publish --dry-run --json --ignore-scripts
+```
+
+Live checks spend provider credits and need explicit user authorization each time:
 
 ```bash
 cd extensions/pi-agent-wave
 PI_CLAUDE_OAUTH_TOKEN_FILE=~/.config/pi/acpx-claude-token.txt npm run test:acpx
-npm run test:acpx -- --dry-run   # print the command, start nothing
+npm run test:acpx -- --dry-run
+python3 test/support/runtime-result-probe.py --dry-run
+python3 test/support/runtime-result-probe.py --preflight
+python3 test/support/runtime-result-probe.py --agents claude --dry-run
+node --experimental-strip-types test/support/runtime-measure.ts --preflight
+node --experimental-strip-types test/support/runtime-measure.ts --graph build --dry-run
+node --experimental-strip-types test/support/runtime-measure.ts --graph operations --dry-run
 ```
 
-Additional required checks:
+The measurement driver is the standard live proof for a launcher or worker change: one research run with `--execute --repeats 1` proves the end-to-end path in about five minutes and samples `op=watch` while workers run. The Claude token file expires within hours; refresh it from the Keychain item `Claude Code-credentials` before a Claude run.
 
-```bash
-cd extensions/pi-agent-wave
-npm run typecheck
-npm pack --dry-run --json --ignore-scripts
-npm publish --dry-run --json --ignore-scripts
-cd ../..
-git diff --check
-```
+Evidence layout under `agent-output/` (private, never packaged): `runtime-result-probe-run{1,2,3,4}-20260912/` are the adapter probes cited as adapter evidence by the PRD; `runtime-measure-20260912*/`, `runtime-measure-build-20260912*/`, `runtime-measure-operations-20260912-smoke*/`, `runtime-measure-post-removal-20260912/` and `runtime-measure-watch-20260912/` are measurement runs; `runtime-completion-20260912/` holds the gate logs named after each increment. The PRDs cite these paths; a new increment adds its own log there and cites it.
 
-Do not weaken an assertion to make a failing proof green. If a real prerequisite blocks a criterion, record the blocker in the PRD.
+Runtime storage while developing: the graph database defaults to `~/.cache/delegate-graph/delegate-graph.db` with `runtime-content/` and `failures/` beside it; tests and drivers must set `DELEGATE_GRAPH_DB` to a temporary path before initializing a run. Private run directories are `/tmp/delegate-graph-herdr-<run>-<operation>.*`.
 
-## Migration and system safety
+`test/acpx-real-matrix.test.ts` sits in the completion glob but skips unless `RUN_REAL_ACPX_MATRIX=1` and a `PI_CLAUDE_OAUTH_TOKEN_FILE` are present; the `test:acpx` guard refuses rather than reporting skips as passes.
 
-- Migration defaults to dry-run. Never run `apply` against the real Pi installation without explicit authorization.
-- Migration tests must use temporary `PI_CODING_AGENT_DIR` trees, preserve `herdr-agent-state.ts`, repair stale pi-fzf route-picker commands, validate private backup permissions, reject path-tampered manifests, and prove byte-exact settings plus `fzf.json` rollback.
-- Installation rehearsals may use network subprocesses only against npm and temporary loopback Git infrastructure. They must not dispatch workers.
-- Never modify the real `~/.pi/agent/extensions/`, Pi settings, credentials, model routing, databases, or caches as part of development verification.
-- Never run `npm publish`, create or push a public repository, commit, push, merge, or apply a real migration unless the user explicitly asks.
+Current Claude stop-reason gate (2026-09-13): 497 Node tests, 459 passed, 27 failed, 11 opt-in skips; preceding auth-integration Bun 46/46 and 75 packed files. Full acceptance is blocked on the restricted host (AgentFS/loopback/process inspection and installation rehearsal); see the auth increment in the package PRD and `agent-output/claude-auth-integration-20260913/`. The preceding recorded increment had 486 tests, 475 passed, 0 failed and 11 skips. Never weaken an assertion to turn a proof green. When a host prerequisite blocks a criterion, record the blocker and the fresh counts in the governing PRD. Report counts, skips, failures, and the source revision from the run you made, not from an earlier log.
+
+## System safety
+
+- Migration and initialization default to dry-run. Never run `apply` against the real Pi installation without explicit authorization.
+- Migration tests use temporary `PI_CODING_AGENT_DIR` trees, preserve `herdr-agent-state.ts`, repair stale pi-fzf commands, validate private backup permissions, reject path-tampered manifests, and prove byte-exact settings and `fzf.json` rollback.
+- Installation rehearsals may reach npm and temporary loopback Git only. They never dispatch workers.
+- Development verification never modifies the real `~/.pi/agent/extensions/`, Pi settings, credentials, model routing, databases, or caches.
+- Never `npm publish`, create or push a public repository, commit, push, merge, or apply a real migration unless the user explicitly asks.
 
 ## Documentation and release hygiene
 
-- User-facing behavior changes require matching updates to `extensions/pi-agent-wave/README.md`.
-- Development workflow changes require matching updates to this file and root `README.md`.
-- Keep compatibility claims limited to versions proven by the real installation rehearsal.
+- A user-facing behavior change updates `extensions/pi-agent-wave/README.md`; a workflow change updates this file and the root `README.md`.
+- Compatibility claims are limited to versions proven by the real installation rehearsal.
 - Do not invent `repository`, `homepage`, or `bugs` metadata.
 - Do not commit `node_modules/`, tarballs, temporary files, caches, or generated installation trees.
-- Before reporting completion, verify observable files, run the relevant checks, and report partial completion honestly.
+- Before reporting completion, verify the observable files, run the relevant checks, and state partial completion plainly.
+
+## Claude provider maintenance
+
+The supervisor auth provider is vendored from `@cgaravitoq/pi-claude-code-auth` 2.2.2; maintain its entry point and `lib/claude-auth-*` helpers here, preserve the upstream license, and write package-specific documentation rather than copying the upstream README. Credential logic remains in the pinned core dependency. Loading the extension must not read credentials or refresh tokens. Graph workers retain their ACPX adapter selection.
+
+`/claude-headers update` is an explicit operator command that queries `claude --version` and saves `$PI_CODING_AGENT_DIR/claude-code-headers.json` atomically with mode 600. Requests use the saved version for both HTTP and billing metadata, with upstream environment overrides taking precedence. Do not infer new beta flags from a CLI version. Tests use temporary agent directories and synthetic request tokens; they never invoke login, refresh, or paid model calls. Test failures must not print environment dictionaries or credentials.

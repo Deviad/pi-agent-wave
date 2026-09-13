@@ -9,7 +9,7 @@ if (process.env.FAKE_EXPECT_CLAUDE_TOKEN && process.env.CLAUDE_CODE_OAUTH_TOKEN 
 if (args.includes("--version")) {
 	process.stdout.write("0.13.2\n");
 } else if (args.includes("ensure")) {
-	process.stdout.write(`${JSON.stringify({ action: "session_created", acpxRecordId: "record-fixture", acpxSessionId: "session-fixture" })}\n`);
+	process.stdout.write(`${JSON.stringify({ action: "session_ensured", acpxRecordId: "record-fixture", acpxSessionId: "session-fixture" })}\n`);
 } else if (args.includes("read")) {
 	process.stdout.write(`${JSON.stringify({ action: "session_history", entries: existsSync(join(process.env.HOME ?? ".", ".fake-acpx-cancelled")) ? [{ result: { stopReason: "cancelled" } }] : [] })}\n`);
 } else if (args.includes("close")) {

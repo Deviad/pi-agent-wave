@@ -24,6 +24,8 @@ import {
 } from "../index.ts";
 import { parseDeferredTime, writeDeferredJob } from "../scheduler.ts";
 import { GraphStore, roleForNode } from "../store.ts";
+import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
+import { selectAcpAgent } from "../lib/acpx-select.ts";
 import type { ResolvedPolicy } from "../types.ts";
 import { packageRoot } from "./support/repoRoot.ts";
 
@@ -78,6 +80,26 @@ function fallbackPolicy(): ResolvedPolicy {
 }
 
 const dirs: string[] = [];
+
+/** Registers a runtime attempt for a pending operation the way dispatch does. */
+function start(store: GraphStore, runId: string, operationId: string, agentId?: string): string {
+	const next = store.next(runId);
+	const operation = next.operations.find((candidate) => candidate.id === operationId);
+	if (!operation) throw new Error(`operation ${operationId} is not pending`);
+	const selectedModel = operation.route?.chain[operation.model_attempt] ?? SOL_MODEL;
+	const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId, role: roleForNode(operation.node), modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts, selectedModel, agent: selectAcpAgent(selectedModel) });
+	const registered = agentId ?? store.registerAgent({ runId, name: `worker-${operationId.slice(-8)}-${operation.transient_attempts}`, node: operation.node, role: roleForNode(operation.node), transport: "headless", currentTask: operation.task });
+	store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: next.policy.digest, agentId: registered });
+	return identity.attemptKey;
+}
+
+/** Settles the operation's attempt as failed and lets the runtime classify the retry. */
+function fail(store: GraphStore, runId: string, operationId: string, error: string) {
+	const attempt = store.runtimeAttemptByOperation(operationId);
+	if (!attempt) throw new Error(`operation ${operationId} has no runtime attempt`);
+	store.settleRuntimeAttempt({ attemptKey: attempt.attemptKey, outcome: { kind: "failed", exitCode: 1, error } });
+	return store.retryRuntimeAttempt({ runId, operationId });
+}
 function fixture(): { dir: string; store: GraphStore } {
 	const dir = mkdtempSync(join(tmpdir(), "delegate-graph-command-"));
 	dirs.push(dir);
@@ -97,6 +119,7 @@ describe("supervisor UX", () => {
 			registerCommand(name: string) {
 				commands.push(name);
 			},
+			on() {},
 			registerTool(tool: { name: string; parameters: unknown }) {
 				tools.push(tool);
 			},
@@ -121,19 +144,15 @@ describe("supervisor UX", () => {
 		const operation = next.operations[0]!;
 		const digest = next.policy.digest;
 		const agentId = store.registerAgent({ runId: state.runId, name: "thinker-1", node: "thinker_plan", role: "thinker", transport: "herdr", herdrAgent: "dg-ux-thinker-1", tabId: "w1:t2", herdrPaneId: "w1:p2", policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0, currentTask: operation.task });
-		store.record({ runId: state.runId, operationId: operation.id, status: "running", agentId, agentName: "thinker-1", transport: "herdr", modelPolicy: next.policy.input, policyDigest: digest, selectedModel: SOL_MODEL, modelAttempt: 0 });
+		const attemptKey = start(store, state.runId, operation.id, agentId);
 		const status = renderStatus(store, state.runId);
 		const log = renderLog(store, state.runId);
 		expect(status).toContain(`policy=Strong | digest=${digest}`);
-		expect(status).toContain(`thinker-1 | thinker_plan | herdr | Strong | reasoning | ${SOL_MODEL} | 1/2 | running`);
+		expect(status).toContain(`${operation.id} | process=running | acceptance=unavailable`);
+		expect(status).toContain(`thinker-1 | thinker_plan | herdr | Strong | reasoning | ${SOL_MODEL} | 1/2 |`);
 		expect(status).toContain("2026-08-17T12:00:00.000Z");
-		expect(log).toContain("supervisor -> thinker-1");
-		expect(log).toContain("reply_to=supervisor");
-		expect(log).toContain("policy=Strong");
-		expect(log).toContain("tier=reasoning");
-		expect(log).toContain(`model=${SOL_MODEL}`);
-		expect(log).toContain("attempt=1/2");
-		expect(log).toContain(`digest=${digest}`);
+		expect(log).toContain("runtime_attempt_registered");
+		expect(store.runtimeAttempt(attemptKey).processState).toBe("running");
 		expect(log).toContain("message=Build UX");
 		store.close();
 	});
@@ -157,12 +176,12 @@ describe("supervisor UX", () => {
 		expect(timers).toBe(0);
 	});
 
-	test("retry exhaustion emits the focus trio and asks for an in-session decision", async () => {
+	test("retry exhaustion notifies in-session without spawning alert processes", async () => {
 		const { store } = fixture();
-		const state = store.initRun("recovery-ux", "build", "Recover");
+		const state = store.initRun("recovery-ux", "build", "Recover", exactPolicy());
 		const operation = store.next(state.runId).operations[0];
-		store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "herdr" });
-		store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "compile error" });
+		start(store, state.runId, operation.id);
+		expect(fail(store, state.runId, operation.id, "compile error").exhausted).toBe(true);
 		const calls: string[][] = [];
 		const fakePi = {
 			exec: async (command: string, args: string[]) => {
@@ -170,16 +189,19 @@ describe("supervisor UX", () => {
 				return { code: 0, stdout: "", stderr: "", killed: false };
 			},
 		} as unknown as ExtensionAPI;
+		const notices: string[] = [];
 		const fakeContext = {
 			mode: "tui",
 			ui: {
 				select: async () => "Retry now",
+				notify: (message: string, level: string) => notices.push(`${level}: ${message}`),
 			},
 		} as unknown as ExtensionContext;
 		const { resolveUserDecision } = await import("../index.ts");
 		const decision = await resolveUserDecision(fakePi, fakeContext, store, state.runId, operation.id);
 		expect(decision.action).toBe("retry");
-		expect(calls.map((call) => call[0])).toEqual(["afplay", "say", "osascript"]);
+		expect(calls).toEqual([]);
+		expect(notices).toEqual([`warning: Delegate Graph ${state.runId} exhausted transient retries and needs your decision.`]);
 		expect(store.getState(state.runId).status).toBe("active");
 		store.close();
 	});
@@ -192,10 +214,10 @@ describe("supervisor UX", () => {
 			["Escalate", "blocked"],
 		] as const) {
 			const { store } = fixture();
-			const state = store.initRun(`recovery-${choice}`, "build", "Recover");
+			const state = store.initRun(`recovery-${choice}`, "build", "Recover", exactPolicy());
 			const operation = store.next(state.runId).operations[0];
-			store.record({ runId: state.runId, operationId: operation.id, status: "running", transport: "herdr" });
-			store.record({ runId: state.runId, operationId: operation.id, status: "failed", error: "compile error" });
+			start(store, state.runId, operation.id);
+			expect(fail(store, state.runId, operation.id, "compile error").exhausted).toBe(true);
 			const calls: string[][] = [];
 			const fakePi = {
 				exec: async (command: string, args: string[]) => {
@@ -208,6 +230,7 @@ describe("supervisor UX", () => {
 				ui: {
 					select: async () => choice,
 					input: async () => "+15m",
+					notify: () => undefined,
 				},
 			} as unknown as ExtensionContext;
 			const decision = await resolveUserDecision(fakePi, fakeContext, store, state.runId, operation.id);
@@ -224,7 +247,7 @@ describe("supervisor UX", () => {
 	test("production registration maps graph nodes to persisted attempt roles", () => {
 		expect(["thinker_plan", "thinker_synthesize", "implement", "review", "test", "audit", "search"].map((node) => roleForNode(node as Parameters<typeof roleForNode>[0]))).toEqual(["thinker", "thinker", "implementer", "reviewer", "tester", "auditor", "searcher"]);
 		const source = readFileSync(join(packageRoot, "index.ts"), "utf8");
-		expect(source).toContain("role: roleForNode(operation.node)");
+		expect(source).toContain("const role = roleForNode(operation.node);");
 		expect(source.includes("role: operation.node")).toBe(false);
 	});
 
@@ -393,33 +416,16 @@ describe("supervisor UX", () => {
 			modelAttempt: 0,
 			currentTask: operation.task,
 		});
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			agentId,
-			agentName: "exact-thinker",
-			transport: "herdr",
-			modelPolicy: input,
-			policyDigest: next.policy.digest,
-			selectedModel: SOL_MODEL,
-			modelAttempt: 0,
-		});
+		const identity = createHeadlessAcpxAttemptIdentity({ runId: state.runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: SOL_MODEL, agent: selectAcpAgent(SOL_MODEL) });
+		expect(() => store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: "0".repeat(64), agentId })).toThrow(/policy digest mismatch/);
+		const unfrozen = createHeadlessAcpxAttemptIdentity({ ...identity, selectedModel: "openai-codex/gpt-5.5-unfrozen" });
+		expect(() => store.beginRuntimeAttempt({ identity: unfrozen, sessionId: unfrozen.sessionName, requestId: null, policyDigest: next.policy.digest, agentId })).toThrow(/conflicts with frozen policy|exact lock/);
+		store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: next.policy.digest, agentId });
 		const registered = store.agents(state.runId)[0]!;
 		expect(registered.policy_digest).toBe(next.policy.digest);
 		expect(registered.selected_model).toBe(SOL_MODEL);
 		expect(registered.model_attempt).toBe(0);
-		expect(() => store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			agentId,
-			transport: "herdr",
-			modelPolicy: { kind: "auto" },
-			policyDigest: next.policy.digest,
-			selectedModel: SOL_MODEL,
-			modelAttempt: 0,
-		})).toThrow(/model policy.*frozen|conflict/i);
+		expect(store.runtimeAttemptByOperation(operation.id)?.attemptKey).toBe(identity.attemptKey);
 		store.close();
 	});
 
@@ -476,11 +482,9 @@ exit 0
 			const state = store.initRun(`launcher-${scenario.expectedAttempt}`, "build", "Plan", scenario.policy);
 			const next = store.next(state.runId);
 			const operation = next.operations[0]!;
-			const reportPath = join(dir, `report-${scenario.expectedAttempt}.json`);
 			const commonArgs = [
 				"--policy", modelPolicyLabel(next.policy.input),
 				"--policy-digest", next.policy.digest,
-				"--report", reportPath,
 				"--task-file", taskPath,
 			];
 			const launcher = scenario.expectedAttempt === 0
@@ -511,21 +515,14 @@ exit 0
 				modelAttempt: launcher["model-attempt"],
 				currentTask: operation.task,
 			});
-			const recorded = store.record({
-				runId: state.runId,
-				operationId: operation.id,
-				status: "running",
-				agentId,
-				agentName: launcher.agent,
-				transport: "herdr",
-				modelPolicy: next.policy.input,
-				policyDigest: launcher["policy-digest"],
-				selectedModel: launcher.model,
-				modelAttempt: launcher["model-attempt"],
-				fallbackReason: launcher["fallback-reason"] ?? undefined,
-			});
-			expect(recorded.operation.selected_model).toBe(scenario.expectedModel);
-			expect(recorded.operation.model_attempt).toBe(scenario.expectedAttempt);
+			const identity = createHeadlessAcpxAttemptIdentity({ runId: state.runId, operationId: operation.id, role: "thinker", modelAttempt: launcher["model-attempt"], transientAttempt: 0, selectedModel: launcher.model, agent: selectAcpAgent(launcher.model) });
+			if (scenario.expectedAttempt === 0) {
+				store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: launcher["policy-digest"], agentId });
+				expect(store.runtimeAttemptByOperation(operation.id)?.attemptKey).toBe(identity.attemptKey);
+			} else {
+				// A launcher may echo a fallback route, but the graph advances model attempts only through its own retry: a fresh operation refuses attempt 1.
+				expect(() => store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: launcher["policy-digest"], agentId })).toThrow(/identity/);
+			}
 		}
 		store.close();
 	});
@@ -582,73 +579,24 @@ exit 0
 	test("makes transient cross-model fallback explicit in events, status, and log", () => {
 		const { store } = fixture();
 		const state = store.initRun("fallback-visibility", "build", "Plan", fallbackPolicy());
-		const next = store.next(state.runId);
-		const operation = next.operations[0]!;
-		const digest = next.policy.digest;
-		const agentId = store.registerAgent({
-			runId: state.runId,
-			name: "fallback-thinker",
-			node: "thinker_plan",
-			role: "thinker",
-			transport: "herdr",
-			herdrAgent: "dg-fallback-thinker",
-			tabId: "workspace:tab",
-			herdrPaneId: "workspace:pane",
-			policyDigest: digest,
-			selectedModel: SOL_MODEL,
-			modelAttempt: 0,
-			currentTask: operation.task,
-		});
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			agentId,
-			agentName: "fallback-thinker",
-			transport: "herdr",
-			modelPolicy: fallbackPolicy().input,
-			policyDigest: digest,
-			selectedModel: SOL_MODEL,
-			modelAttempt: 0,
-		});
-		const failed = store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "failed",
-			agentId,
-			agentName: "fallback-thinker",
-			error: "HTTP 503 during provider launch",
-			modelPolicy: fallbackPolicy().input,
-			policyDigest: digest,
-			selectedModel: SOL_MODEL,
-			modelAttempt: 0,
-			retryReason: "provider-launch",
-			fallbackReason: "http-503",
-		});
-		expect(failed.retry?.modelAttempt).toBe(0);
-		expect(failed.retry?.selectedModel).toBe(SOL_MODEL);
-		store.record({
-			runId: state.runId,
-			operationId: operation.id,
-			status: "running",
-			agentId,
-			agentName: "fallback-thinker",
-			transport: "herdr",
-			modelPolicy: fallbackPolicy().input,
-			policyDigest: digest,
-			selectedModel: "anthropic/claude-opus-4-1",
-			modelAttempt: 1,
-			retryReason: "provider-launch",
-			fallbackReason: "http-503",
-		});
+		const operation = store.next(state.runId).operations[0]!;
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			start(store, state.runId, operation.id);
+			const retried = fail(store, state.runId, operation.id, "HTTP 503 during provider launch");
+			expect(retried.retry?.modelAttempt).toBe(0);
+			expect(retried.retry?.selectedModel).toBe(SOL_MODEL);
+		}
+		start(store, state.runId, operation.id);
+		const fallback = fail(store, state.runId, operation.id, "HTTP 503 during provider launch");
+		expect(fallback.retry?.modelAttempt).toBe(1);
+		expect(fallback.retry?.selectedModel).toBe(FALLBACK_MODEL);
 		const events = store.events(state.runId);
-		expect(events.some((event) => event.type === "model_selected")).toBe(true);
+		expect(events.filter((event) => event.type === "retry")).toHaveLength(3);
 		expect(events.some((event) => event.type === "model_fallback")).toBe(true);
 		const log = renderLog(store, state.runId);
-		expect(log).toContain("model_selected");
 		expect(log).toContain("model_fallback");
 		expect(log).toContain("fallback=http-503");
-		expect(log).toContain("model=anthropic/claude-opus-4-1");
+		expect(log).toContain(`model=${FALLBACK_MODEL}`);
 		expect(log).toContain("attempt=2/2");
 		store.close();
 	});

@@ -88,7 +88,7 @@ describe("production host audit bundle", () => {
 		const output = join(directory, "audit.json");
 		const bundle = runProductionAudit(root, output, runner(), () => ({ ...cleanMachine }));
 		assert.equal(bundle.ok, true, JSON.stringify({ stale: bundle.artifacts.filter((artifact) => !artifact.sourceCurrent).map((artifact) => [artifact.path, artifact.productionSourceSha256]), cleanup: bundle.cleanup, secret: bundle.secretScan, changed: bundle.sourceChangedDuringAudit }));
-		assert.equal(bundle.commands.length, 14);
+		assert.equal(bundle.commands.length, 13);
 		assert.ok(bundle.commands.every((command) => command.outputSha256.length === 64));
 		assert.ok(bundle.artifacts.every((artifact) => artifact.sha256.length === 64 && artifact.mode === "600"));
 		assert.ok(bundle.artifacts.every((artifact) => artifact.sourceCurrent));

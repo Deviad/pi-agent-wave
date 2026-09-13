@@ -68,6 +68,8 @@ export interface OperationalCommand {
 	executable: string;
 	args: string[];
 	cwd: string;
+	/** Persisted with the command when the spec declares a checkpoint file; passed to the launcher unchanged. */
+	checkpoint?: string;
 }
 
 /** One independently owned command dispatched by an operational-search graph. */
@@ -76,6 +78,8 @@ export interface OperationalCommandSpec {
 	name: string;
 	command: OperationalCommand;
 	ownedPaths: string[];
+	/** Checkpoint file the source script writes, relative to the command cwd (or absolute), under one of the owned paths. */
+	checkpoint?: string;
 }
 
 export interface SliceSpec {
@@ -159,7 +163,6 @@ export interface OperationRow {
 	selected_model: string | null;
 	command_json: string | null;
 	task: string;
-	report_path: string | null;
 	verdict: string | null;
 	classifier_reason: string | null;
 	retry_reason: string | null;

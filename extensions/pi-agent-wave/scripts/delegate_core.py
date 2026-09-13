@@ -12,6 +12,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -21,14 +22,11 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RESOLVER = SCRIPT_DIR / "resolve-model.mjs"
-REPORT_AUDIT = SCRIPT_DIR / "report-audit.ts"
-REPORT_PROMPT = SCRIPT_DIR / "report-prompt.ts"
-LEDGER = SCRIPT_DIR / "ledger.ts"
 ACPX_WORKER = SCRIPT_DIR / "acpx-worker.ts"
+RUNTIME_SETTLE = SCRIPT_DIR / "runtime-settle.ts"
 HEADLESS_SUPERVISOR = SCRIPT_DIR / "headless_supervisor.py"
 ACPX_CANCEL = SCRIPT_DIR / "acpx-cancel.ts"
 ACPX_PLAN = SCRIPT_DIR / "acpx-plan.ts"
-AGENTFS_EXPORT = SCRIPT_DIR / "agentfs-export.ts"
 NODE = shutil.which("node") or "node"
 TMP_ROOT = Path("/tmp").resolve()
 RUN_PREFIX = "delegate-graph-herdr-"
@@ -257,10 +255,14 @@ def command_init(args: argparse.Namespace) -> None:
     write_private(
         run_dir / "system-prompt.txt",
         "You are a Delegate Graph leaf agent. Execute only the assigned task using "
-        "available tools. Do not delegate recursively. Follow the assigned JSON report "
-        "contract exactly. The report file is the sole verdict source.\n",
+        "available tools. Do not delegate recursively. Reply with your complete result as "
+        "assistant text; the runtime retains it and the supervisor decides it.\n",
     )
     print(run_dir)
+
+
+# Nodes whose runtime-v1 answer must end with a verdict line; op=decide takes the value the caller reads there.
+RUNTIME_VERDICT_NODES: dict[str, tuple[str, ...]] = {"review": ("PASS", "FAIL"), "test": ("GREEN", "NOT_OK"), "audit": ("PASS", "FAIL"), "source_search": ("DONE", "BLOCKED")}
 
 
 def resolve_tier(tier: str) -> tuple[list[str], str, bool]:
@@ -380,7 +382,10 @@ def tab_create_argv(
     return argv
 
 
-def operational_instruction(raw: str | None) -> str:
+def operational_instruction(raw: str | None, cwd: Path | None = None) -> str:
+    """The worker runs the exact argv from the directory it starts in. The instruction never names an absolute host
+    path: on this host a worker that changes into one writes straight to the host, outside the AgentFS overlay, and
+    the ownership audit sees nothing (2026-09-12 operations smoke 2)."""
     if not raw:
         return ""
     try:
@@ -389,30 +394,64 @@ def operational_instruction(raw: str | None) -> str:
         raise DelegateError(f"invalid --command-json: {error}") from error
     if not isinstance(value, dict) or not isinstance(value.get("executable"), str) or not value["executable"] or not isinstance(value.get("args"), list) or not all(isinstance(item, str) for item in value["args"]) or not isinstance(value.get("cwd"), str) or not value["cwd"]:
         raise DelegateError("--command-json requires executable, string args, and cwd")
+    if "checkpoint" in value and (not isinstance(value["checkpoint"], str) or not value["checkpoint"]):
+        raise DelegateError("--command-json checkpoint must be a path")
+    if cwd is not None and Path(value["cwd"]).resolve() != Path(cwd).resolve():
+        raise DelegateError("operational command cwd must be the worker working directory")
     argv = [value["executable"], *value["args"]]
     return (
         "\n\nOperational command contract:\n"
         "- Required skill and instruction reads are read-only preparation.\n"
         "- Your first execution command must run this exact argv; do not create a replacement script or run a separate doctor/preflight command first.\n"
-        f"- cwd: {json.dumps(value['cwd'])}\n"
+        "- cwd: \".\" (the working directory you start in). Never change into an absolute host path: work outside this directory bypasses the sandbox overlay and leaves no audited change.\n"
         f"- argv: {json.dumps(argv, ensure_ascii=False)}\n"
     )
 
 
-def parsed_owned_paths(raw: str | None, cwd: Path) -> list[str]:
+# Strict by default; only an explicit private-launch override discards named paths.
+# Mirrored by DEFAULT_IGNORED_PATHS in lib/agentfs-sandbox.ts. The Git index is ignored by default since
+# 2026-09-12: a worker that inspects its work with `git status`/`git diff` refreshes the index inside the
+# overlay, and the live build measurement refused every such attempt as an unowned change. Ignoring it grants
+# no ownership: the index is never exported or staged, and integration refuses Git-internal paths anyway.
+DEFAULT_IGNORED_PATHS: tuple[str, ...] = (".git/index",)
+
+
+def parsed_path_list(raw: str | None, cwd: Path, option: str) -> list[str]:
     if not raw:
         return []
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise DelegateError(f"invalid --owned-paths-json: {error}") from error
+        raise DelegateError(f"invalid {option}: {error}") from error
     if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
-        raise DelegateError("--owned-paths-json must be a JSON string array")
+        raise DelegateError(f"{option} must be a JSON string array")
     return [str((cwd / item).resolve()) if not Path(item).is_absolute() else str(Path(item).resolve()) for item in value]
 
 
-def worker_pi_settings(real_home: Path) -> dict[str, Any]:
-    """Execution-only Pi settings for a headless worker: supervisor defaults, zero packages.
+def operational_checkpoint_path(raw: str | None, cwd: Path) -> str | None:
+    """The checkpoint file declared with the operational command, resolved against the worker's cwd."""
+    if not raw:
+        return None
+    value = json.loads(raw)
+    checkpoint = value.get("checkpoint") if isinstance(value, dict) else None
+    if not isinstance(checkpoint, str) or not checkpoint:
+        return None
+    return str(Path(checkpoint).resolve()) if Path(checkpoint).is_absolute() else str((cwd / checkpoint).resolve())
+
+
+def parsed_owned_paths(raw: str | None, cwd: Path) -> list[str]:
+    return parsed_path_list(raw, cwd, "--owned-paths-json")
+
+
+def parsed_ignored_paths(raw: str | None, cwd: Path) -> list[str]:
+    """Absent or empty options ignore nothing; explicit paths never grant ownership."""
+    if raw is None:
+        raw = json.dumps(list(DEFAULT_IGNORED_PATHS))
+    return parsed_path_list(raw, cwd, "--ignored-paths-json")
+
+
+def worker_pi_settings(real_home: Path, thinking: str | None = None) -> dict[str, Any]:
+    """Execution-only Pi settings for a headless worker: supervisor defaults, zero packages, the route's thinking level.
 
     The supervisor's real settings.json must never reach a worker: its packages list
     loads the pi-agent-wave extension, whose entry point fails closed without Herdr
@@ -420,14 +459,18 @@ def worker_pi_settings(real_home: Path) -> dict[str, Any]:
     """
     settings: dict[str, Any] = {"packages": []}
     source = real_home / ".pi" / "agent" / "settings.json"
+    parsed: Any = None
     try:
         parsed = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return settings
+        parsed = None
     if isinstance(parsed, dict):
         for key in ("defaultProvider", "defaultModel", "defaultThinkingLevel", "compaction", "retry"):
             if key in parsed:
                 settings[key] = parsed[key]
+    # The frozen route decides how hard a role thinks; the supervisor's own default is only the fallback.
+    if isinstance(thinking, str) and thinking.strip():
+        settings["defaultThinkingLevel"] = thinking.strip()
     return settings
 
 
@@ -558,20 +601,34 @@ def copy_credential_file(source: Path, destination: Path) -> dict[str, str]:
     return materialize_credential_file(destination, source.read_text(encoding="utf-8"))
 
 
-def snapshot_runtime_file(source: Path, destination: Path) -> dict[str, str]:
-    """Freeze configuration or a token in a private file whose bytes must survive unchanged."""
+def copy_runtime_file(source: Path, destination: Path, *, mutable_catalog: bool = False, tolerate_self_writes: bool = False) -> dict[str, str]:
+    """Copy private runtime data; only a provider catalog may refresh its contents.
+
+    A snapshot marked ``selfWrites: tolerated`` (Claude's own JSON configuration, 2026-09-12 decision) may be
+    rewritten by the agent inside the attempt: it must stay a private regular JSON object, and every change is
+    recorded rather than refused. All other snapshots keep exact bytes.
+    """
     data = source.read_bytes()
     write_private_bytes(destination, data)
-    return {
-        "kind": "snapshot",
+    record: dict[str, str] = {
+        "kind": "catalog-cache" if mutable_catalog else "snapshot",
         "link": str(destination),
         "sha256": hashlib.sha256(data).hexdigest(),
         "mode": oct(destination.stat().st_mode & 0o777),
     }
+    if tolerate_self_writes:
+        try:
+            parsed = json.loads(data.decode("utf-8"))
+            key_set = json.dumps(sorted(parsed.keys())) if isinstance(parsed, dict) else "unparseable"
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            key_set = "unparseable"
+        record["selfWrites"] = "tolerated"
+        record["keySet"] = key_set
+    return record
 
 
-def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: Path, selected_model: str = "", command_runner: Any = run) -> tuple[dict[str, str], list[dict[str, str]]]:
-    """Build the selected agent's private credentials and immutable runtime configuration."""
+def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: Path, selected_model: str = "", command_runner: Any = run, thinking: str | None = None) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Build private credentials, frozen configuration and a refreshable provider catalog."""
     if not selected_model:
         raise DelegateError("provider runtime environment requires the frozen selected model")
     providers = attempt_dir / "providers"
@@ -608,7 +665,7 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
     }
     for source, destination in configuration[agent]:
         if source.exists():
-            links.append(snapshot_runtime_file(source, destination))
+            links.append(copy_runtime_file(source, destination, mutable_catalog=agent == "pi" and destination.name == "models-store.json", tolerate_self_writes=agent == "claude"))
     claude_token_source = os.environ.get("PI_CLAUDE_OAUTH_TOKEN_FILE") if agent == "claude" else None
     claude_token_link: Path | None = None
     if claude_token_source:
@@ -616,8 +673,8 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
         if not source.is_file() or source.stat().st_mode & 0o077:
             raise DelegateError("PI_CLAUDE_OAUTH_TOKEN_FILE must name a mode-600 regular file")
         claude_token_link = claude_home / "setup-token"
-        links.append(snapshot_runtime_file(source, claude_token_link))
-    write_private(pi_agent_dir / "settings.json", json.dumps(worker_pi_settings(real_home), indent=2, sort_keys=True) + "\n")
+        links.append(copy_runtime_file(source, claude_token_link))
+    write_private(pi_agent_dir / "settings.json", json.dumps(worker_pi_settings(real_home, thinking), indent=2, sort_keys=True) + "\n")
     environment = {
         "PI_CODING_AGENT_DIR": str(pi_agent_dir),
         "CODEX_HOME": str(codex_home),
@@ -634,11 +691,11 @@ def prepare_acpx_attempt(
     state: dict[str, Any],
     agent_name: str,
     model: str,
-    report: Path,
     task_file: Path,
     node: str,
-    report_contract: str,
+    thinking: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
+    result_contract = "runtime-v1"
     cwd = Path.cwd().resolve()
     real_home = Path(os.environ.get("HOME", str(Path.home()))).resolve()
     workspace_relative = "."
@@ -663,16 +720,19 @@ def prepare_acpx_attempt(
     agentfs_home = attempt_dir / "agentfs-home"
     acpx_home.mkdir(mode=0o700)
     agentfs_home.mkdir(mode=0o700)
-    provider_environment, provider_links = provider_runtime_environment(attempt_dir, acpx_home, real_home, model)
+    provider_environment, provider_links = provider_runtime_environment(attempt_dir, acpx_home, real_home, model, thinking=thinking)
     prompt_file = attempt_dir / "prompt.md"
-    prompt = task_file.read_text(encoding="utf-8") + operational_instruction(args.command_json) + "\n" + report_contract + "\n"
     read_only = args.access_mode == "read-only" if args.access_mode is not None else node not in {"implement", "source_search"}
+    # The answer is the assistant's public text and the audited overlay changes; no report file exists to author or repair.
+    prompt = task_file.read_text(encoding="utf-8") + operational_instruction(args.command_json, cwd) + "\n"
+    prompt += "Reply with your complete result as ordinary assistant text. No report file is required or read.\n"
+    verdicts = RUNTIME_VERDICT_NODES.get(node)
+    if verdicts:
+        prompt += "End your reply with one final line of the exact form VERDICT: <value>, where <value> is one of " + ", ".join(verdicts) + ". State the verdict exactly once and only after the evidence that supports it.\n"
     if args.no_terminal:
-        prompt += "Terminal capability is disabled. Use ACP filesystem read/search capabilities and the private report path only; consume recorded host evidence instead of running commands.\n"
-    if agent == "pi":
-        prompt += "Pi ACP supervisor projection uses structured terminal facts only; assistant free text is ignored.\n"
-    elif read_only:
-        prompt += "Read-only host mode: all tool activity stays inside AgentFS COW and every overlay change will be discarded. Zero repository paths are exported. Write only the required private report path on the host.\n"
+        prompt += "Terminal capability is disabled. Use ACP filesystem read/search capabilities only; consume recorded host evidence instead of running commands.\n"
+    if read_only:
+        prompt += "Read-only host mode: all tool activity stays inside AgentFS COW and every overlay change will be discarded. Zero repository paths are exported.\n"
     write_private(prompt_file, prompt)
     config_path = attempt_dir / "worker-config.json"
     result_path = attempt_dir / "worker-result.json"
@@ -689,7 +749,6 @@ def prepare_acpx_attempt(
         "sessionName": session_name,
         "workspaceRelative": workspace_relative,
         "node": node,
-        "reportPath": str(report),
         "claudeTokenFile": provider_environment.get("PI_CLAUDE_OAUTH_TOKEN_FILE"),
         "acpxHome": str(acpx_home),
         "mode": "prompt",
@@ -702,6 +761,8 @@ def prepare_acpx_attempt(
         "discardAllChanges": read_only,
         "noTerminal": args.no_terminal,
     }
+    config["resultContract"] = result_contract
+    config["attemptKey"] = plan["attemptKey"]
     write_private(config_path, json.dumps(config, indent=2, sort_keys=True) + "\n")
     launcher = attempt_dir / "launch-acpx.sh"
     launcher_text = "#!/bin/sh\nexec " + " ".join([
@@ -718,29 +779,25 @@ def prepare_acpx_attempt(
     write_private(cancel_launcher, cancel_text)
     cancel_launcher.chmod(0o700)
     owned_paths = parsed_owned_paths(args.owned_paths_json, cwd)
-    export_config_path = attempt_dir / "export-config.json"
-    export_result_path = attempt_dir / "export-result.json"
-    agentfs_db_path = agentfs_home / ".agentfs" / "run" / session_name / "delta.db"
-    write_private(export_config_path, json.dumps({
-        "schemaVersion": 1,
-        "agentFsExecutable": agentfs_executable,
-        "dbPath": str(agentfs_db_path),
-        "baseDir": str(cwd),
-        "ownedPaths": owned_paths,
-        "ignoredPaths": [],
-        "discardAllChanges": read_only,
-        "resultPath": str(export_result_path),
-    }, indent=2, sort_keys=True) + "\n")
+    ignored_paths = parsed_ignored_paths(getattr(args, "ignored_paths_json", None), cwd)
     path_parts = [str(Path(node_executable).parent), str(Path(acpx_executable).parent), str(Path(agentfs_executable).parent), os.environ.get("PATH", "")]
     environment = {
         "PI_ACPX_CONFIG": str(config_path),
-        "PI_AGENTFS_EXPORT_CONFIG": str(export_config_path),
         "HOME": str(agentfs_home),
         "PATH": os.pathsep.join(path_parts),
         **provider_environment,
     }
+    agentfs_db_path = agentfs_home / ".agentfs" / "run" / session_name / "delta.db"
+    base_revision = run(["git", "-C", str(cwd), "rev-parse", "HEAD"], check=False).stdout.strip()
     resource = {
         "execution": "acpx-agentfs",
+        "result_contract": result_contract,
+        "base_dir": str(cwd),
+        "base_revision": base_revision or None,
+        "checkpoint_path": operational_checkpoint_path(args.command_json, cwd),
+        "owned_paths": owned_paths,
+        "ignored_paths": ignored_paths,
+        "read_only": read_only,
         "run_id": run_id,
         "operation_id": operation_id,
         "acp_agent": agent,
@@ -760,8 +817,6 @@ def prepare_acpx_attempt(
         "acpx_cancel_script": str(cancel_launcher),
         "acpx_cancel_config": str(cancel_config),
         "prompt_file": str(prompt_file),
-        "export_config": str(export_config_path),
-        "export_result": str(export_result_path),
         "owned_paths": owned_paths,
         "sandbox_base": str(cwd),
         "workspace_relative": workspace_relative,
@@ -792,21 +847,12 @@ def command_start(args: argparse.Namespace) -> None:
     run_dir = require_run_dir(args.run_dir)
     route = frozen_route(args)
 
-    report_value = args.report_option or args.report
     task_value = args.task_file_option or args.task_file
-    # Exact locks can omit the legacy tier selector: shift the two positional paths.
-    if args.model and not task_value and args.selector and args.report:
-        report_value, task_value = args.selector, args.report
-    if not report_value or not task_value:
-        raise DelegateError("start requires a report path and task file")
-    report_input = Path(report_value)
-    if not report_input.is_absolute():
-        raise DelegateError("delegate report must be an absolute path under /tmp")
-    report = report_input.resolve()
-    try:
-        report.relative_to(TMP_ROOT)
-    except ValueError as error:
-        raise DelegateError("delegate report must be an absolute path under /tmp") from error
+    # An exact lock may omit the tier selector, in which case the single positional path is the task file.
+    if args.model and not task_value and args.selector:
+        task_value = args.selector
+    if not task_value:
+        raise DelegateError("start requires a task file")
     task_file = Path(task_value)
     if not task_file.is_file():
         raise DelegateError(f"delegate task file does not exist: {task_file}")
@@ -834,11 +880,8 @@ def command_start(args: argparse.Namespace) -> None:
         f"{state['run_label']}: {role_label} [{route['policy']}] "
         f"@ {selected_model.rsplit('/', 1)[-1]}"
     )
-    report_contract = run(
-        [NODE, "--experimental-strip-types", str(REPORT_PROMPT), "--node", node, "--report", str(report)]
-    ).stdout.strip()
     acpx_resource, runtime_environment = prepare_acpx_attempt(
-        run_dir, args, state, agent_name, selected_model, report, task_file, node, report_contract
+        run_dir, args, state, agent_name, selected_model, task_file, node, thinking=route["thinking"]
     )
     environment = delegation_environment(route, args.role, first_label, selected_model)
     environment.update(runtime_environment)
@@ -875,8 +918,6 @@ def command_start(args: argparse.Namespace) -> None:
         "headless_stdout": str(run_dir / f"headless-{slugify(agent_name)}.stdout"),
         "headless_stderr": str(run_dir / f"headless-{slugify(agent_name)}.stderr"),
         "headless_status": str(run_dir / f"headless-{slugify(agent_name)}.status.json"),
-        "report": str(report),
-        "report_root": str(report.parent),
         "role": args.role,
         "node": node,
         "role_label": role_label,
@@ -890,8 +931,6 @@ def command_start(args: argparse.Namespace) -> None:
         "chain_length": len(chain),
         "fallback_reason": args.fallback_reason,
         "model_lock_reason": route["lock_reason"],
-        "report_repair_attempts": 0,
-        "report_repair_diagnostics": [],
         **acpx_resource,
         "attempt_identity": final_plan,
     }
@@ -946,7 +985,6 @@ def command_start(args: argparse.Namespace) -> None:
                 "agentfs-db": resource["agentfs_db_path"],
                 "attempt-identity": resource["attempt_identity"],
                 "pane": pane_id,
-                "report": str(report),
                 "tab": tab_id,
             },
             sort_keys=True,
@@ -1004,6 +1042,46 @@ def is_approval_block(result: dict[str, Any]) -> bool:
     return result.get("processExitCode") == ACPX_PERMISSION_DENIED_EXIT
 
 
+WORKER_EXIT_TIMEOUT_MS = os.environ.get("PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS", "30000")
+
+
+def wait_for_worker_exit(resource: dict[str, Any], timeout_ms: int | None = None) -> dict[str, Any]:
+    """Waits, bounded, for the headless worker process to exit after its result file appears.
+
+    worker-result.json is written before the AgentFS server and acpx child have finished tearing
+    down, so auditing on file presence alone can read a delta that is still being flushed.
+    """
+    worker_pid = resource.get("worker_pid")
+    started = time.monotonic()
+    if using_herdr() or not isinstance(worker_pid, int):
+        observation = {"pid": worker_pid if isinstance(worker_pid, int) else None, "exited": None, "waitedMs": 0}
+        resource["worker_exit"] = observation
+        return observation
+    budget = (int(WORKER_EXIT_TIMEOUT_MS) if timeout_ms is None else timeout_ms) / 1000
+    deadline = started + budget
+
+    def exited_now() -> bool:
+        # `start` and `wait` normally run as separate processes, so the worker is not our child; when
+        # it is (same-process callers, tests), reap it so a zombie is not mistaken for a live worker.
+        try:
+            reaped, _ = os.waitpid(worker_pid, os.WNOHANG)
+            if reaped == worker_pid:
+                return True
+        except ChildProcessError:
+            pass
+        return not process_alive(worker_pid)
+
+    exited = exited_now()
+    while not exited and time.monotonic() < deadline:
+        time.sleep(0.05)
+        exited = exited_now()
+    observation = {"pid": worker_pid, "exited": exited, "waitedMs": int((time.monotonic() - started) * 1000)}
+    resource["worker_exit"] = observation
+    if not exited:
+        raise DelegateError(f"ACPX worker result present but worker process {worker_pid} did not exit within {int(budget * 1000)}ms")
+    return observation
+
+
 def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
     agent_name = str(resource["agent"])
     if resource.get("execution") == "acpx-agentfs":
@@ -1018,11 +1096,16 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
             time.sleep(0.1)
         if not result_path.exists():
             raise DelegateError(f"ACPX worker result timed out: {result_path}")
+        wait_for_worker_exit(resource)
         try:
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise DelegateError(f"invalid ACPX worker result: {error}") from error
         resource["worker_observation"] = result
+        if result.get("schemaVersion") == 2 and result.get("resultContract") == "runtime-v1":
+            # The runtime worker records its process outcome durably; settlement reads it and no
+            # terminal event, exit code or report is interpreted here.
+            return
         exit_code = result.get("processExitCode")
         terminal = result.get("terminal")
         terminal_kind = terminal.get("kind") if isinstance(terminal, dict) else None
@@ -1032,7 +1115,7 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
                 "herdr", "pane", "report-agent", str(resource["pane"]),
                 "--source", "pi-agent-wave-acpx", "--agent", agent_name,
                 "--state", state, "--message", f"ACPX terminal {terminal_kind or 'missing'}",
-                "--seq", str(int(resource.get("report_repair_attempts", 0)) + 2),
+                "--seq", "2",
             ])
         if exit_code != 0 or terminal_kind != "completed":
             if is_approval_block(result):
@@ -1064,55 +1147,13 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
         close_settled_tab(run_dir, resource, DelegateError(f"Herdr agent settled in unsupported state {status!r}: {agent_name}"))
 
 
-def audit_resource_report(run_dir: Path, resource: dict[str, Any]) -> dict[str, Any]:
-    result = run(
-        [
-            NODE,
-            "--experimental-strip-types",
-            str(REPORT_AUDIT),
-            "--report",
-            str(resource["report"]),
-            "--node",
-            str(resource["node"]),
-            "--private-root",
-            str(resource["report_root"]),
-        ],
-        check=False,
-    )
-    try:
-        audit = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise DelegateError(f"report auditor returned invalid JSON: {error}") from error
-    if not isinstance(audit, dict):
-        raise DelegateError("report auditor returned a non-object result")
-    return audit
 
-
-def record_repair_attempt(run_dir: Path, agent_name: str, attempt: int, diagnostics: list[Any]) -> None:
-    found = False
-
-    def update(state: dict[str, Any]) -> None:
-        nonlocal found
-        for resource in reversed(state["resources"]):
-            if resource["agent"] == agent_name:
-                resource["report_repair_attempts"] = attempt
-                resource.setdefault("report_repair_diagnostics", []).append(diagnostics)
-                found = True
-                return
-
-    mutate_state(run_dir, update)
-    if not found:
-        raise DelegateError(f"agent is not owned by this run: {agent_name}")
 
 
 def run_acpx_again(resource: dict[str, Any], prompt: str | None, mode: str, suffix: str) -> dict[str, Any]:
     config_path = Path(str(resource["worker_config"]))
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if prompt is not None:
-        if resource.get("acp_agent") == "pi":
-            prompt += "\nPi supervisor projection uses structured terminal facts only; assistant free text is ignored."
-        elif resource.get("node") in {"thinker_plan", "review", "test", "audit", "thinker_split", "thinker_synthesize"}:
-            prompt += "\nAll repository activity remains in AgentFS COW and will be discarded. Repair only the private report file."
         write_private(Path(str(resource["prompt_file"])), prompt + "\n")
     attempt_dir = Path(str(resource["attempt_dir"]))
     result_path = attempt_dir / f"worker-{suffix}-result.json"
@@ -1130,7 +1171,7 @@ def run_acpx_again(resource: dict[str, Any], prompt: str | None, mode: str, suff
             "herdr", "pane", "report-agent", str(resource["pane"]),
             "--source", "pi-agent-wave-acpx", "--agent", str(resource["agent"]),
             "--state", "working", "--message", f"ACPX {mode} {resource['acpx_session']}",
-            "--seq", str(int(resource.get("report_repair_attempts", 0)) + 2),
+            "--seq", "2",
         ])
         run(["herdr", "pane", "run", str(resource["pane"]), str(resource["worker_launcher"])])
     else:
@@ -1147,57 +1188,86 @@ def run_acpx_again(resource: dict[str, Any], prompt: str | None, mode: str, suff
         raise DelegateError(f"invalid ACPX {mode} result: {error}") from error
 
 
-def snapshot_agentfs_db(resource: dict[str, Any]) -> Path:
+def snapshot_agentfs_db(resource: dict[str, Any], timeout_ms: int = 30000) -> Path:
+    """Create one consistent SQLite backup or refuse export; never copy live sidecars."""
     source = Path(str(resource["agentfs_db_path"]))
     snapshot_dir = Path(str(resource["attempt_dir"])) / "agentfs-snapshot"
     snapshot_dir.mkdir(mode=0o700, exist_ok=True)
+    snapshot_dir.chmod(0o700)
     snapshot = snapshot_dir / "delta.db"
     for suffix in ("", "-wal", "-shm"):
-        candidate = Path(str(source) + suffix)
-        if candidate.exists():
-            shutil.copy2(candidate, Path(str(snapshot) + suffix))
-    config_path = Path(str(resource["export_config"]))
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["dbPath"] = str(snapshot)
-    write_private(config_path, json.dumps(config, indent=2, sort_keys=True) + "\n")
+        Path(str(snapshot) + suffix).unlink(missing_ok=True)
+    deadline = time.monotonic() + timeout_ms / 1000
+
+    def progress(status: int, remaining: int, total: int) -> None:
+        if time.monotonic() >= deadline:
+            raise sqlite3.OperationalError(f"backup timed out after {timeout_ms}ms")
+
+    try:
+        write_private_bytes(snapshot, b"")
+        source_connection = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout_ms / 1000)
+        try:
+            target_connection = sqlite3.connect(snapshot, timeout=timeout_ms / 1000)
+            try:
+                source_connection.backup(target_connection, pages=256, progress=progress, sleep=0.05)
+                # The source WAL header is inherited; DELETE keeps the snapshot self-contained.
+                target_connection.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                target_connection.close()
+        finally:
+            source_connection.close()
+        snapshot.chmod(0o600)
+    except (sqlite3.Error, OSError) as error:
+        resource["agentfs_snapshot"] = {"path": str(snapshot), "method": "failed", "backupError": str(error)}
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(snapshot) + suffix).unlink(missing_ok=True)
+        raise DelegateError(f"AgentFS snapshot failed: {error}") from error
+    resource["agentfs_snapshot"] = {"path": str(snapshot), "method": "backup", "backupError": None}
+    # The runtime settle configuration receives the snapshot path directly; the legacy export configuration it used to rewrite is gone.
     return snapshot
 
-
-def export_agentfs_owned_changes(resource: dict[str, Any]) -> dict[str, Any]:
-    snapshot_agentfs_db(resource)
-    env = os.environ.copy()
-    env["PI_AGENTFS_EXPORT_CONFIG"] = str(resource["export_config"])
-    completed = run([NODE, "--experimental-strip-types", str(AGENTFS_EXPORT)], env=env, check=False)
-    stderr = redact_failure_text(completed.stderr[-FAILURE_DIAGNOSTIC_STDERR_BYTES:])
-    resource["agentfs_export_process"] = {"exitCode": completed.returncode, "stderrTail": stderr}
-    try:
-        result = json.loads(Path(str(resource["export_result"])).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise DelegateError(f"invalid AgentFS export result (exit {completed.returncode}): {stderr or error}") from error
-    if not isinstance(result, dict) or not isinstance(result.get("violations"), list):
-        raise DelegateError(f"invalid AgentFS export result (exit {completed.returncode})")
-    if completed.returncode != 0 or result.get("exported") is not True or result["violations"]:
-        paths = ", ".join(redact_failure_text(str(change.get("path", "")))[:FAILURE_DIAGNOSTIC_EVENT_CHARS]
-                          for change in result["violations"][:FAILURE_DIAGNOSTIC_EVENT_LIMIT] if isinstance(change, dict))
-        detail = f"unowned changes ({len(result['violations'])} total): {paths}" if paths else stderr or "no successful export receipt"
-        raise DelegateError(f"AgentFS export failed (exit {completed.returncode}): {detail}")
-    return result
 
 
 def verify_provider_links(resource: dict[str, Any]) -> bool:
     for item in resource.get("provider_links", []):
         link = Path(str(item["link"]))
-        if item.get("kind", "symlink") in ("file", "snapshot"):
-            label = "runtime configuration snapshot" if item["kind"] == "snapshot" else "materialized provider credential"
+        if item.get("kind", "symlink") in ("file", "snapshot", "catalog-cache"):
+            label = {"snapshot": "runtime configuration snapshot", "file": "materialized provider credential", "catalog-cache": "runtime catalog cache"}[item["kind"]]
             if link.is_symlink():
                 raise DelegateError(f"{label} became a symlink: {link}")
             if not link.is_file():
                 raise DelegateError(f"{label} is missing: {link}")
             if oct(stat.S_IMODE(link.stat().st_mode)) != item["mode"]:
                 raise DelegateError(f"{label} mode changed: {link}")
+            if item["kind"] == "catalog-cache":
+                continue
             if item["kind"] == "snapshot":
-                if hashlib.sha256(link.read_bytes()).hexdigest() != item["sha256"]:
-                    raise DelegateError(f"{label} changed: {link}")
+                data = link.read_bytes()
+                observed_sha = hashlib.sha256(data).hexdigest()
+                if item.get("selfWrites") != "tolerated":
+                    if observed_sha != item["sha256"]:
+                        raise DelegateError(f"{label} changed: {link}")
+                    continue
+                # Tolerated self-write (Claude rewrites its own settings.json / .claude.json during tool use):
+                # the file must still be a JSON object; what changed is recorded, never refused.
+                try:
+                    observed = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise DelegateError(f"{label} changed and is no longer a JSON object: {link} ({type(error).__name__})") from error
+                if not isinstance(observed, dict):
+                    raise DelegateError(f"{label} changed and is no longer a JSON object: {link}")
+                if observed_sha != item["sha256"]:
+                    recorded_keys = set(json.loads(item["keySet"])) if item.get("keySet") not in (None, "unparseable") else set()
+                    observed_keys = set(observed.keys())
+                    self_writes = resource.setdefault("configuration_self_writes", {})
+                    self_writes[link.name] = {
+                        "name": link.name,
+                        "addedKeys": sorted(observed_keys - recorded_keys),
+                        "removedKeys": sorted(recorded_keys - observed_keys),
+                        "contentChanged": True,
+                        "expectedSha256": item["sha256"],
+                        "observedSha256": observed_sha,
+                    }
                 continue
             # The byte hash is deliberately not compared for a JSON credential store: an agent refreshes
             # its own tokens by rewriting this private file inside the attempt, which is confined and
@@ -1264,70 +1334,19 @@ def close_acpx_attempt(resource: dict[str, Any]) -> dict[str, Any]:
         run([
             "herdr", "pane", "release-agent", str(resource["pane"]),
             "--source", "pi-agent-wave-acpx", "--agent", str(resource["agent"]),
-            "--seq", str(int(resource.get("report_repair_attempts", 0)) + 4),
+            "--seq", "4",
         ], check=False)
     return closed
 
 
-def write_and_audit_attempt_ledger(run_dir: Path, resource: dict[str, Any]) -> dict[str, Any]:
-    base = run_dir / "evidence"
-    story = slugify(str(read_state(run_dir)["run_label"]))
-    run([
-        NODE, "--experimental-strip-types", str(LEDGER), "write", story, str(resource["agent"]),
-        "--run", str(resource["run_id"]), "--tier", str(resource["tier"]),
-        "--model", str(resource["model"]), "--outcome", "accepted",
-        "--task", f"ACPX AgentFS {resource['node']} attempt", "--report", str(resource["report"]),
-        "--base", str(base),
-    ])
-    audited = run([NODE, "--experimental-strip-types", str(LEDGER), "audit", story, "--base", str(base)])
-    try:
-        result = json.loads(audited.stdout)
-    except json.JSONDecodeError as error:
-        raise DelegateError(f"invalid attempt ledger audit: {error}") from error
-    if result.get("valid") is not True:
-        raise DelegateError(f"attempt ledger audit failed: {result}")
-    return result
 
+def configuration_self_writes(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    """Tolerated configuration self-writes observed by provider verification, in file-name order."""
+    observed = resource.get("configuration_self_writes")
+    if not isinstance(observed, dict):
+        return []
+    return [observed[name] for name in sorted(observed)]
 
-def write_settlement_evidence(run_dir: Path, resource: dict[str, Any], export_result: dict[str, Any], close_result: dict[str, Any], ledger_result: dict[str, Any], presentation_observation: dict[str, Any], provider_links_verified: bool) -> Path:
-    observation = resource.get("worker_observation")
-    if not isinstance(observation, dict):
-        raise DelegateError("missing ACPX worker observation")
-    report_path = Path(str(resource["report"]))
-    evidence_path = run_dir / f"settlement-{slugify(str(resource['agent']))}.json"
-    evidence = {
-        "schemaVersion": 1,
-        "runId": resource["run_id"],
-        "operationId": resource["operation_id"],
-        "agentName": resource["agent"],
-        "transport": presentation_observation["transport"],
-        "acpxCancelScript": resource["acpx_cancel_script"],
-        "acpAgent": resource["acp_agent"],
-        "acpxRecordId": resource["acpx_record_id"],
-        "acpxSessionId": resource["acpx_session"],
-        "acpxState": observation.get("status"),
-        "acpxAttemptKey": resource["acpx_attempt_key"],
-        "agentFsSessionId": resource["agentfs_session"],
-        "agentFsDbPath": resource["agentfs_db_path"],
-        "processExitCode": observation.get("processExitCode"),
-        "terminalKind": (observation.get("terminal") or {}).get("kind"),
-        "presentationVerified": presentation_observation["presentationVerified"],
-        "herdrVisible": presentation_observation["herdrVisible"],
-        "identityMatches": presentation_observation["identityMatches"],
-        "reportPath": str(report_path),
-        "reportSha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
-        "agentFsExported": export_result.get("exported") is True,
-        "agentFsViolationCount": len(export_result.get("violations", [])),
-        "discardedReadOnlyChanges": export_result.get("discardedReadOnlyChanges", 0),
-        "sessionClosed": close_result.get("closed") is True and close_result.get("noSession") is True,
-        "providerLinksVerified": provider_links_verified,
-        "ledgerValid": ledger_result.get("valid") is True,
-        "ledgerSummary": ledger_result.get("summary"),
-    }
-    if using_herdr():
-        evidence.update({"herdrAgent": resource["agent"], "tabId": resource["tab"], "herdrPaneId": resource["pane"]})
-    write_private(evidence_path, json.dumps(evidence, indent=2, sort_keys=True) + "\n")
-    return evidence_path
 
 
 def parse_json_action(output: str, action: str) -> dict[str, Any] | None:
@@ -1402,27 +1421,6 @@ def _recent_worker_events(path: Path, limit: int) -> list[object]:
     return events
 
 
-def export_failure_summary(result_path: Path) -> dict[str, object] | None:
-    """Retains export disposition and bounded violating paths after the attempt is removed."""
-    if not result_path.is_file():
-        return None
-    try:
-        result = json.loads(redact_failure_text(result_path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return {"unreadable": True}
-    if not isinstance(result, dict) or not isinstance(result.get("violations"), list):
-        return {"unreadable": True}
-    violations = result["violations"]
-    return {
-        "exported": result.get("exported") is True,
-        "violationCount": len(violations),
-        "violations": [
-            {key: str(change.get(key, ""))[:FAILURE_DIAGNOSTIC_EVENT_CHARS] for key in ("path", "kind")}
-            for change in violations[:FAILURE_DIAGNOSTIC_EVENT_LIMIT] if isinstance(change, dict)
-        ],
-        "discardedReadOnlyChanges": result.get("discardedReadOnlyChanges", 0),
-    }
-
 
 def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | None:
     """Retain a bounded private diagnostic bundle before the attempt directory is removed."""
@@ -1438,6 +1436,27 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
         except (json.JSONDecodeError, OSError):
             result = {"unreadable": True}
     terminal = result.get("terminal") if isinstance(result, dict) else None
+    suffix = str(resource.get("operation_id") or attempt_dir.name)
+    changed_configuration = []
+    for index, item in enumerate(resource.get("provider_links", [])):
+        if item.get("kind") != "snapshot":
+            continue
+        link = Path(str(item["link"]))
+        if link.name == "setup-token":
+            continue
+        try:
+            roots = [attempt_dir.resolve(), Path(str(resource.get("acpx_home", attempt_dir))).resolve()]
+            if link.is_symlink() or not link.is_file() or not any(link.resolve().is_relative_to(root) for root in roots):
+                continue
+            data = link.read_bytes()
+            observed = hashlib.sha256(data).hexdigest()
+            if observed == item["sha256"]:
+                continue
+            retained = run_dir / f"changed-configuration-{suffix}-{index}-{link.name}"
+            write_private_bytes(retained, data)
+            changed_configuration.append({"name": link.name, "expectedSha256": item["sha256"], "observedSha256": observed, "retainedPath": str(retained)})
+        except OSError as error:
+            changed_configuration.append({"name": link.name, "retentionError": type(error).__name__})
     bundle = {
         "schemaVersion": 1,
         "runId": resource.get("run_id"),
@@ -1454,12 +1473,12 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
         "processExitCode": result.get("processExitCode") if isinstance(result, dict) else None,
         "terminalKind": terminal.get("kind") if isinstance(terminal, dict) else None,
         "workerResult": result,
-        "agentFsExport": export_failure_summary(Path(str(resource.get("export_result", attempt_dir / "export-result.json")))),
-        "agentFsExportProcess": resource.get("agentfs_export_process"),
+        "agentFsSnapshot": resource.get("agentfs_snapshot"),
+        "workerExit": resource.get("worker_exit"),
+        "changedConfiguration": changed_configuration,
         "stderrTail": _read_text_tail(attempt_dir / "worker.stderr.txt", FAILURE_DIAGNOSTIC_STDERR_BYTES),
         "recentEvents": _recent_worker_events(attempt_dir / "worker.stdout.ndjson", FAILURE_DIAGNOSTIC_EVENT_LIMIT),
     }
-    suffix = str(resource.get("operation_id") or attempt_dir.name)
     path = run_dir / f"failure-{suffix}.json"
     write_private(path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
     return path
@@ -1519,7 +1538,27 @@ def cleanup_absence_inventory(resource: dict[str, Any], tabs_output: str, pane_e
     agentfs_home = Path(str(resource.get("agentfs_home", "")))
     agentfs_db = Path(str(resource.get("agentfs_db_path", "")))
     process_lines = [line.strip() for line in process_output.splitlines()]
-    owned_processes = [line for line in process_lines if (session_name and session_name in line or str(attempt_dir) and str(attempt_dir) in line) and "herdr_delegate.py" not in line]
+    def owned_process(line: str) -> bool:
+        # Identify the Python entry point, not filenames in a worker's arbitrary arguments.
+        # A launch-acpx.sh process still owns an execution and must settle before cleanup passes.
+        matches_session = bool(session_name) and session_name in line
+        matches_attempt = bool(str(attempt_dir)) and str(attempt_dir) != "." and str(attempt_dir) in line
+        if not (matches_session or matches_attempt):
+            return False
+        try:
+            arguments = shlex.split(line)[1:]  # ps prefixes the command with its PID.
+        except ValueError:
+            return True
+        if arguments and re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", Path(arguments[0]).name):
+            script_args = arguments[1:]
+            while script_args and script_args[0] in {"-u", "-B"}:
+                script_args = script_args[1:]
+            script = script_args[0] if script_args else ""
+            if Path(script).name in {"herdr_delegate.py", "headless_delegate.py", "headless_supervisor.py"}:
+                return False
+        return True
+
+    owned_processes = [line for line in process_lines if owned_process(line)]
     queue_owner = [line for line in owned_processes if "acpx" in line and ("queue" in line or session_name in line)]
     agentfs_servers = [line for line in owned_processes if "agentfs" in line]
     repair_children = [line for line in owned_processes if "repair" in line or "report" in line]
@@ -1585,103 +1624,127 @@ def command_wait(args: argparse.Namespace) -> None:
         require_worker_runtime()
     run_dir = require_run_dir(args.run_dir)
     resource = owned_resource(run_dir, args.agent_name)
-    repair_attempts = int(resource.get("report_repair_attempts", 0))
-    while True:
-        try:
-            wait_for_settled_agent(run_dir, resource)
-        except DelegateError as error:
-            if resource.get("execution") == "acpx-agentfs":
-                cleanup_failures = abort_acpx_attempt(resource)
-                if cleanup_failures:
-                    error = DelegateError(f"{error}\n" + "\n".join(cleanup_failures))
-            close_settled_tab(run_dir, resource, error)
-        audit = audit_resource_report(run_dir, resource)
-        if audit.get("valid") is True:
-            export_result: dict[str, Any] | None = None
-            settlement_evidence: Path | None = None
-            if resource.get("execution") == "acpx-agentfs":
-                try:
-                    presentation_observation = observe_presentation_identity(resource)
-                    if presentation_observation.get("presentationVerified") is not True or presentation_observation.get("identityMatches") is not True:
-                        raise DelegateError("worker presentation identity does not match the registered attempt")
-                    close_result = close_acpx_attempt(resource)
-                    resource["session_closure"] = "close-proved"
-                    provider_links_verified = verify_provider_links(resource)
-                    export_result = export_agentfs_owned_changes(resource)
-                    ledger_result = write_and_audit_attempt_ledger(run_dir, resource)
-                    settlement_evidence = write_settlement_evidence(run_dir, resource, export_result, close_result, ledger_result, presentation_observation, provider_links_verified)
-                except DelegateError as error:
-                    cleanup_failures = abort_acpx_attempt(resource)
-                    if cleanup_failures:
-                        error = DelegateError(f"{error}\n" + "\n".join(cleanup_failures))
-                    close_settled_tab(run_dir, resource, error)
-            audit["reportRepairAttempts"] = repair_attempts
-            audit["reportRepairDiagnostics"] = resource.get("report_repair_diagnostics", [])
-            audit["acpxSession"] = resource.get("acpx_session")
-            audit["agentFsSession"] = resource.get("agentfs_session")
-            audit["agentFsExport"] = export_result
-            audit["settlementEvidencePath"] = str(settlement_evidence) if settlement_evidence else None
-            close_settled_tab(run_dir, resource)
-            cleanup_evidence: Path | None = None
-            if resource.get("execution") == "acpx-agentfs":
-                shutil.rmtree(Path(str(resource["attempt_dir"])), ignore_errors=True)
-                shutil.rmtree(Path(str(resource["acpx_home"])), ignore_errors=True)
-                cleanup_evidence = verify_cleanup_absence(run_dir, resource)
-                if settlement_evidence:
-                    settlement = json.loads(settlement_evidence.read_text(encoding="utf-8"))
-                    settlement["cleanupVerified"] = True
-                    settlement["cleanupEvidencePath"] = str(cleanup_evidence)
-                    write_private(settlement_evidence, json.dumps(settlement, indent=2, sort_keys=True) + "\n")
-            audit["cleanupEvidencePath"] = str(cleanup_evidence) if cleanup_evidence else None
-            print(json.dumps(audit, sort_keys=True))
-            return
-        if repair_attempts >= 1:
-            final_diagnostics = audit.get("errors", [])
-            record_repair_attempt(run_dir, args.agent_name, repair_attempts, final_diagnostics)
-            resource.setdefault("report_repair_diagnostics", []).append(final_diagnostics)
-            error = DelegateError(
-                "delegate report rejected after one repair attempt: "
-                + json.dumps(final_diagnostics, sort_keys=True)
-            )
-            if resource.get("execution") == "acpx-agentfs":
-                cleanup_failures = abort_acpx_attempt(resource)
-                if cleanup_failures:
-                    error = DelegateError(f"{error}\n" + "\n".join(cleanup_failures))
-            close_settled_tab(run_dir, resource, error)
-        repair_attempts += 1
-        diagnostics = audit.get("errors", [])
-        record_repair_attempt(run_dir, args.agent_name, repair_attempts, diagnostics)
-        resource.setdefault("report_repair_diagnostics", []).append(diagnostics)
-        repair_prompt = run(
-            [
-                NODE,
-                "--experimental-strip-types",
-                str(REPORT_PROMPT),
-                "--node",
-                str(resource["node"]),
-                "--report",
-                str(resource["report"]),
-                "--repair-json",
-                json.dumps(diagnostics),
-            ]
-        ).stdout.strip()
-        if resource.get("execution") == "acpx-agentfs":
-            run_acpx_again(resource, repair_prompt, "prompt", f"repair-{repair_attempts}")
-        else:
-            run(
-                [
-                    "herdr",
-                    "agent",
-                    "prompt",
-                    args.agent_name,
-                    repair_prompt,
-                    "--wait",
-                    "--until",
-                    "working",
-                    "--timeout",
-                    "10000",
-                ]
-            )
+    print(json.dumps(settle_runtime_attempt(run_dir, resource), sort_keys=True))
+
+
+def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_path: Path) -> Path | None:
+    """Keep the raw worker stream as private evidence when capture was not complete or produced no candidate.
+
+    The attempt directory is removed after a clean settlement, which left the 2026-09-12 operations smoke 3 with an
+    exited, candidate-less synthesis attempt (`output-outside-prompt`) and nothing to diagnose it from.
+    """
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    observation = evidence.get("observation") if isinstance(evidence, dict) else None
+    status = observation.get("captureStatus") if isinstance(observation, dict) else None
+    if status == "complete" and evidence.get("candidate") is not None:
+        return None
+    source = Path(str(resource.get("attempt_dir", ""))) / "worker.stdout.ndjson"
+    if not source.is_file():
+        return None
+    retained = run_dir / f"runtime-capture-{slugify(str(resource['agent']))}.ndjson"
+    write_private_bytes(retained, source.read_bytes())
+    return retained
+
+
+def settlement_base_dir(resource: dict[str, Any]) -> str:
+    """The workspace the worker was dispatched in. Settlement may run from any directory (the supervisor's
+    collect call does not change directory), so the current directory is never a substitute: the 2026-09-12
+    build measurement staged against the supervisor's checkout and refused the real owned paths as escapes."""
+    base_dir = resource.get("base_dir")
+    if not isinstance(base_dir, str) or not base_dir:
+        raise DelegateError("runtime settlement requires the dispatch working directory recorded at start (base_dir)")
+    return base_dir
+
+
+def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str, Any]:
+    """Retain the worker's answer and audited changes first; close, verify and clean up afterwards.
+
+    Content retention is the essential commit: a session-close, provider-boundary or cleanup failure
+    after it leaves the settlement record and its content in place and is reported as a
+    post-settlement failure instead of discarding the attempt.
+    """
+    try:
+        wait_for_settled_agent(run_dir, resource)
+    except DelegateError as error:
+        cleanup_failures = abort_acpx_attempt(resource)
+        if cleanup_failures:
+            error = DelegateError(f"{error}\n" + "\n".join(cleanup_failures))
+        raise error
+    evidence_path = run_dir / f"runtime-settlement-{slugify(str(resource['agent']))}.json"
+    node_name = str(resource.get("node"))
+    kind = "coding" if node_name == "implement" else "operational" if node_name == "source_search" else "research"
+    post_settlement_failures: list[str] = []
+    try:
+        snapshot: Path | None = None
+        if kind in ("coding", "operational"):
+            if resource.get("read_only") is True:
+                raise DelegateError(f"{kind} settlement requires an owned-write attempt")
+            if kind == "coding" and not resource.get("base_revision"):
+                raise DelegateError("coding settlement requires a Git base revision recorded at dispatch")
+            snapshot = snapshot_agentfs_db(resource)
+        settle_config = Path(str(resource["attempt_dir"])) / "runtime-settle.json"
+        write_private(settle_config, json.dumps({
+            "schemaVersion": 1,
+            "attemptKey": resource["acpx_attempt_key"],
+            "workerResultPath": resource["worker_result"],
+            "kind": kind,
+            "baseDir": settlement_base_dir(resource),
+            "baseRevision": resource.get("base_revision") or "none",
+            "checkpointPath": resource.get("checkpoint_path") if kind == "operational" else None,
+            "ownedPaths": resource.get("owned_paths", []),
+            "readOnly": resource.get("read_only") is True,
+            "snapshotPath": str(snapshot) if snapshot else None,
+            "agentFsExecutable": shutil.which("agentfs") or "agentfs",
+            "evidencePath": str(evidence_path),
+        }, indent=2, sort_keys=True) + "\n")
+        if not evidence_path.exists():
+            settled = run([NODE, "--experimental-strip-types", str(RUNTIME_SETTLE)], env={**os.environ, "PI_RUNTIME_SETTLE_CONFIG": str(settle_config)}, check=False)
+            if settled.returncode != 0 or parse_json_action(settled.stdout, "runtime_settled") is None:
+                raise DelegateError(f"runtime settlement failed: {redact_failure_text(settled.stderr[-FAILURE_DIAGNOSTIC_STDERR_BYTES:]) or settled.returncode}")
+    except DelegateError as error:
+        cleanup_failures = abort_acpx_attempt(resource)
+        if cleanup_failures:
+            error = DelegateError(f"{error}\n" + "\n".join(cleanup_failures))
+        raise error
+    capture_retained = retain_incomplete_capture(run_dir, resource, evidence_path)
+    session_closed = False
+    provider_links_verified = False
+    try:
+        presentation_observation = observe_presentation_identity(resource)
+        if presentation_observation.get("presentationVerified") is not True or presentation_observation.get("identityMatches") is not True:
+            raise DelegateError("worker presentation identity does not match the registered attempt")
+        close_result = close_acpx_attempt(resource)
+        resource["session_closure"] = "close-proved"
+        session_closed = close_result.get("closed") is True and close_result.get("noSession") is True
+        provider_links_verified = True
+    except DelegateError as error:
+        post_settlement_failures.append(without_target_paths(str(error)))
+    cleanup_failures = abort_acpx_attempt(resource) if post_settlement_failures else []
+    if not post_settlement_failures:
+        shutil.rmtree(Path(str(resource["attempt_dir"])), ignore_errors=True)
+        shutil.rmtree(Path(str(resource["acpx_home"])), ignore_errors=True)
+    cleanup_evidence: Path | None = None
+    try:
+        cleanup_evidence = verify_cleanup_absence(run_dir, resource)
+    except DelegateError as error:
+        post_settlement_failures.append(str(error))
+    post_settlement_failures.extend(cleanup_failures)
+    return {
+        "valid": True,
+        "resultContract": "runtime-v1",
+        "settlementEvidencePath": str(evidence_path),
+        "captureRetainedPath": str(capture_retained) if capture_retained else None,
+        "cleanupEvidencePath": str(cleanup_evidence) if cleanup_evidence else None,
+        "sessionClosed": session_closed,
+        "providerLinksVerified": provider_links_verified,
+        "configurationSelfWrites": configuration_self_writes(resource),
+        "postSettlementFailures": post_settlement_failures,
+        "acpxSession": resource.get("acpx_session"),
+        "agentFsSession": resource.get("agentfs_session"),
+    }
 
 
 def command_cleanup(args: argparse.Namespace) -> None:
@@ -1730,7 +1793,6 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("run_dir")
     start_parser.add_argument("role")
     start_parser.add_argument("selector", nargs="?")
-    start_parser.add_argument("report", nargs="?")
     start_parser.add_argument("task_file", nargs="?")
     start_parser.add_argument("--policy", help="friendly frozen policy label")
     start_parser.add_argument("--policy-digest", default="")
@@ -1740,17 +1802,17 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--reason", help="required reason for an exact model lock")
     start_parser.add_argument("--thinking")
     start_parser.add_argument("--session", help="true or false")
-    start_parser.add_argument("--node", help="exact Delegate Graph node for report verdict validation")
+    start_parser.add_argument("--node", help="exact Delegate Graph node")
     start_parser.add_argument("--command-json", help="structured operational command with executable, args, and cwd")
     start_parser.add_argument("--run-id", help="Delegate Graph run ID")
     start_parser.add_argument("--operation-id", help="Delegate Graph operation ID")
     start_parser.add_argument("--owned-paths-json", help="JSON array of graph-owned paths")
+    start_parser.add_argument("--ignored-paths-json", help="JSON array of overlay paths discarded without export or violation; defaults to no ignored paths")
     start_parser.add_argument("--access-mode", choices=("read-only", "owned-write"), help="persisted graph operation access mode; legacy launches default to read-only except implement/source_search")
     start_parser.add_argument("--model-attempt", type=int, default=0)
     start_parser.add_argument("--transient-attempt", type=int, default=0)
     start_parser.add_argument("--fallback-reason")
     start_parser.add_argument("--no-terminal", action="store_true", help="disable ACP terminal capability for evidence-only review")
-    start_parser.add_argument("--report", dest="report_option")
     start_parser.add_argument("--task-file", dest="task_file_option")
     start_parser.set_defaults(handler=command_start)
 

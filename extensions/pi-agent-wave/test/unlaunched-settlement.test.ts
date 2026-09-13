@@ -40,6 +40,7 @@ async function toolIn(dir: string): Promise<Record<string, any>> {
 	let tool: Record<string, any>;
 	const fakePi = {
 		registerCommand() {},
+		on() {},
 		registerTool(definition: Record<string, any>) {
 			tool = definition;
 		},
@@ -83,32 +84,18 @@ function runStatus(dbPath: string, runId: string): string {
 }
 
 describe("settlement for an operation whose worker never started", () => {
-	test("collect settles a never-dispatched operation and retains a diagnostic", async () => {
+	test("collect refuses a never-dispatched operation without writing anywhere", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "unlaunched-collect-"));
 		dirs.push(dir);
 		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
-		const collected = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(collected.error, undefined, `collect must settle an unlaunched operation, got ${JSON.stringify(collected)}`);
+		// A runtime attempt is registered by dispatch; with none registered there is nothing to collect, so the call is a refusal, not a settlement.
+		const refused = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
+		assert.match(String(refused.error), /no registered runtime attempt to collect/, `collect must refuse an unlaunched operation, got ${JSON.stringify(refused)}`);
 		const row = operationRow(dbPath, operationId);
-		assert.equal(row.status, "failed", "the operation must leave the active set");
-		assert.ok(row.finished_at, "the settled operation must carry finished_at");
-		assert.match(String(row.last_error), /never started/, "the recorded error must name the actual cause");
-		const retained = String(row.last_error).match(/retained diagnostics: (.+)$/)?.[1];
-		assert.ok(retained && existsSync(retained), `the settlement must name a retained diagnostic file: ${JSON.stringify(row)}`);
-		assert.match(readFileSync(retained, "utf8"), /never started/i, "the diagnostic must say the authorized command never started");
-		assert.notEqual(runStatus(dbPath, runId), "active", "the run must become decidable");
-	});
-
-	test("a repeated collect is a no-op instead of an error", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "unlaunched-repeat-"));
-		dirs.push(dir);
-		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
-		const first = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(first.error, undefined, String(first));
-		const settled = operationRow(dbPath, operationId);
-		const second = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(second.error, undefined, `a second collect must be a no-op, got ${JSON.stringify(second)}`);
-		assert.deepEqual(operationRow(dbPath, operationId), settled, "a no-op must not rewrite the settled row");
+		assert.equal(row.status, "pending", "a refused collect leaves the operation dispatchable");
+		assert.equal(row.finished_at, null);
+		assert.equal(runStatus(dbPath, runId), "active");
+		assert.equal(existsSync(join(dirname(dbPath), "failures", runId)), false, "a refusal must not retain a diagnostic");
 	});
 
 	test("cancel abandons a never-dispatched operation", async () => {
@@ -123,43 +110,6 @@ describe("settlement for an operation whose worker never started", () => {
 		assert.equal(runStatus(dbPath, runId), "cancelled", "the run must leave the active set");
 		const again = parsed(await tool.execute("cancel", { op: "cancel", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
 		assert.equal(again.error, undefined, `a repeated cancel must be a no-op, got ${JSON.stringify(again)}`);
-	});
-
-	test("the settlement needs no presentation adapter", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "unlaunched-herdr-"));
-		dirs.push(dir);
-		process.env.HERDR_ENV = "1";
-		process.env.HERDR_WORKSPACE_ID = "workspace";
-		process.env.HERDR_TAB_ID = "tab";
-		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
-		const collected = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(collected.error, undefined, `collect must settle with a presentation adapter present, got ${JSON.stringify(collected)}`);
-		assert.equal(operationRow(dbPath, operationId).status, "failed");
-	});
-
-	test("a settled run stays decidable for the operator", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "unlaunched-resolve-"));
-		dirs.push(dir);
-		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
-		const collected = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(collected.error, undefined, String(collected));
-		const retry = parsed(await tool.execute("retry", { op: "resolve", runId, operationId, decision: "retry" }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(retry.error, undefined, `a settled operation must be reopenable: ${JSON.stringify(retry)}`);
-		const reopened = operationRow(dbPath, operationId);
-		assert.equal(reopened.status, "pending", "an operator-approved retry returns the operation to the dispatchable set");
-		assert.equal(reopened.finished_at, null);
-		assert.equal(runStatus(dbPath, runId), "active");
-	});
-
-	test("a settled run can be abandoned outright", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "unlaunched-abort-"));
-		dirs.push(dir);
-		const { tool, runId, operationId, dbPath } = await unlaunched(dir);
-		await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext);
-		const abort = parsed(await tool.execute("abort", { op: "resolve", runId, operationId, decision: "abort" }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(abort.error, undefined, `a settled operation must be aborable: ${JSON.stringify(abort)}`);
-		assert.equal(runStatus(dbPath, runId), "cancelled", "abort ends the run");
-		assert.equal(operationRow(dbPath, operationId).status, "cancelled");
 	});
 
 	test("a run the caller got wrong is refused without writing anywhere", async () => {
@@ -179,7 +129,7 @@ describe("settlement for an operation whose worker never started", () => {
 		assert.equal(existsSync(join(dirname(dbPath), "failures", "run_does-not-exist")), false, "a refusal must not leave a failures directory behind");
 		assert.equal(operationRow(dbPath, operationId).status, "pending", "a refused collect leaves the operation untouched");
 		const good = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.equal(good.error, undefined, `refusals must not break the real path: ${JSON.stringify(good)}`);
+		assert.match(String(good.error), /no registered runtime attempt to collect/, `the real run is still addressed after the refusals: ${JSON.stringify(good)}`);
 	});
 
 	test("an operation cannot be settled under a foreign run", async () => {
@@ -208,7 +158,7 @@ describe("settlement for an operation whose worker never started", () => {
 			db.close();
 		}
 		const parked = parsed(await tool.execute("collect", { op: "collect", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
-		assert.match(String(parked.error), /is awaiting_user; resolve it/, `a parked run must be refused, got ${JSON.stringify(parked)}`);
+		assert.match(String(parked.error), /no registered runtime attempt to collect/, `a parked run must be refused, got ${JSON.stringify(parked)}`);
 		assert.equal(existsSync(join(dirname(dbPath), "failures", runId)), false, "a refusal must not write a diagnostic");
 		assert.equal(operationRow(dbPath, operationId).status, "pending");
 	});

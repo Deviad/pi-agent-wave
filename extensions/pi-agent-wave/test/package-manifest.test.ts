@@ -20,7 +20,7 @@ describe("package manifest", () => {
 		expect(typeof manifest.description).toBe("string");
 		expect(manifest.description.trim()).not.toBe("");
 		expect(manifest.files).toEqual(["*.ts", "lib", "scripts/*.ts", "scripts/*.mjs", "scripts/*.py", "README.md", "LICENSE"]);
-		expect(manifest.pi?.extensions).toEqual(["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts"]);
+		expect(manifest.pi?.extensions).toEqual(["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts", "claude-code-auth.ts"]);
 	});
 
 	test("declares the migrate, init, and doctor bins", () => {
@@ -39,7 +39,7 @@ describe("package manifest", () => {
 			typebox: "*",
 		});
 		expect(manifest.bundledDependencies).toBeUndefined();
-		expect(manifest.dependencies).toBeUndefined();
+		expect(manifest.dependencies).toEqual({ "@anthropic-ai/sdk": "0.91.1", "@cgaravitoq/claude-code-core": "0.1.0" });
 	});
 
 	test("does not invent deferred public URLs", () => {

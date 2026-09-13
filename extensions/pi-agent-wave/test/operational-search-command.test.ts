@@ -3,8 +3,25 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GraphStore } from "../store.ts";
-import type { OperationalCommandSpec } from "../types.ts";
+import { GraphStore, roleForNode } from "../store.ts";
+import type { OperationalCommandSpec, ResolvedPolicy } from "../types.ts";
+import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
+import { selectAcpAgent } from "../lib/acpx-select.ts";
+
+const MODEL = "openai-codex/gpt-5.6-sol";
+const policy = { input: { kind: "model", model: MODEL, reason: "test" }, routes: ["searcher", "thinker", "auditor"].map((role) => ({ role, tier: "exact", chain: [MODEL], thinking: "high", session: true, capabilityFloor: "planning", selectionSource: "model", promoted: false, promotionReason: null })) } as unknown as ResolvedPolicy;
+
+/** Registers, settles and accepts a runtime attempt for a pending operation, the way dispatch, collect and decide do. */
+function runOperation(store: GraphStore, runId: string, operationId: string, verdict: string): void {
+	const next = store.next(runId);
+	const operation = next.operations.find((candidate) => candidate.id === operationId);
+	if (!operation) throw new Error(`operation ${operationId} is not pending`);
+	const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId, role: roleForNode(operation.node), modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts, selectedModel: MODEL, agent: selectAcpAgent(MODEL) });
+	store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: next.policy.digest });
+	const answer = store.retainRuntimeContent(Buffer.from(`answer\n\nVERDICT: ${verdict}\n`));
+	store.settleRuntimeAttempt({ attemptKey: identity.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer, sources: [] }, observation: { sessionId: identity.sessionName, requestId: "1", sessionOrigin: "created", captureStatus: "complete", manifest: null } });
+	store.decideRuntimeCandidate({ attemptKey: identity.attemptKey, decision: "accepted", reason: "test", verdict });
+}
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -52,16 +69,14 @@ describe("operational command persistence", () => {
 
 	test("joins every source before creating synthesis and audit operations", () => {
 		const store = fixture();
-		const state = store.initRun("join", "operations", "Run", undefined, [command("linkedin", ["/tmp/linkedin.json"]), command("indeed", ["/tmp/indeed.json"])]);
+		const state = store.initRun("join", "operations", "Run", policy, [command("linkedin", ["/tmp/linkedin.json"]), command("indeed", ["/tmp/indeed.json"])]);
 		const sources = store.next(state.runId).operations;
-		for (const source of sources) store.record({ runId: state.runId, operationId: source.id, status: "running", transport: "herdr" });
-		store.record({ runId: state.runId, operationId: sources[0]!.id, status: "completed", verdict: "DONE", reportPath: "/tmp/report-one.json" });
+		runOperation(store, state.runId, sources[0]!.id, "DONE");
 		assert.equal(store.getState(state.runId).currentNode, "source_search");
-		store.record({ runId: state.runId, operationId: sources[1]!.id, status: "completed", verdict: "DONE", reportPath: "/tmp/report-two.json" });
+		runOperation(store, state.runId, sources[1]!.id, "DONE");
 		assert.equal(store.getState(state.runId).currentNode, "thinker_synthesize");
 		const synthesis = store.next(state.runId).operations[0]!;
-		store.record({ runId: state.runId, operationId: synthesis.id, status: "running", transport: "herdr" });
-		store.record({ runId: state.runId, operationId: synthesis.id, status: "completed", verdict: "DONE", reportPath: "/tmp/synthesis.json" });
+		runOperation(store, state.runId, synthesis.id, "DONE");
 		assert.equal(store.getState(state.runId).currentNode, "audit");
 		store.close();
 	});
@@ -80,8 +95,8 @@ describe("operational command persistence", () => {
 
 	test("preserves existing build and research initialization", () => {
 		const store = fixture();
-		assert.equal(store.initRun("build", "build", "Plan").currentNode, "thinker_plan");
-		assert.equal(store.initRun("research", "research", "Research").currentNode, "thinker_split");
+		assert.equal(store.initRun("build", "build", "Plan", undefined, undefined).currentNode, "thinker_plan");
+		assert.equal(store.initRun("research", "research", "Research", undefined, undefined).currentNode, "thinker_split");
 		store.close();
 	});
 });

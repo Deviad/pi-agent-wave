@@ -335,32 +335,6 @@ export function verifyHerdrPresentation(identity: AcpxWorkerIdentity, probe: Her
 	return { visible: blockers.length === 0, blockers };
 }
 
-interface GraphSettlementStore {
-	record(input: RecordOperationInput): unknown;
-}
 
-export interface AcpxSettlementInput {
-	runId: string;
-	operationId: string;
-	agentId: string;
-	agentName: string;
-	reportPath: string;
-	verdict: string;
-	lifecycle: LifecycleReconciliation;
-}
 
 /** Completes the graph operation only after every fail-closed spike signal agrees. */
-export function settleAcpxGraphOperation(store: GraphSettlementStore, input: AcpxSettlementInput): void {
-	if (input.lifecycle.status !== "completed") throw new Error(input.lifecycle.blockers.join("; ") || `ACPX lifecycle is ${input.lifecycle.status}`);
-	if (!existsSync(input.reportPath)) throw new Error(`worker report does not exist: ${input.reportPath}`);
-	store.record({
-		runId: input.runId,
-		operationId: input.operationId,
-		status: "completed",
-		agentId: input.agentId,
-		agentName: input.agentName,
-		verdict: input.verdict,
-		reportPath: input.reportPath,
-		payload: { acpxLifecycle: "completed", evidenceAuditValid: true },
-	});
-}

@@ -177,7 +177,7 @@ describe("loose-install migration", () => {
 	});
 
 	test("manifest lists Delegate Graph and each selected companion exactly once", () => {
-		expect(manifest.pi.extensions).toEqual(["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts"]);
-		expect(new Set(manifest.pi.extensions).size).toBe(4);
+		expect(manifest.pi.extensions).toEqual(["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts", "claude-code-auth.ts"]);
+		expect(new Set(manifest.pi.extensions).size).toBe(5);
 	});
 });

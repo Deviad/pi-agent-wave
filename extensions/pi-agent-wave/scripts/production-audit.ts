@@ -52,10 +52,9 @@ export const EXPECTED_AUDIT_SUMMARIES: AuditExpectations = Object.freeze({
 	"real-lifecycle-matrix": Object.freeze({ tests: 3, pass: 3, fail: 0, skipped: 0 }),
 	"real-production-matrix": Object.freeze({ tests: 3, pass: 3, fail: 0, skipped: 0 }),
 	"real-headless-matrix": Object.freeze({ tests: 3, pass: 3, fail: 0, skipped: 0 }),
-	ledger: Object.freeze({ valid: true, files: 1, findings: 0 }),
 });
 
-export const EXPECTED_AUDIT_COMMANDS = Object.freeze(["full-node", "bun-package", "typecheck", "pack", "publish", "install-rehearsal", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix", "token-cleanup", "secret-scan", "cleanup-scan", "ledger", "diff-check"] as const);
+export const EXPECTED_AUDIT_COMMANDS = Object.freeze(["full-node", "bun-package", "typecheck", "pack", "publish", "install-rehearsal", "real-lifecycle-matrix", "real-production-matrix", "real-headless-matrix", "token-cleanup", "secret-scan", "cleanup-scan", "diff-check"] as const);
 
 export type Runner = (command: string, args: readonly string[], options: { cwd: string; env: NodeJS.ProcessEnv; encoding: "utf8"; timeout: number; shell: false }) => SpawnSyncReturns<string>;
 
@@ -89,10 +88,6 @@ export function summarizeAuditOutput(name: string, output: string): Record<strin
 	if (name === "secret-scan" || name === "cleanup-scan" || name === "token-cleanup") {
 		try { return JSON.parse(output); } catch { return { parseError: true }; }
 	}
-	if (name === "ledger") {
-		try { const parsed = JSON.parse(output); return { valid: parsed.valid, files: parsed.files, findings: parsed.findings?.length }; }
-		catch { return { parseError: true }; }
-	}
 	return { bytes: Buffer.byteLength(output) };
 }
 
@@ -111,13 +106,11 @@ export function auditCommands(root: string): AuditCommand[] {
 		{ name: "token-cleanup", executable: "node", args: ["--experimental-strip-types", "extensions/pi-agent-wave/scripts/production-token-cleanup.ts"], cwd: root },
 		{ name: "secret-scan", executable: "node", args: ["--experimental-strip-types", "extensions/pi-agent-wave/scripts/production-secret-scan.ts", "agent-output/production-acpx-worker-backend"], cwd: root },
 		{ name: "cleanup-scan", executable: "node", args: ["--experimental-strip-types", "extensions/pi-agent-wave/scripts/production-cleanup-scan.ts"], cwd: root },
-		{ name: "ledger", executable: "node", args: ["--experimental-strip-types", "extensions/pi-agent-wave/scripts/ledger.ts", "audit", process.env.PI_WAVE_AUDIT_STORY ?? "air-headless-orchestration", "--base", "agent-output"], cwd: root },
-		{ name: "diff-check", executable: "git", args: ["diff", "--check"], cwd: root },
+			{ name: "diff-check", executable: "git", args: ["diff", "--check"], cwd: root },
 	];
 }
 
 function commandArtifacts(name: string): string[] {
-	if (name === "ledger") return ["agent-output/production-acpx-worker-backend/delegate-ledger/"];
 	if (name === "pack" || name === "publish") return ["extensions/pi-agent-wave/package.json"];
 	return [];
 }
@@ -137,7 +130,7 @@ function runCommand(command: AuditCommand, runner: Runner): AuditCommandRecord {
 	const result = runner(command.executable, args, { cwd: command.cwd, env: environment, encoding: "utf8", timeout: 900_000, shell: false });
 	const finished = Date.now();
 	const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-	const summarySource = ["pack", "publish", "ledger", "token-cleanup", "secret-scan", "cleanup-scan"].includes(command.name) ? result.stdout ?? "" : output;
+	const summarySource = ["pack", "publish", "token-cleanup", "secret-scan", "cleanup-scan"].includes(command.name) ? result.stdout ?? "" : output;
 	return { ...command, args, exitCode: result.status ?? 128, startedAt, finishedAt: new Date(finished).toISOString(), durationMs: finished - started, environmentKeys: ["PATH", "npm_config_audit", "npm_config_fund"], artifactPaths: commandArtifacts(command.name), outputSha256: hash(output), summary: summarizeAuditOutput(command.name, summarySource) };
 }
 
@@ -220,7 +213,6 @@ export function summariesValid(commands: AuditCommandRecord[], expectations: Aud
 		if (command.name === "token-cleanup" && command.summary.deleted !== true) return false;
 		if (command.name === "secret-scan" && command.summary.findings !== 0) return false;
 		if (command.name === "cleanup-scan" && (Array.isArray(command.summary.leakedTabs) && command.summary.leakedTabs.length || command.summary.agentFsProcesses !== 0 || Array.isArray(command.summary.temporaryDirectories) && command.summary.temporaryDirectories.length || command.summary.tokenFilePresent !== false)) return false;
-		if (command.name === "ledger" && (command.summary.valid !== true || command.summary.findings !== 0)) return false;
 		return true;
 	});
 }

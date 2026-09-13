@@ -34,7 +34,7 @@ const identity = workerAttemptIdentity({
 const headlessAdapter = {
 	kind: "headless",
 	async launch(request) { return { identity: request.identity, presentation: headlessPresentationIdentity() }; },
-	async wait(handle) { return { identity: handle.identity, verdict: "PASS", reportPath: "/tmp/report.json", settlementEvidencePath: "/tmp/settlement.json", cleanupEvidencePath: "/tmp/cleanup.json" }; },
+	async wait(handle) { return { identity: handle.identity, verdict: "PASS", settlementEvidencePath: "/tmp/settlement.json", cleanupEvidencePath: "/tmp/cleanup.json" }; },
 	async cancel() {},
 	async cleanup() {},
 	async observeProgress(handle, listener) { listener({ identity: handle.identity, kind: "progress", detail: "running" }); },
@@ -89,14 +89,14 @@ describe("worker transport Value Objects", () => {
 
 describe("worker transport port", () => {
 	test("supports a headless adapter without focus", async () => {
-		const handle = await headlessAdapter.launch({ identity, taskFile: "/tmp/task.md", reportPath: "/tmp/report.json", readOnly: true, ownedPaths: [] });
+		const handle = await headlessAdapter.launch({ identity, taskFile: "/tmp/task.md", readOnly: true, ownedPaths: [] });
 		assert.equal(handle.presentation.kind, "headless");
 		assert.equal(headlessAdapter.focus, undefined);
 		assert.equal((await headlessAdapter.wait(handle)).verdict, "PASS");
 	});
 
 	test("supports a focus-capable Herdr adapter", async () => {
-		const handle = await herdrAdapter.launch({ identity, taskFile: "/tmp/task.md", reportPath: "/tmp/report.json", readOnly: false, ownedPaths: ["src"] });
+		const handle = await herdrAdapter.launch({ identity, taskFile: "/tmp/task.md", readOnly: false, ownedPaths: ["src"] });
 		assert.equal(handle.presentation.kind, "herdr");
 		await herdrAdapter.focus(handle);
 	});

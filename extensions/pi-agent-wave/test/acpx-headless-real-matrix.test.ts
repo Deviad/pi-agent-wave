@@ -43,7 +43,7 @@ function runAgent(agent: "pi" | "codex" | "claude", model: string): void {
 	const taskFile = join(runDir, "task.md");
 	const reportPath = join(runDir, "report.json");
 	writeFileSync(taskFile, `Perform one harmless report-only production matrix turn for ${agent}. Do not modify repository files. Write the required schemaVersion 1 report with verdict PASS and one verified execution claim. Do not include credentials or provider responses.\n`, { mode: 0o600 });
-	const started = run(["start", runDir, "auditor", "--policy", "auto", "--policy-digest", "72cf06816600122ea63a982f598604b09e5be1de196acc5665bd9739da915e59", "--model", model, "--reason", `final headless ${agent} matrix`, "--thinking", "low", "--session", "true", "--node", "audit", "--run-id", `final-headless-${agent}`, "--operation-id", `final-headless-${agent}-1`, "--owned-paths-json", "[]", "--model-attempt", "0", "--transient-attempt", "0", "--report", reportPath, "--task-file", taskFile], env);
+	const started = run(["start", runDir, "auditor", "--result-contract", "legacy-v1", "--policy", "auto", "--policy-digest", "72cf06816600122ea63a982f598604b09e5be1de196acc5665bd9739da915e59", "--model", model, "--reason", `final headless ${agent} matrix`, "--thinking", "low", "--session", "true", "--node", "audit", "--run-id", `final-headless-${agent}`, "--operation-id", `final-headless-${agent}-1`, "--owned-paths-json", "[]", "--model-attempt", "0", "--transient-attempt", "0", "--report", reportPath, "--task-file", taskFile], env);
 	assert.equal(started.status, 0, started.stderr);
 	const start = JSON.parse(started.stdout);
 	assert.equal(start.transport, "headless");

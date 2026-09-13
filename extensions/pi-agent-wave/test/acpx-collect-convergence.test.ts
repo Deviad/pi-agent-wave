@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { GraphStore } from "../store.ts";
+import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
+import { selectAcpAgent } from "../lib/acpx-select.ts";
+
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -31,6 +35,7 @@ async function toolIn(dir: string, models: string[] = ["openai-codex/gpt-5.6-sol
 	const fakePi = {
 		registerCommand() {},
 		registerTool(definition: Record<string, any>) { tool = definition; },
+		on() {},
 		exec: async (command: string, args: string[]) => {
 			invocations?.push({ command, args: [...args] });
 			const result = spawnSync(command, args, { encoding: "utf8" });
@@ -46,6 +51,7 @@ async function toolIn(dir: string, models: string[] = ["openai-codex/gpt-5.6-sol
 async function startDeadAttempt(dir: string, options: { cancelExit: number; state: "alive" | "no-session" }): Promise<{ tool: Record<string, any>; runId: string; operationId: string; privateRunDir: string; diagnosticsPath: string }> {
 	const { tool } = await toolIn(dir);
 	const init = parsed(await tool.execute("init", { op: "init", story: "dead-attempt", graph: "build", task: "Plan the wave" }, undefined, () => {}, {} as ExtensionContext));
+	if (init.error) throw new Error(`init failed: ${init.error}`);
 	const operation = init.next.operations[0];
 	const privateRunDir = join(dir, "run-private");
 	const attemptDir = join(privateRunDir, "acpx", "dg-dead-thinker");
@@ -55,21 +61,14 @@ async function startDeadAttempt(dir: string, options: { cancelExit: number; stat
 	const cancelScript = join(attemptDir, "cancel-acpx.sh");
 	writeFileSync(cancelScript, `#!/bin/sh\nprintf 'worker session already gone\\n' >&2\nexit ${options.cancelExit}\n`, { mode: 0o700 });
 	chmodSync(cancelScript, 0o700);
-	const started = parsed(await tool.execute("running", {
-		op: "record",
-		runId: init.state.runId,
-		operationId: operation.id,
-		status: "running",
-		agentName: "dg-dead-thinker",
-		transport: "headless",
-		policyDigest: init.next.policy.digest,
-		modelPolicy: init.next.policy.input,
-		selectedModel: operation.route.chain[0],
-		modelAttempt: 0,
-		payload: { acpx: { agent: "pi", recordId: "dg-dead-session", sessionId: "dg-dead-session", state: options.state, attemptKey: "attempt-key", agentFsSessionId: "dg-dead-session", agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript } },
-	}, undefined, () => {}, {} as ExtensionContext));
-	if (started.error) throw new Error(`running registration failed: ${started.error}`);
-	if (!started.operation?.agent_id) throw new Error(`running left no agent binding: ${JSON.stringify(started.operation)}`);
+	// Register the attempt the way dispatch does, bound to a launcher directory whose worker is already gone.
+	const selectedModel: string = operation.route.chain[0];
+	const identity = createHeadlessAcpxAttemptIdentity({ runId: init.state.runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel, agent: selectAcpAgent(selectedModel) });
+	const store = new GraphStore({ dbPath: process.env.DELEGATE_GRAPH_DB });
+	try {
+		const agentId = store.registerAgent({ runId: init.state.runId, name: "dg-dead-thinker", node: "thinker_plan", role: "thinker", transport: "headless", policyDigest: init.next.policy.digest, selectedModel, modelAttempt: 0, currentTask: operation.task, acpAgent: identity.agent, acpxRecordId: "dg-dead-session", acpxSessionId: "dg-dead-session", acpxState: options.state, acpxAttemptKey: identity.attemptKey, agentFsSessionId: "dg-dead-session", agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript });
+		store.beginRuntimeAttempt({ identity, sessionId: "dg-dead-session", requestId: null, policyDigest: init.next.policy.digest, agentId });
+	} finally { store.close(); }
 	return { tool, runId: init.state.runId, operationId: operation.id, privateRunDir, diagnosticsPath };
 }
 
@@ -84,6 +83,7 @@ describe("provider preflight at dispatch", () => {
 			const { tool } = await toolIn(dir, ["nosuchproviderxyz/dead-route", "alibaba/live-route"], invocations);
 			const commands = graph === "operations" ? [{ id: "access", name: "access", command: { executable: process.execPath, args: ["-e", "process.exit(0)"], cwd: dir }, ownedPaths: [join(dir, "result.txt")] }] : undefined;
 			const init = parsed(await tool.execute("init", { op: "init", story: "preflight-block", graph, task: "Plan the wave", commands }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(init.error, undefined, `init must succeed, got ${JSON.stringify(init)}`);
 			const operation = init.next.operations[0];
 			const blocked = parsed(await tool.execute("dispatch", { op: "dispatch", runId: init.state.runId, operationId: operation.id, transport: "headless" }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(blocked.error, undefined, `dispatch must converge on a named block, got ${JSON.stringify(blocked)}`);
@@ -112,13 +112,16 @@ describe("terminated attempt convergence", () => {
 			const started = await startDeadAttempt(dir, { cancelExit: 1, state: "alive" });
 			const collected = parsed(await started.tool.execute("collect", { op: "collect", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(collected.error, undefined, `collect must converge, got ${JSON.stringify(collected)}`);
-			assert.equal(collected.settled, false);
-			assert.equal(collected.recorded, "failed");
+			assert.equal(collected.settled, true);
+			assert.equal(collected.attempt.processState, "failed");
 			assert.equal(collected.diagnosticsPath, started.diagnosticsPath, "the retained diagnostic bundle must be named to the supervisor");
 			assert.ok(String(collected.reason).length > 0, "the launcher reason must be reported");
-			assert.match(String(collected.operation.last_error), new RegExp(`retained worker diagnostics: ${started.diagnosticsPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the recorded error must name the retained bundle");
-			assert.equal(collected.operation.status, "failed");
-			assert.notEqual(collected.state.status, "active", "the run must move to a decidable state");
+			assert.match(String(collected.attempt.outcome.error), new RegExp(`retained worker diagnostics: ${started.diagnosticsPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the settled outcome must name the retained bundle");
+			// The fact is settled; the operation stays on its failed attempt until the runtime replaces it.
+			assert.equal(collected.operation.status, "running");
+			const retried = parsed(await started.tool.execute("retry", { op: "retry", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(retried.error, undefined, `retry must classify the dead worker, got ${JSON.stringify(retried)}`);
+			assert.notEqual(retried.operation.status, "running", "a dead worker must never stay dispatchable as running");
 			const next = parsed(await started.tool.execute("next", { op: "next", runId: started.runId }, undefined, () => {}, {} as ExtensionContext));
 			assert.ok(!next.operations.some((candidate: Record<string, unknown>) => candidate.id === started.operationId && candidate.status === "running"), "a dead worker must never stay dispatchable as running");
 		} finally {

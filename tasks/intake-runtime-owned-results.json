@@ -1,0 +1,32 @@
+{
+  "title": "Capture worker results without mandatory report files",
+  "description": "Add an opt-in runtime-v1 contract for build and research runs. Capture attributable authored answers and retain isolated candidates; separate durable process settlement from explicit semantic acceptance. Derived reports and ledgers cannot invalidate results or trigger formatting-only model turns. Preserve legacy runs, caller-driven scheduling, frozen model policies and existing Part C work.",
+  "user_story": "As a Pi user, I want useful worker results retained and assessed directly, so that report formatting cannot discard work or spend another model turn.",
+  "acceptance_criteria": [
+    "AC1: Legacy runs and omitted options retain their gates; explicit build/research runtime-v1 selection is immutable, migration and replay are idempotent, and cancelled runs and frozen model locks remain unchanged.",
+    "AC2: Real Pi, Codex and Claude adapter evidence gates attributable bounded answer capture; missing/malformed reports spend zero repair calls, and empty, tool-only, thought, stale or truncated output cannot fabricate success.",
+    "AC3: Process outcomes and useful coding/research candidates persist independently of acceptance and derived exports across cancellation, failure, duplicate collection and restart; essential persistence failure pauses safely.",
+    "AC4: Coding candidates integrate serially against a recorded base with crash recovery; acceptance binds combined revision, applicable executable checks and independent review, while conflicts and ownership violations are refused.",
+    "AC5: Repository-read-only research completes without diffs or test commands only with retrieved evidence, authored synthesis and independent source-support review; unsupported claims require substantive correction.",
+    "AC6: Both task types pass the shared recovery matrix and repository gates; AGENTS and both READMEs match versioned behavior, and separate timing/quality measurements report unrun paid proofs and unavailable prerequisites honestly."
+  ],
+  "decomposition": [
+    "Resolve real-adapter evidence and environment availability; obtain separate authorization before paid probes or benchmarks and record a matched legacy baseline.",
+    "Add test-first versioned run, attempt, candidate and decision persistence with migration and replay guarantees.",
+    "Implement bounded attributed answer capture, retained candidates and report-independent collection while preserving legacy branches.",
+    "Implement minimal revision-bound integration recovery and explicit coding/research acceptance with independent review.",
+    "Synchronize documentation and complete real dependency, package, recovery and separately authorized measurement proof."
+  ],
+  "difficulty": "XL",
+  "difficulty_reasoning": "The change spans command compatibility, SQLite transitions, ACPX capture, Python lifecycle and filesystem integration. Crash consistency and independent research acceptance require explicit cross-layer contracts. Real adapter proof and the current sandbox limitations make release verification a material dependency.",
+  "routing": {
+    "executor": "Codex",
+    "reason": "Sustained repository implementation with test-first changes and real dependency verification; independent review before release acceptance."
+  },
+  "original_input": "proceed with tasks/design-autonomous-swarms.md",
+  "suggested_labels": [
+    "feature",
+    "runtime",
+    "research"
+  ]
+}

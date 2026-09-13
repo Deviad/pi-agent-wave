@@ -1,0 +1,1 @@
+{"type":"error_resolution","symptom":"py-ok\nnot ok 2 - the runtime worker branch needs an attempt key and fails closed without a real acpx executable\n  error: |-\n  error: 'spawnSync /var/folders/bf/bg8nrdrx27z4cmyv4bm5z5_m0000gn/T/runtime","root_cause":"","fix":"# pass 2\n# fail 0","tags":[],"ts":"2026-09-12T07:12:46.005Z"}

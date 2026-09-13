@@ -1,61 +1,43 @@
 # pi-agent-wave
 
-pi-agent-wave adds transport-neutral multi-agent work to Pi. JetBrains Air can control Pi through `pi-acp` while headless ACPX workers run inside AgentFS; Herdr remains an optional presentation adapter.
+pi-agent-wave gives Pi a durable, evidence-gated delegation graph. A supervisor session dispatches Pi, Codex, and Claude workers through ACPX, isolates every attempt in an AgentFS copy-on-write sandbox, and advances the graph only on verified evidence. JetBrains Air drives it through `pi-acp` in headless mode; Herdr is an optional presentation adapter for visible worker tabs.
 
-Use it when you want ordered implementation and review, durable status and logs, isolated Pi/Codex/Claude workers, and evidence-gated recovery without requiring a separate UI.
+This document is the reference for installing, configuring, and operating the package. The repository root README covers the product overview and the Air journey.
 
-The package provides Delegate Graph, the `questionnaire` tool, cmux session metadata hooks, and native model failover.
+## Contents
 
-## Security
-
-Pi extensions execute with your user account's full system access. Review the source before installation, especially migration and worker-launch scripts.
+| Section | What it covers |
+| --- | --- |
+| [Requirements](#requirements-and-compatibility) | Tested Pi, ACPX, AgentFS, and pi-acp versions |
+| [Install](#install) | Runtimes, the package, optional Herdr |
+| [First run](#first-run) | Restart, enable an adapter, start a run, watch it |
+| [Configure](#configure) | Initializer, doctor, migration, environment variables |
+| [Environment and storage](#environment-and-storage) | Every variable the package reads and where it writes |
+| [Commands](#pi-commands) | `/delegate`, `/graph`, `/failover` |
+| [Tools](#tools) | `delegate_graph`, `questionnaire`, cmux hooks |
+| [Result contract](#result-contract) | `runtime-v1`: retained answers, audited changes, explicit decisions |
+| [Graphs](#graphs) | Build, research, operational search |
+| [Worker lifecycle](#worker-lifecycle) | Agent selection, credentials, sandbox, settlement, cleanup |
+| [Failure recovery](#failure-recovery) | Retry, chain fallback, parking, main-session failover |
+| [Verification tooling](#verification-tooling) | Host audit, live matrix, measurement, live result probe |
+| [Known limitations](#known-limitations) | What is proven, what is open |
+| [Security](#security) and [Uninstall](#uninstall) | |
 
 ## Requirements and compatibility
 
-- Pi `0.84.1` or `0.84.2`.
-- ACPX `0.13.2` is required for ACP worker execution through Pi, Codex, and Claude.
-- Turso AgentFS `0.6.4` is required for one copy-on-write sandbox per operation attempt.
+| Component | Version | Role |
+| --- | --- | --- |
+| Pi | `0.84.1` or `0.84.2` | Host and supervisor |
+| ACPX | `0.13.2` | Worker execution for Pi, Codex, and Claude |
+| Turso AgentFS | `0.6.4` | One copy-on-write sandbox per attempt |
+| pi-acp | `0.0.31` | Air's ACP bridge to Pi |
+| Herdr | any current release | Optional visible worker tabs |
 
-ACPX, AgentFS, `pi-acp`, optional Herdr, and ACP adapter packages remain external and are not bundled with pi-agent-wave.
-
-| Pi version | Status |
-| --- | --- |
-| `0.84.1` | Tested |
-| `0.84.2` | Tested |
-
-No compatibility is claimed outside this matrix.
+ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them.
 
 ## Install
 
-### Optional: install Herdr presentation
-
-With Homebrew on macOS or Linux:
-
-```bash
-brew install herdr
-```
-
-Or use Herdr's official installer on macOS or Linux:
-
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
-
-On Windows PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
-```
-
-Verify the installation:
-
-```bash
-herdr --version
-```
-
-See the [official Herdr installation guide](https://herdr.dev/docs/install/) for other options.
-
-### Install ACPX and AgentFS
+### ACPX and AgentFS
 
 ```bash
 npm install -g acpx@0.13.2
@@ -63,79 +45,157 @@ acpx --version
 agentfs --version
 ```
 
-AgentFS must report `agentfs v0.6.4`. Download the matching platform archive and published checksum from https://github.com/tursodatabase/agentfs/releases/tag/v0.6.4. The package fails before registration when ACPX or AgentFS is absent or mismatched. Claude execution uses a token created by `claude setup-token` and supplied only through a mode-600 file path in `PI_CLAUDE_OAUTH_TOKEN_FILE`; `pi-agent-wave-doctor --json` reports a missing or insecure file without printing token values.
+AgentFS must report `agentfs v0.6.4`. Download the platform archive and checksum from https://github.com/tursodatabase/agentfs/releases/tag/v0.6.4.
 
-### Install pi-agent-wave
+Claude workers authenticate with a token created by `claude setup-token`, supplied only through a mode-600 file whose path is in `PI_CLAUDE_OAUTH_TOKEN_FILE`. The doctor reports a missing or insecure file without printing its contents.
 
-The npm package has not been published yet. Install the current source release with:
+### pi-agent-wave
+
+The npm package has not been published yet. Install from a retained source checkout:
 
 ```bash
 git clone https://github.com/Deviad/pi-agent-wave.git
 pi install ./pi-agent-wave-new-design/extensions/pi-agent-wave
 ```
 
-Keep the cloned directory in place while Pi uses this local package source.
-
-After npm publication, the command will be:
+Keep the clone in place; Pi loads the extension from that path. After npm publication the command will be:
 
 ```bash
 pi install npm:@dpugliese/pi-agent-wave
 ```
 
-Do not use the npm command until the package is available in the npm registry.
+Do not use the npm form before the package exists in the registry.
 
-## Contents
+`pi install` records the checkout path in `~/.pi/agent/settings.json` under `packages`; Pi loads the extension's TypeScript from that path at startup, so a change in the checkout takes effect after Pi is restarted, and an uncommitted checkout runs exactly as it is on disk.
 
-- `index.ts`: Delegate Graph commands and the `delegate_graph` tool.
-- `questionnaire.ts`: structured terminal questions.
-- `cmux-session.ts`: optional cmux session metadata hooks.
-- `model-failover.ts`: same-tier, cross-provider model recovery.
-- `scripts/`: shared transport-neutral lifecycle, headless and optional Herdr adapters, ACPX worker execution, AgentFS export, evidence, configuration, and migration utilities.
+### Optional: Herdr
 
-Herdr, ACPX, AgentFS, `pi-acp`, ACP adapter packages, overlay databases, Herdr-managed files, user settings, routing configuration, credentials, and generated evidence are not packaged.
+Herdr adds visible worker tabs and `/graph focus`. Install it only if you want that:
 
-## Configuration
+```bash
+brew install herdr
+# or: curl -fsSL https://herdr.dev/install.sh | sh
+herdr --version
+```
 
-Pi resolves its agent directory from `PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent`. Route inspection and failover also honor:
+Windows PowerShell: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"`. See the [Herdr installation guide](https://herdr.dev/docs/install/) for other options.
 
-- `PI_MODEL_ROUTING`: an explicit `model-routing.jsonc` path.
-- `PI_MODEL_CATALOG`: an explicit `models.json` path.
+## First run
 
-Headless is selected when complete Herdr identity is absent. A complete Herdr workspace enables optional visible tabs and focus. Delegated workers automatically receive their frozen model route and failover settings. Main interactive sessions should use `/failover` instead of setting failover environment variables manually.
+1. **Restart Pi.** Extensions load at startup.
+2. **Check the tier routes.** Every worker is dispatched to the adapter its frozen model selects (`openai-codex/*` Codex, `claude-code/*` Claude, anything else Pi); no enablement step exists. Put a Pi-adapter model behind every Codex or Claude entry in `~/.pi/agent/model-routing.jsonc` so an exhausted plan quota or usage window falls over to another provider instead of parking the run. Provenance for each adapter's runtime-v1 evidence lives in [Adapters](#known-limitations) and the PRD.
 
-## Quick start
+3. **Check the doctor** (`node scripts/doctor.mjs` from the checkout) for the routing file, credentials and the optional Claude token.
+4. **Start a run.** From a Herdr workspace in your terminal the workers get tabs; from Air or a plain terminal they run headless:
 
-Pi's local-path install loads the extension but does not add package commands to your shell. Run the source scripts through Node.
+   ```text
+   /delegate research where is cache invalidation triggered in this repository
+   /graph watch <runId> --follow
+   ```
 
-Preview the configuration, apply it, and run the read-only doctor:
+   The run id is in the run notice and in `/graph status`. As soon as the first worker registers, a numbered agent list opens above the editor; type its number and press Enter to see the worker's task, state, live output and retained answer in the terminal, `q` or Escape goes back and then closes, `/graph agents` reopens. In the explicit follow view, number keys focus a worker's tab and `q` closes it.
+5. **Decide what a role thinks.** The tier a role maps to in `model-routing.jsonc` carries `thinking`; that level is frozen into the run and written into each worker's private settings, so a `high` tier streams thoughts (shown dimmed) and an `off` tier does not. The level applies to runs started after the change.
+
+## Configure
+
+Pi resolves its agent directory from `PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent`. Route inspection and failover also honor `PI_MODEL_ROUTING` (an explicit `model-routing.jsonc` path) and `PI_MODEL_CATALOG` (an explicit `models.json` path).
+
+A local-path install loads the extension but adds no shell commands, so run the scripts through Node. After npm publication, the package binaries will be `pi-agent-wave-init`, `pi-agent-wave-init apply`, `pi-agent-wave-doctor`, and `pi-agent-wave-migrate`:
+
+```text
+pi-agent-wave-init [dry-run|apply|rollback] [options]
+pi-agent-wave-doctor [--json] [--agent-dir <path>] [--routing <path>] [--models <path>]
+pi-agent-wave-migrate [preflight|dry-run|apply|rollback] [options]
+```
+
+### Initializer
+
+The initializer writes a valid `model-routing.jsonc` from the models already in your catalog. It defaults to dry-run and writes only on an explicit `apply`:
 
 ```bash
 node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs
 node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs --agent-dir "$PI_CODING_AGENT_DIR"
 ```
 
-The first command is a read-only plan. Review it before running `apply`.
+It reads `models.json` (`--models`, then `PI_MODEL_CATALOG`, then the agent directory) and offers only ids found under `providers.<provider>.models[].id`. It never creates providers, credentials, or `models.json`.
 
-After npm publication, the package binaries will be:
+Interactive mode prompts for one model per tier: the six public tiers plus the optional `local-fast` tier. Automation passes every required tier explicitly with `--non-interactive`; each flag takes a comma-separated `provider/model-id` chain whose order becomes the tier's fallback chain:
 
 ```bash
-pi-agent-wave-init
-pi-agent-wave-init apply
-pi-agent-wave-doctor
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply --non-interactive \
+  --tools openai-codex/gpt-5.4-mini \
+  --coding openai-codex/gpt-5.6-luna \
+  --test openai-codex/gpt-5.4-mini \
+  --review claude-code/claude-opus-5 \
+  --reasoning claude-code/claude-opus-5 \
+  --long-context openai-codex/gpt-5.6-luna \
+  --local-fast ds4/deepseek-v4-flash
 ```
 
-For JetBrains Air, add a global ACP agent whose command is the absolute `npx` path and whose args are `["-y", "pi-acp@0.0.31"]`. Select Pi in a new Air task, then ask it to use `delegate_graph`. Air-owned ACP sessions use structured progress, cancellation, recovery, and awaiting-user results without Herdr.
+Apply fails closed when an existing `model-routing.jsonc` differs or a pi-fzf `route` or `delegate-model` command would be overwritten. `--force` backs the originals up first to a private, content-addressed directory under `migration-backups/pi-agent-wave-init/<id>/`, and `rollback --manifest` restores them byte-for-byte:
 
-In a Pi terminal, start Pi and use the existing commands:
-
-```text
-/delegate Implement tenant-scoped API keys
+```bash
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply --force
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs rollback --manifest /path/to/migration-backups/pi-agent-wave-init/<id>/manifest.json
 ```
 
-To use optional visible tabs, start Pi inside a Herdr workspace before delegating.
+When pi-fzf is installed (detected from `settings.json`), the initializer merges `route` and `delegate-model` list and preview commands that point at the installed package's `route-picker.ts`, leaving unrelated commands untouched. Without pi-fzf the plan reports `skipped` and creates no `fzf.json`.
 
-## Pi command reference
+### Doctor
+
+The doctor is read-only:
+
+```bash
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs --json
+```
+
+It checks agent-directory resolution, catalog readability, routing JSONC, the six required tiers and roles, non-empty chains, catalog membership, local-model loopback validity, pi-fzf targets, package entry points, and real `policy-resolver` and `route-picker` execution. Its `route-credentials` section names the executing agent for every routed model and whether that agent's credential store is structurally usable. It exits nonzero only on a required failure; absent pi-fzf is a warning. Output redacts credential-bearing fields.
+
+### Migration from a loose install
+
+The migration utility moves a loose extension install aside and enables the package. It defaults to dry-run:
+
+```bash
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs preflight
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs apply
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs rollback --manifest /path/to/manifest.json
+```
+
+Apply moves conflicting loose extensions to `migration-backups/pi-agent-wave/`, records a manifest, enables the package source in `settings.json`, and repairs the pi-fzf `route` and `delegate-model` commands to execute the installed package's `route-picker.ts`. The original `fzf.json` bytes are kept in the manifest. Review every dry-run before applying, and never migrate a real installation without explicit authorization.
+
+## Environment and storage
+
+| Variable | Read by | Meaning |
+| --- | --- | --- |
+| `PI_CODING_AGENT_DIR` | extension, scripts | Pi agent directory; default `~/.pi/agent` |
+| `PI_MODEL_ROUTING`, `PI_MODEL_CATALOG` | resolver, doctor, picker | Explicit `model-routing.jsonc` and `models.json` paths |
+| `DELEGATE_GRAPH_DB` | extension, settlement | Graph database path; default `~/.cache/delegate-graph/delegate-graph.db`. Tests and the measurement driver point it at a temporary file |
+| `PI_CLAUDE_OAUTH_TOKEN_FILE` | launcher, doctor, matrix | Mode-600 raw Claude token for `claude-code/*` workers |
+| `CODEX_HOME` | launcher, doctor | Codex credential and configuration home; default `~/.codex` |
+| `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` | extension, launcher | Set by Herdr in a workspace shell; complete identity selects the Herdr transport under `auto` |
+| `PI_DELEGATE_WAIT_TIMEOUT_MS` | launcher | Bound on waiting for a worker to settle |
+| `PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS` | launcher | Bound on waiting for the worker process to exit after its result; default `30000` |
+| `PI_GRAPH_WATCH_INTERVAL_MS` | extension | Redraw interval of the agent list and of `/graph watch --follow`; default `2000`, minimum `50` |
+| `PI_ACPX_CONFIG`, `PI_ACPX_CANCEL_CONFIG`, `PI_RUNTIME_SETTLE_CONFIG` | worker scripts | Private per-attempt configuration paths set by the launcher; never set them yourself |
+
+Where the package writes:
+
+| Location | Contents | Lifetime |
+| --- | --- | --- |
+| `~/.cache/delegate-graph/delegate-graph.db` | Runs, operations, agents, events, runtime attempts, decisions, integrations, adapter evidence rows | Until `/graph prune` |
+| `~/.cache/delegate-graph/runtime-content/` | Content-addressed retained answers, staged files and manifests | With the run |
+| `~/.cache/delegate-graph/failures/<runId>/` | Diagnostics for operations that were never dispatched | With the run |
+| `/tmp/delegate-graph-herdr-<run>-<operation>.*/` | The attempt's private run directory: task, prompt, worker configuration, ACPX and AgentFS homes, capture files, settlement and cleanup records, materialized run evidence, retained failure bundles and raw streams | Attempt directories are removed after a clean settlement; the run directory and its records remain |
+| `<workspace>` | Files placed by `integrate` through the journal, and nothing else | Yours |
+
+All of these are private, mode 600 or 700, and may contain sensitive values. None is packaged.
+
+## Pi commands
+
+The same operations are available to ACP clients through the `delegate_graph` tool. For JetBrains Air, register a global ACP agent whose command is the absolute `npx` path and whose args are `["-y", "pi-acp@0.0.31"]`, select Pi in a new Air task, and ask it to use `delegate_graph`; Air owns the Pi process and receives structured progress, questions, cancellation, recovery, and `awaiting_user` results in headless mode without Herdr.
 
 ### `/delegate`
 
@@ -143,157 +203,135 @@ To use optional visible tabs, start Pi inside a Herdr workspace before delegatin
 /delegate [--policy <auto|cheap|balanced|strong|local|long-context>] <task>
 ```
 
-Starts a durable build or research graph, freezes the model route for every role, renames the Pi session, and injects the supervisor contract. The optional `--policy` must be the first argument. In TUI mode, omitting it opens the policy picker; headless mode defaults to `auto`.
+Starts a durable run, freezes the model route for every role, renames the Pi session, and injects the supervisor contract. The only leading flag is `--policy`; flags inside the task text stay task text. In TUI mode, omitting `--policy` opens the policy picker; headless mode defaults to `auto`.
 
-A task is a build graph unless it begins with `research`, `explore`, or `search`. Those prefixes select the read-only research graph and are removed from the task text.
+A task is a build graph unless it begins with `research`, `explore`, or `search`; those prefixes select the read-only research graph and are removed from the task text.
 
 ```text
+/delegate Implement tenant-scoped API keys
 /delegate --policy strong Implement tenant-scoped API keys
 /delegate research compare SQLite replication options
 /delegate --policy local search for the source of the cache invalidation bug
 ```
 
-Policy behavior:
-
-| Policy | Use case |
+| Policy | Behavior |
 | --- | --- |
-| `auto` | Use each role's configured default tier. |
-| `cheap` | Prefer the configured economy route. |
-| `balanced` | Balance capability and cost. |
-| `strong` | Prefer stronger configured models. |
-| `local` | Require local routes; preflight fails closed if a role cannot meet its capability floor locally. |
-| `long-context` | Prefer the configured long-context route. |
+| `auto` | Each role's configured default tier |
+| `cheap` | The configured economy route |
+| `balanced` | Balance capability and cost |
+| `strong` | Stronger configured models |
+| `local` | Local routes only; preflight fails closed if a role cannot meet its capability floor locally |
+| `long-context` | The configured long-context route |
 
-Capability floors may promote a role to a stronger tier. The frozen policy preview records promotions and remains authoritative for retries and resumes.
+Capability floors may promote a role to a stronger tier. The frozen policy records promotions and stays authoritative for every retry and resume.
 
 ### `/graph`
 
-Use the run and operation identifiers returned by `/delegate` or shown in graph status.
-
 | Command | Purpose |
 | --- | --- |
-| `/graph status <runId>` | Show graph state, pending work, blockers, and registered workers. |
-| `/graph log <runId> [--tail <count>] [--agent <name>]` | Show the event log. The default tail is 50 entries; `--agent` filters it. |
-| `/graph focus <runId> <node-or-agent>` | Focus an optional Herdr worker. Headless workers use status and log inspection. |
-| `/graph resume <runId> <operationId>` | Retry an exhausted operation using its stored policy digest and frozen route; it does not reopen the picker. |
-| `/graph prune [days]` | Remove settled runs older than the retention window; the default is 30 days. |
+| `/graph agents` | Reopens the session's numbered agent list. It opens by itself when the first worker of the session registers and appends later workers with stable numbers, across runs and retries. A number followed by Enter opens that attempt's details: run and status, node, role, transport, model, task, process state (running, settled with its outcome, or superseded) and acceptance, the rendered tail of the retained stream, and the retained answer after settlement, bounded; missing output or answer is stated. `r` refreshes, `q` or Escape clears a pending number, returns from details to the list, and closes the list. Keys reach the list only while the editor is empty. Selection never runs a Herdr focus or cancel command, so a worker whose tab is gone stays inspectable. TUI only; read-only; the redraw timer runs only while a listed worker is running and the view is open |
+| `/graph status <runId> [--follow]` | Graph state, pending work, blockers, registered workers, and for runtime runs each attempt's process, acceptance, capture, and session state. With `--follow` (before or after the run id) it is an alias of `/graph watch <runId> --follow` |
+| `/graph watch <runId> [--follow]` | One line per running worker: agent, node, process state, tool-call count, and the last thing it did, rendered from its live ACPX stream; the most recent rendered lines follow. Without `--follow` it prints once. With `--follow` it stays on screen as a widget above the editor, redraws every two seconds while the run is active, and takes keys: `1` to `9` focus that worker's Herdr tab, `r` redraws, `q` or Escape closes. The timer lives only while the view is open. Read-only |
+| `/graph log <runId> [--tail <count>] [--agent <name>]` | The event ledger; default tail 50, filterable by agent |
+| `/graph focus <runId> <node-or-agent>` | Bring a Herdr worker tab forward; headless workers have nothing to focus |
+| `/graph resume <runId> <operationId>` | Operator-approved retry of a parked operation with its stored policy digest and frozen route; never reopens the picker |
+| `/graph ledger <runId> [path]` | Derived, read-only JSON view of a run: attempts, outcomes, candidates, checkpoints, decisions, supersessions, events. Printed, or written mode-600 to `path`. It is consulted by no gate. |
+| `/graph prune [days]` | Remove settled runs older than the retention window (default 30 days) |
 
-`/graph resume` is for a run waiting on an exhaustion decision. It does not bypass graph edges, joins, report validation, or retry limits.
+`/graph resume` is the operator's fenced replacement of a parked attempt: it advances the transient counter so the new identity is fresh, never restores the budget, and never bypasses edges or joins.
 
 ### `/failover`
 
+Main-session failover is separate from worker failover and is off until enabled:
+
 | Command | Purpose |
 | --- | --- |
-| `/failover enable <tier>` | Arm same-tier runtime failover for the current main session. The current model must belong to the tier route. |
-| `/failover status` | Show whether failover is enabled, the current route position, lock state, and latest recovery details. |
-| `/failover unlock <tier>` | Clear a persisted manual-selection lock and re-arm the named tier when the current model belongs to it. |
+| `/failover enable <tier>` | Arm same-tier runtime failover for the current session; the current model must belong to the tier route |
+| `/failover status` | Enabled state, route position, lock state, and latest recovery details |
+| `/failover unlock <tier>` | Clear a manual-selection lock and re-arm the tier |
 
-There is no implicit main-session activation. Exact-model locks cannot be unlocked with `/failover unlock`; they remain authoritative.
+Exact-model locks cannot be unlocked; they remain authoritative.
 
-## Automation tools
-
-These are Pi tools for agents, RPC clients, and headless orchestration rather than shell commands.
+## Tools
 
 ### `delegate_graph`
 
-`delegate_graph` is the durable state-machine API behind `/delegate`.
+`delegate_graph` is the state-machine API behind `/delegate`. It is what ACP clients such as Air call directly.
 
-| Operation | Required input and behavior |
+| Operation | Input and behavior |
 | --- | --- |
-| `init` | `story` and `task`; optional `graph` (`build`, `research`, or `operations`) and `modelPolicy`. An `operations` run also requires structured `commands`. Returns the run plus its first pending operation. |
-| `next` | `runId`. Returns only operations currently eligible for dispatch, including each frozen route, `modelPolicy`, and `policyDigest`. |
-| `record` | `runId`, `operationId`, and `status`, plus status-specific dispatch or result evidence. The extension enforces transitions, joins, retries, and report gates. |
-| `status` | `runId`. Returns the durable graph status without changing it. |
+| `init` | `story`, `task`; optional `graph` (`build`, `research`, `operations`), `modelPolicy`, and `commands` for operations runs. Refused until every adapter the frozen routes can select has an evidence row. Returns the run and its first pending operations. |
+| `next` | `runId`. Current-phase operations with their frozen route, `modelPolicy`, `policyDigest`, attempt counters, `retry_not_before`, and the active attempt. |
+| `status` | `runId`. Read-only rendered status. |
+| `watch` | `runId`. Read-only view of every running worker: agent, node, process and acceptance state, the retained stream path, its last rendered activity, the most recent rendered lines, and prompt, tool-call and text counts. Emits a `watch` progress event, so ACP clients such as Air show the same summary. Consulted by no gate. |
+| `dispatch` | `runId`, `operationId`, optional `transport`. Preflights, materializes the run evidence for the worker, launches one worker, and registers the agent and the attempt under its frozen identity. |
+| `collect` | `runId`, `operationId`. Waits for the worker and settles the attempt from durable evidence: process outcome, retained candidate, observed session. Collecting again returns the same settlement. The result also carries what the supervisor needs to decide: `answer` (the retained answer, first 16 KiB, with `answerBytes` and `answerTruncated`), `verdict` (the answer's final `VERDICT:` line, or null), a `decide` template with this operation's id and the fields its node takes (`verdict` for review, test, audit and source_search; `payload.slices` for thinker_plan and thinker_split), and a `note` naming the next step (`op=integrate` first for coding and operational candidates, `op=retry` when no candidate was retained). |
+| `integrate` | `runId`, `operationId`, optional `decision: "rejected"` to roll back. Applies a coding or operational candidate's audited changes through the journal. |
+| `decide` | `runId`, `operationId`, `decision` (`accepted` or `rejected`), `reason`, optional `verdict` and `payload`. The only way an operation completes. `retry`, `defer`, `abort` and `escalate` are refused here with a message naming `resolve`, which applies only to a parked run. A thinker on the build or research graph is accepted only with `payload.slices` (`id`, `name`, `task`, and `ownedPaths` on the build graph). |
+| `retry` | `runId`, `operationId`, optional `retryReason`. Replaces a `failed`, `interrupted` or candidate-less `exited` attempt under the frozen budget. For a launch failure with no registered attempt, pass the `error` plus the `modelAttempt` and `transientAttempt` the launch used; a replayed or stale failure is refused. |
+| `resolve` | `runId`, `operationId`, `decision`: `retry` (the operator's fenced replacement of a parked attempt), `defer` with `deferredUntil`, `abort`, `escalate`. |
+| `cancel` | `runId`, `operationId`. Cancels through the persisted attempt boundary and records `cancelled`; an operation that was never dispatched is cancelled with a retained diagnostic. |
+| `record` | `runId`, `operationId`, `status: "cancelled"` only. Every other transition was removed with the report contract. |
 
-For `record` with `status: "running"`, pass the frozen `modelPolicy` and `policyDigest` from `next`, the selected model and zero-based model attempt, `transport: "herdr"`, and the Herdr agent and tab identifiers. A same-model retry uses `retryReason`; a cross-model fallback advances `modelAttempt` and uses `fallbackReason`.
+Direct initialization accepts every tagged model-policy form: `auto`, a named preset, an explicit tier, or an exact model with a reason. `/delegate` exposes only the six picker policies.
 
-For `status: "completed"`, provide the private JSON `reportPath`; its schema and verdict are audited before the transition is accepted. A report carrying the Pi execution-only projection ("Supervisor projection:") is rejected for every semantic node, because it states explicitly that no semantic claim was made; redispatch the operation instead. For `status: "failed"`, provide `error`. Invalid edges, premature joins, exhausted retry budgets, and unevidenced completion fail closed.
+#### Dead and unlaunched attempts
 
-`op=collect` always converges: when the launcher cannot produce a settlement manifest, the attempt is recorded failed, the result reports `settled: false`, `recorded: "failed"`, and the path of the retained `failure-<operationId>.json` diagnostic bundle (mode 600, redacted, written before the attempt directory is removed). `op=cancel` refuses while the registered worker's ACPX state is `alive` and its launcher cancel command fails; it records `cancelled` when the state is already `no-session`.
+`collect` always converges. When the launcher cannot produce a settlement record, the attempt settles `failed` with the launcher's reason and names the retained `failure-<operationId>.json` diagnostic bundle (mode 600, redacted, written before the attempt directory is removed); the operation keeps that failed attempt until `retry` classifies it. `cancel` refuses while a worker's ACPX state is `alive` and its cancel command fails, and records `cancelled` when the state is already `no-session`.
 
-An operation whose worker was never registered has no session to cancel and no report to collect, so `op=collect` and `op=cancel` settle it instead of refusing: `collect` records `failed`, `cancel` records `cancelled`, and both retain a `failure-<operationId>.json` diagnostic beside the graph database (in `failures/<runId>/`, mode 600) naming the cause — the authorized command never started. A repeated call reports `settled: false` instead of erroring, the frozen model policy and its attempt counters stay untouched, and the settled run stays decidable through `op=resolve`: `decision: "retry"` reopens the operation as a fresh pending attempt and `decision: "abort"` ends the run. That reason is permanent in `retry.ts`, so an unlaunched command never spends the same-model budget or switches provider. A `runId` the caller got wrong is a refusal, not a write: an unknown run, a run the operation does not belong to, and a run that already left `active` all report an error and leave the database and the filesystem untouched.
+An operation whose worker was never registered has nothing to collect: `collect` refuses it without writing anywhere, and `cancel` settles it as cancelled with a diagnostic under `failures/<runId>/` beside the graph database naming the cause. A dispatch whose preflight fails classifies the launch failure through `retry`, fenced to the exact counters that were dispatched. A wrong `runId` is a refusal, not a write.
 
-An operation explicitly recorded with `status: "blocked"` can be resumed through `op: "resolve"` using its current `runId` and `operationId`, with `decision: "retry"`, `"defer"`, `"abort"`, or `"escalate"`. Retry preserves the operation, semantic round and frozen model policy; it records the previous report, verdict, error and worker identity in the resume event and clears those fields from the new pending attempt. A pending attempt cannot complete using the old report. Foreign or stale operations, cancelled/terminal runs and completed semantic-cap blocks cannot be reopened by recovery.
-
-Direct initialization supports the full tagged model-policy forms used by the API: `auto`, a named preset, an explicit tier, or an exact model with a reason. `/delegate` intentionally exposes only the six picker policies listed above.
+A parked run resumes through `resolve`: `retry` supersedes the parked attempt and returns the operation to `pending` with a fresh identity; `defer`, `abort` and `escalate` are graph transitions. An escalated run can also be resumed by the operator. Foreign, stale, cancelled, terminal, and completed semantic-cap operations cannot be reopened.
 
 ### `questionnaire`
 
-`questionnaire` presents one or more option questions in Pi's terminal UI. Each question supplies an `id`, `prompt`, and option list, with optional `label` and `allowOther`. Use it when an agent needs structured user input; cancellation returns no submitted answer.
+`questionnaire` presents one or more option questions, each with an `id`, `prompt`, and options plus optional `label` and `allowOther`. In a terminal it renders Pi's picker. In ACP clients with a dialog UI but no terminal (Air, IntelliJ via `pi-acp`) it renders each question as a native picker with Cancel and, after the first question, Back; a final review picker requires an explicit Submit, so nothing is sent before you confirm. Free-form answers are typed in chat. Without any dialog UI it returns an `awaiting_user` state with a Markdown table of choices.
 
-In ACP/RPC clients with a dialog UI but no terminal (for example JetBrains Air or IntelliJ via `pi-acp`), it presents each question as a native selectable picker (`ctx.ui.select`, rendered by the client as clickable options). The tool blocks until a choice is made; multiple questions are shown one after another. Because a click is otherwise final, every picker appends a Cancel option (and, after the first question, a Back option): Cancel aborts the whole questionnaire and Back returns to the previous answer so it can be changed. Once every question is answered, a final review picker shows the collected answers and requires an explicit Submit before they are sent back to the model — so nothing is submitted until you confirm; from the review you can also go Back to change an answer or Cancel. Free-form "other" input is unavailable in ACP, so a custom answer must be typed in chat. If no dialog UI is available at all, it falls back to a structured `awaiting_user` state with a numbered Markdown table of the choices.
+### cmux hooks
 
-`cmux-session.ts` has no user command. When cmux metadata and hooks are present it forwards session, prompt, and stop metadata; otherwise it is a no-op.
+`cmux-session.ts` has no command. When cmux metadata and hooks are present it forwards session, prompt, and stop metadata; otherwise it does nothing.
 
-## ACPX and AgentFS worker lifecycle
+## Result contract
 
-Worker execution is ACPX-only. Presentation transport is selected per attempt: headless runs without Herdr, while Herdr adds visible workspace tabs when explicitly selected or when `auto` detects complete Herdr identity.
+Every run uses `runtime-v1`: workers author no report, the runtime retains what happened, and the supervisor decides. The earlier report contract, `legacy-v1`, was removed on 2026-09-12; naming it is refused. Operations runs settle the operational candidate kind described under [Operational search delegation](#operational-search-delegation).
 
-- `openai-codex/*` selects ACPX Codex, `claude-code/*` selects ACPX Claude, and every other valid frozen model selects ACPX Pi through the shared TypeScript attempt planner.
-- Each `(runId, operationId, modelAttempt, transientAttempt)` owns one ACPX session and one AgentFS session. Retry or fallback closes the old attempt and creates a new identity; one bounded report repair reuses the current session.
-- Before an attempt launches, the credential store of **the agent that will actually execute the model** is preflighted: `openai-codex/*` runs on the ACPX Codex agent and is checked against `CODEX_HOME/auth.json` (needs `OPENAI_API_KEY` or `tokens.access_token`; the remedy printed is `codex logout && codex login`), `claude-code/*` runs on the ACPX Claude agent and needs a mode-600 `PI_CLAUDE_OAUTH_TOKEN_FILE` or `~/.claude/.credentials.json`, and every other model runs on ACPX Pi and is preflighted with `pi auth check --provider <p> --json --no-refresh` under the supervisor's real home. Checking Pi for a Codex-routed model is not enough: the two credential stores are unrelated, and `codex login status` reports "Logged in" even when the stored refresh token has been revoked. The checks are structural and offline on purpose — a live probe costs a model call per dispatch — so a revoked-but-unexpired token is caught at runtime instead, where it arrives as a transient `worker-runtime-failure` and the chain advances. The check is advisory: a provider is blocked with `worker preflight: provider "<p>" has no usable credential for <model> (<reason>)` only when neither the live store nor `print-api-key` can produce a credential. `op=dispatch` records that block as a transient failure (`dispatched: false`, `blocked: "preflight"`) and the operation advances to the next model of its frozen chain. Credentials are then **materialized** rather than linked: `providers/pi-agent/auth.json` is a real mode-600 file holding only the selected provider's entry, copied from the live store when present and otherwise resolved with `pi auth print-api-key`. The live `auth.json` is never symlinked into an attempt, so a worker's token refresh cannot write through to it and a concurrent change to the live store cannot invalidate a running attempt. `verify_provider_links()` checks that private credential files remain regular, non-symlink files with unchanged modes and top-level key sets; token values may refresh inside the private JSON copy. Only the executing agent's configuration is delivered, as mode-600 regular-file snapshots rather than live links. Codex uses configuration from `CODEX_HOME`; Pi's model catalogs and routing are not dependencies of Codex or Claude attempts. Configuration snapshots and Claude setup-token copies must retain their exact bytes, modes and regular-file type. Live source rewrites cannot change an existing attempt, while private substitution still fails verification. Existing legacy-link records retain their strict target, byte and mode checks. An OAuth provider absent from the live store fails the preflight instead of receiving a half-built credential, because an access token alone cannot reconstruct Pi's `refresh`/`expires` fields.
-- AgentFS runs with a repository copy-on-write base, temporary HOME, `--no-default-allows`, and one private attempt directory. Writable operations export only audited owned paths. Content comparisons and owned-file exports capture complete files in memory without the subprocess default output-buffer limit; unchanged large files do not become ownership violations, and changed unowned files still block export. Read-only operations, including research `search`, record and discard all overlay changes and export zero paths. The graph passes its persisted access mode to the launcher; role names do not determine graph permissions. Private direct launches may set `--access-mode read-only` or `--access-mode owned-write`. Legacy launches without that option default to read-only except `implement` and `source_search`.
-- An export refusal remains a failed attempt, not an automatic retry or an accepted report. Its error identifies the violating paths; `failure-*.json` outside the removed attempt directory retains `agentFsExport` (export disposition, total violation count and a bounded path sample) and `agentFsExportProcess` (exit code and redacted stderr). Missing or malformed receipts also fail closed. The failure bundle survives cleanup; fixing read-only classification does not permit unauthorized writes by writable workers.
-- The worker session closes and provider integrity verifies before owned files can be exported. A rejected private configuration cannot write candidate files to the host. Completion verifies the private settlement manifest against the registered ACPX/AgentFS attempt and its tagged headless or Herdr presentation identity, report hash, session close, provider-link integrity, export result, and private attempt-ledger audit.
-- Cancellation, focus-identity failure, abort, retry, and cleanup all execute the same persisted `acpx-cancel.ts` attempt boundary. It validates the ACPX session, record, attempt key, and AgentFS session cwd; requires structured cancel acknowledgement and the observed transition to `idle` or `no-session`; then requires `session_closed` and final `no-session`.
-- Cleanup independently audits the queue owner, ACPX session files, AgentFS mount/server/database/HOME, provider links, report-repair child, any Herdr agent/pane/tab, owned processes, and attempt directory, and it records that audit as `cleanup-<agent>.json` on every path that owns an ACPX/AgentFS attempt — including a repeat cleanup of an attempt that was already torn down, so cleanup converges instead of going silent. Absence is the teardown goal: an absent cancel launcher is skipped and an already-absent credential or link converges, while a *present* resource is a failure. `sessionClosed` is true only from an observed cancellation, an observed session close, or a session absent from both session files and owned processes, and `sessionClosureEvidence` names which one proved it. Any remaining resource or unproven closure is terminal; unrelated workspace resources are never closed. Cleanup reasons name credential targets by basename only, never by absolute path.
-- A denied authorization is not a transient worker failure. ACPX exits with permission-denied code 5 and prints `Permission request denied or cancelled` when every permission request in a turn is denied or cancelled, so the owning command never executed and an identical retry would replay the same denial. The worker result therefore records `permissionDenied` alongside `status: permission_denied` and `processExitCode: 5`, the launcher raises `worker approval block: permission_denied …` instead of `ACPX worker failed: …`, and both classifier entries resolve to a permanent `approval-block` reason. The operation parks for authorization; it does not consume the same-model budget, switch provider, or gain a permanent fallback. Genuine `QUEUE_RUNTIME_PROMPT_FAILED`, connection-reset, timeout, 429/5xx, quota and credential-link-change text still classifies as transient.
-- Pi may use an execution-only supervisor projection after process exit 0 plus structured `end_turn`; the report explicitly makes no semantic task claim.
-- A Pi turn that completes with no assistant or tool activity at all is a failed attempt (`silentTurn`, exit 2, no report), not a projection: Pi records a failed model request as an empty assistant message, which most often means the provider credential is unreachable from the attempt-private home (for example a macOS keychain lookup). Such a failure is transient, so the operation advances to the next model of its frozen chain. Claude reads a setup token only from a mode-600 `PI_CLAUDE_OAUTH_TOKEN_FILE` path.
+**Adapters.** Every adapter is dispatchable; the frozen model selects it. The earlier per-adapter enablement gate (`/graph enable-adapter`, the `runtime_adapters` table) was removed on 2026-09-12 with schema v11; the evidence it pointed at is listed under [Known limitations](#known-limitations). Nothing enables autonomous scheduling.
 
-JetBrains Air is supported through `pi-acp`: Air launches and owns Pi as its ACP agent, and Pi dispatches ACPX/AgentFS workers through the headless transport without requiring Herdr. pi-agent-wave does not attach Air directly to an externally owned ACPX worker session.
+**Attempts.** `dispatch` registers the attempt with the worker's frozen identity (run, operation, role, model attempt, transient attempt, model, agent); the ACP request id binds later from the worker's own stream. `collect` waits for the worker and, before the session is closed, the provider boundary is verified, or anything is cleaned up, retains the public answer and (for `implement`) the audited AgentFS changes as content-addressed private files. The process outcome, candidate, and observed session identity (`loaded`, `created`, `resumed`, `expected`) are then settled immutably. A close, provider-boundary, or cleanup failure after that point comes back as `postSettlementFailures` and never discards the candidate. Collecting again returns the same settlement.
 
-Run the deterministic host audit outside AgentFS before final review:
+**Decisions.** An `exited` attempt is completed or parked only by `decide`. `accepted` with a `reason` (and, for review, test, audit and source-search nodes, the `verdict` you read from the answer; the worker prompt asks those roles to end with one line `VERDICT: <value>`) completes the operation through the graph's join and transition logic. `rejected` marks the operation failed and parks the run with the candidate retained. A coding or operational candidate with file changes must be applied with `integrate` first; the journal reserves the Git workspace, keeps preimages, recovers or rolls back interrupted writes from private staging on the same filesystem, and refuses changed bases, dirty affected files, symlinks, Git-internal paths, missing parents, and files over 16 MiB. A candidate without changes needs no integration.
 
-```bash
-node --experimental-strip-types scripts/production-audit.ts
-```
+**Retry and fallback.** A `failed` or `interrupted` attempt, or an `exited` attempt whose capture produced no candidate, is replaced only by `retry`. Its recorded failure text is classified: transient failures spend the three-attempt same-model budget, then advance to the next model of the frozen chain, then park the run in `awaiting_user`; permanent failures park at once; exact-model locks never advance. A replacement stamps the old attempt `superseded`, returns the operation to `pending` with a `retry_not_before` backoff, and the next `dispatch` mints a new attempt key and ACPX session from the advanced counters. Old identities can no longer register. A dispatch preflight failure with no worker registered goes through the same classification, fenced to the exact counters that were dispatched so one failure can never spend the budget twice. A failed coding attempt whose partial candidate was prepared or applied cannot be replaced until that integration is rolled back, and a superseded attempt's candidate can only ever be rolled back, never applied. A parked run resumes only through the operator's `resolve` with `retry` or `/graph resume`, which advance the transient counter so the replacement identity is fresh without restoring the budget; `defer`, `abort` and `escalate` are graph transitions. `record` accepts only cancellation.
 
-It writes `agent-output/production-acpx-worker-backend/final-audit.json` with direct argv records, explicit expected and observed counts, production-source and artifact hashes, cleanup inventory, and secret-scan results. Unexpected counts or stale source bindings fail closed. The final reviewer consumes this bundle with ACPX `--no-terminal`, so nested AgentFS, package-manager, build, test, and git-write commands are unavailable. Embed the required source and evidence text in the task: no-terminal mode does not guarantee filesystem-read tools. If the reviewer returns authored JSON instead of writing its report file, preserve that response byte-for-byte with stream/message attribution before applying the ordinary report and settlement gates; it is not a supervisor-generated semantic verdict.
+**Evidence durability.** The settlement record is published atomically: written under a private temporary name, fsynced, linked into place exclusively, then the directory is fsynced. A crash between content retention and the record leaves no partial file; re-collecting replays the settlement from the same retained content. `/graph ledger` derives a read-only JSON view of the run from these facts.
 
-### Running the real ACPX lifecycle matrix
+**Bounds and limits.** Capture bounds individual events to 1 MiB and total input to 16 MiB. Response completeness is labelled unverified, and independent review of a candidate is the caller's responsibility, recorded in the decision reason.
 
-The three lifecycle cases in `test/acpx-real-matrix.test.ts` drive live ACPX sessions against Pi, Codex, and Claude. They are skipped unless configured, because a skipped case proves nothing about a provider. `npm run test:acpx` is the entry point and it refuses rather than reporting passes when the configuration is missing.
+**Adapters.** Pi is proven end to end on the build, research and operations graphs. Claude passed the probe under the configuration self-write rule described under [Credentials and configuration](#credentials-and-configuration) but has not run a graph. Codex is proven on the research, build and operations graphs (`agent-output/runtime-measure-codex-20260912/`, `runtime-measure-codex-build-20260912/`, `runtime-measure-codex-operations-20260912/`): with its shell available, which graph dispatch always is, it reads and edits inside the overlay; only the evidence-only review gate, which removes the terminal, leaves Codex without file access. Codex's own `sandbox-exec` was refused once inside the overlay during the build smoke; the tester reported the blocker with `VERDICT: NOT_OK`, the graph returned to implementation, and the next test pass ran clean. Expect an occasional extra cycle of that kind with Codex.
 
-```bash
-cd extensions/pi-agent-wave
-PI_CLAUDE_OAUTH_TOKEN_FILE=~/.config/pi/acpx-claude-token.txt npm run test:acpx
-npm run test:acpx -- --dry-run   # print the command; starts no session
-```
+## Graphs
 
-- `RUN_REAL_ACPX_MATRIX` — set to `1` by the script; the three cases skip unless it is `1`. Set it yourself only when calling `node --test` directly.
-- `PI_CLAUDE_OAUTH_TOKEN_FILE` — required, and it must point at an existing file: a raw token, mode 600, not JSON. Without it all three cases skip, which is why the script treats an unset or missing path as a refusal instead of a green run.
-- `MATRIX_EVIDENCE_DIR` — where the run writes `<agent>.json` and `<agent>-production.json`. It defaults to `agent-output/production-acpx-worker-backend/final-matrix`, the directory the host audit reads.
-
-Use `node --test`, never `bun test`: the matrix imports `node:sqlite`, and Bun resolves a bare `test/` glob to a temporary-directory path that does not exist, so the whole-directory run dies in module loading before any assertion. Run single files under Bun only for the package-focused checks listed in `AGENTS.md`.
-
-The run dispatches real worker sessions and spends provider credits, bounded by a fifteen-minute timeout on the script; a run that fails early ends in seconds, so a fast non-zero exit is a real failure rather than a skipped one. Source checkouts only: `test/` is not in the published package, so this script exists only in a clone.
-
-## Runtime scenarios
-
-### Build delegation
-
-Use `/delegate <task>` for implementation or other state-changing work. The frozen build graph is:
+### Build
 
 ```text
-Thinker -> parallel Implementers -> Reviewer -> Tester -> Auditor
+thinker_plan -> implement (fan-out) -> review -> test -> audit -> terminal
 ```
 
-Implementers may fan out only when the graph returns multiple eligible operations. The join must complete before review. Reviewer or tester rejection returns through the graph's bounded repair path rather than creating an ad hoc retry.
+Implementers fan out only when `next` returns several eligible operations, and the join completes before review. A review `FAIL` returns to implementation for up to two fix iterations; a test `NOT_OK` returns for up to three rounds. These are graph edges, never ad hoc retries.
 
-### Research delegation
+### Research
 
-Prefix the task with `research`, `explore`, or `search` when the workers must stay read-only:
+Prefix the task with `research`, `explore`, or `search`:
 
 ```text
-Thinker split -> parallel Searchers -> Thinker synthesis
+thinker_split -> search (fan-out) -> thinker_synthesize -> terminal
 ```
 
-Searchers may run in parallel; synthesis waits for their join.
+Searchers are read-only and may run in parallel; synthesis waits for their join.
 
 ### Operational search delegation
 
-Use the `operations` graph when a visible worker must run an existing command and write explicitly owned result artifacts:
+Use the `operations` graph when workers must run existing commands and write explicitly owned result artifacts:
 
 ```json
 {
@@ -316,167 +354,212 @@ Use the `operations` graph when a visible worker must run an existing command an
 }
 ```
 
-The graph is `Source Searchers -> Thinker synthesis -> Auditor`; it skips pre-execution planning. Each pending source operation retains `command_json` and disjoint writable paths. Pass `command_json` unchanged to `scripts/delegate.ts` as `--command-json`; the generated worker prompt allows required read-only instruction loading, then requires that exact argv as the first execution command.
+The graph is `source_search (fan-out) -> thinker_synthesize -> audit`; it skips planning. Each source operation keeps its `command_json` and disjoint writable paths. An optional `checkpoint` names the file the source script writes, relative to `cwd`, and must lie under one of the command's owned paths; it is persisted with the command. The launcher receives `command_json` unchanged as `--command-json`; the worker prompt allows read-only instruction loading, then requires that exact argv as the first execution command.
 
-A completed `source_search` report must include an `execution` object with argv, exit code, source, run ID, checkpoint path, candidate count, and source status. Candidate-producing runs also require a result path; a zero-candidate run may omit it only when the checkpoint records zero saved jobs. Budget exhaustion also requires resume argv. Accepted, blocked, and failed source results are ledgered automatically by operation ID. Concurrent source workers cannot own the same path or SQLite database; persist or merge shared data in a separate serialized stage.
+A settled `source_search` attempt is an **operational candidate**: the worker's answer, which ends with `VERDICT: DONE` or `VERDICT: BLOCKED`, plus the audited overlay changes under the owned paths (checkpoint, results, logs) staged as content. When a `checkpoint` was declared, the staged checkpoint file is parsed at settlement and its integer `jobsSaved` and string `status` are recorded as observed facts on the candidate and in the ledger; the process exit code is not observable by the supervisor and is not recorded. Artifacts reach the host through `integrate`, using the same journal as coding candidates with the Git checks switched off, so the working directory need not be a repository. `decide accepted` with `DONE` advances to synthesis; with `BLOCKED` the run parks `blocked`. Every source result is ledgered automatically by operation ID in the derived run ledger, which covers every attempt, candidate, checkpoint and decision and is materialized to later workers as evidence. Concurrent source workers cannot own the same path or SQLite database; persist or merge shared data in a separate serialized stage.
 
-### Headless and Herdr transports
+### Driving a run from an API
 
-Headless transport runs ACPX/AgentFS workers without creating a Herdr tab or requiring Herdr installation. Herdr is an optional visible-presentation adapter: `auto` selects it only when the `herdr` executable and complete workspace identity are available, otherwise `auto` selects headless. Explicit `herdr` fails closed when its prerequisites are missing; explicit `headless` creates no Herdr resource. Every worker receives the same frozen policy, model identity, role, and runtime failover route regardless of presentation transport.
+Call `init`, then repeat `next -> dispatch -> collect -> [integrate] -> decide | retry` (`integrate` only for a candidate with staged changes) until the run is terminal or parked. Never invent operations, dispatch work `next` did not return, or change the returned policy digest and route.
 
-### Inspecting a live or blocked run
+## Worker lifecycle
 
-Use `/graph status` for the current state and `/graph log` for recent transitions. `/graph focus` brings a registered Herdr worker forward. If the graph requests a user decision after route exhaustion, use `/graph resume <runId> <operationId>` only when retrying that stored operation is intended.
+### Transport
 
-### Headless or API-driven delegation
+Execution is ACPX-only. Headless runs without Herdr. `auto` selects Herdr only when the `herdr` executable and complete workspace and tab identity are present; explicit `herdr` fails closed without them, and explicit `headless` creates no Herdr resource. Both adapters share planning, launch, audit, cancellation, settlement, and cleanup, and both deliver the same frozen policy, model identity, role, and failover route.
 
-Use `delegate_graph init`, then repeat `next -> record running -> record result` until status is terminal or blocked. Never invent operations or dispatch work not returned by `next`. Preserve the returned policy digest and route on every attempt.
+### Agent selection and identity
 
-## HTTP 429 failover
+`openai-codex/*` selects ACPX Codex, `claude-code/*` selects ACPX Claude, and every other frozen model selects ACPX Pi. Each `(runId, operationId, modelAttempt, transientAttempt)` owns one ACPX session and one AgentFS session; a retry or fallback closes the old attempt and creates a new identity.
 
-Delegate Graph workers automatically inherit their frozen tier, ordered model chain, role, and exact-model lock through either headless or Herdr presentation. When a worker attempt fails with an infrastructure-shaped error (HTTP 429 or 5xx, rate limit, quota, overload, timeout, connection reset or close, `ACPX worker failed` / `terminal=failed` / `QUEUE_RUNTIME_PROMPT_FAILED`, or a provider-credential link that changed mid-attempt), the operation advances to the next model of its own frozen chain once the current model's three-attempt same-model budget is spent, and the next dispatch runs that model. When the chain has no remaining model, the run parks in `awaiting_user` for `/graph resume` or `op=resolve`. A denied authorization is excluded from that list: an attempt whose authorized command was denied ends as a permanent `approval-block`, so it never consumes the same-model budget, switches provider, or adds a fallback. The table below describes the separate main-session `/failover` machinery.
+### Credentials and configuration
 
-| Worker situation | Behavior |
+Before launch, the credential store of the agent that will execute the model is preflighted:
+
+- `openai-codex/*` checks `CODEX_HOME/auth.json` for `OPENAI_API_KEY` or `tokens.access_token`; the printed remedy is `codex logout && codex login`.
+- `claude-code/*` needs a mode-600 `PI_CLAUDE_OAUTH_TOKEN_FILE` or `~/.claude/.credentials.json`.
+- Every other model runs on Pi and is checked with `pi auth check --provider <p> --json --no-refresh` under the supervisor's real home.
+
+The checks are structural and offline, so a revoked but unexpired token surfaces at runtime as a transient `worker-runtime-failure` and the chain advances. A provider is blocked with `worker preflight: provider "<p>" has no usable credential for <model> (<reason>)` only when neither the live store nor `print-api-key` can produce a credential; `dispatch` records that as a transient failure (`dispatched: false`, `blocked: "preflight"`).
+
+The worker's private Pi settings carry only the supervisor's defaults, zero packages, and the frozen route's `thinking` level as `defaultThinkingLevel`, so a `high` tier thinks and an `off` tier does not, per role; a worker streams thoughts, which the pane and `/graph watch` show dimmed, only when its level allows. Credentials are then materialized, not linked: `providers/pi-agent/auth.json` is a real mode-600 file holding only the selected provider's entry. The live `auth.json` is never symlinked into an attempt, so a worker's refresh cannot write through and a live change cannot invalidate a running attempt. Only the executing agent's configuration is delivered, as mode-600 regular-file snapshots. Snapshots and Claude setup-token copies must keep their exact bytes, modes, and file type; Pi's private `models-store.json` is a mutable catalog copy that may refresh. An OAuth provider absent from the live store fails preflight rather than receiving a half-built credential.
+
+Claude Code rewrites its own `settings.json` and `.claude.json` during tool use (it removed a key and bumped a counter in the live probe). Those two attempt copies are tolerated self-writes: they must remain regular, non-symlinked, mode-600 files that parse as a JSON object, and any change in bytes or key set is recorded as `configurationSelfWrites` (added keys, removed keys, digests) in the settlement result, never treated as a boundary failure. A non-JSON rewrite, a JSON array, a symlink, a mode change or a missing file still fails the attempt.
+
+### Sandbox and staging
+
+AgentFS runs with a repository copy-on-write base, a temporary HOME, `--no-default-allows`, and one private attempt directory. Writable operations stage only audited owned paths as content; read-only operations (including research `search`) record and discard all overlay changes and stage nothing. The graph passes its persisted access mode to the launcher, so role names never decide permissions. Worker subprocesses set `GIT_OPTIONAL_LOCKS=0` so inspection commands do not refresh the Git index. On this host a process inside the sandbox that changes into an absolute host path writes straight to the host, outside the overlay; the operational command instruction therefore names the working directory as `.`, and a declared checkpoint that appears on the host without an overlay change fails settlement.
+
+Ignored paths default to `.git/index`: a worker that inspects its work with `git status` or `git diff` refreshes the index inside the overlay, and the live build measurement of 2026-09-12 refused every such attempt as an unowned change. Ignoring it grants no ownership: the index is never exported or staged, and integration refuses Git-internal paths regardless. Private direct launches may pass `--ignored-paths-json` to widen or empty the list; graph dispatch always uses the default. Owned `.DS_Store` and AppleDouble `._*` metadata stages with its directory; unowned platform metadata is discarded. Paths resolve through symlinks, and escaping or unresolvable ownership declarations fail the audit.
+
+An audit refusal (an unowned overlay change) is a permanent failure of the attempt, never an automatic retry or an accepted candidate. Changed immutable configuration is retained in the private run directory in mode-600 files with expected and observed checksums; these files may contain sensitive values and are private evidence. Overlay-command and host-read failures produce distinct `audit_error` entries and may retry under the frozen budget. Comparison and staging buffer whole files in memory.
+
+Staging reads a consistent SQLite backup of the closed delta with a 30-second budget; a failed backup fails the attempt and removes partial snapshots, with no raw DB/WAL/SHM fallback. Headless settlement waits for the worker process to exit after its result appears, bounded by `PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS` (default `30000`); a timeout fails the attempt.
+
+### Settlement and cleanup
+
+The answer and the audited overlay changes are retained as content-addressed private files and the settlement record is published before the worker session closes, the provider boundary is verified, or anything is cleaned up; a failure after that point is reported as a post-settlement failure and never discards the candidate. When capture is incomplete or produced no candidate, the raw worker stream is retained beside the record as private evidence.
+
+Cancellation, focus failure, abort, retry, and cleanup all run the same persisted `acpx-cancel.ts` boundary: it validates the ACPX session, record, attempt key, and AgentFS session cwd, requires structured cancel acknowledgement and the transition to `idle` or `no-session`, then requires `session_closed` and final `no-session`.
+
+Cleanup audits the queue owner, ACPX session files, AgentFS mount, server, database, and HOME, provider links, Herdr agent, pane, and tab, owned processes, and the attempt directory, and records that audit as `cleanup-<agent>.json` every time, including a repeat cleanup of an already torn-down attempt. Absence is the goal: a present resource is a failure, an already-absent one converges. `sessionClosed` is true only from an observed cancellation, an observed close, or a session absent from both session files and owned processes, and `sessionClosureEvidence` says which. Cleanup names credential targets by basename only.
+
+### Watching a worker
+
+The worker runs ACPX with `--format json --json-strict` because settlement needs the JSON-RPC stream to retain the answer and observe the session. That stream is written only to the attempt's private capture files. What the launcher prints, and therefore what a Herdr pane shows, is a rendering of it: assistant text as it streams, thoughts dimmed, one line per tool call (`\u25b8` started, `\u2713` completed, `\u2717` failed), `plan: done/total steps`, and short rules for prompt start, `end_turn`, cancellation and errors. Adapter bookkeeping (usage, commands, session info) is suppressed and non-JSON lines pass through prefixed with `|`. Nothing in the rendering is a success signal. `/graph watch` and `op=watch` apply the same renderer to the tail of each running worker's stream to produce the per-agent summary. `/graph watch --follow` is the navigable form: the summary stays on screen above the editor, number keys jump to a worker's Herdr tab, and it closes on `q`. Headless workers appear in the list but have no pane to focus.
+
+### Denials and empty turns
+
+A denied authorization is permanent. ACPX exits with code 5 and prints `Permission request denied or cancelled` when every permission request in a turn is denied; the worker result records `permissionDenied` with `status: permission_denied`, the launcher raises `worker approval block: permission_denied …`, and the classifier resolves it to `approval-block`. The operation parks for authorization without spending the budget or switching provider.
+
+A worker that exits without a candidate, because its capture was empty or incomplete, is a transient `worker-empty-answer` failure: `retry` spends the same-model budget and then the chain, and the raw stream is retained for diagnosis. No positive verdict is ever inferred from an exit code.
+
+## Failure recovery
+
+### Worker attempts
+
+Every worker inherits its frozen tier, ordered chain, role, and exact-model lock. Infrastructure-shaped failures (HTTP 429 or 5xx, rate limit, quota, overload, timeout, connection reset or close, `ACPX worker failed`, `terminal=failed`, `QUEUE_RUNTIME_PROMPT_FAILED`, provider-link churn, AgentFS audit or snapshot errors, exit before result, exit without a candidate) are transient; `retry` applies the classification.
+
+| Situation | Behavior |
 | --- | --- |
-| Transient failure, current model still has budget | Same-model retry with backoff; `retry_reason` set, `fallback_reason` stays null. |
-| Transient failure, current model's budget spent, chain has another model | `model_attempt` advances by one, `fallback_reason` names the transient reason, the dead attempt's agent is marked failed, and `model_fallback` is logged. |
-| Transient failure on the last model of the chain | Run moves to `awaiting_user`; nothing is promoted into another tier. |
-| Exact-model lock (`--policy` model lock / `selectionSource: exact-model`) | Never advances; parks for a user decision. |
-| Semantic verdict (`FAIL`, `NOT_OK`, review rejection) | Never a fallback trigger; the graph's own repair loop handles it. |
-| Worker died mid-attempt | `op=collect` records the attempt failed and returns `settled: false` with the retained diagnostic bundle path instead of throwing. |
-| Operation never dispatched | `op=collect` or `op=cancel` settles it and retains the diagnostic; `op=resolve` with `decision: "retry"` reopens it as a fresh pending attempt. |
-| Worker never wrote its report (Pi execution-only projection) | `op=record status=completed` is rejected for every semantic node; redispatch the operation. |
+| Transient failure, same-model budget remains | Same-model retry with full-jitter backoff; `retry_reason` set, `fallback_reason` null |
+| Transient failure, budget spent, chain has another model | `model_attempt` advances, `fallback_reason` names the cause, the dead attempt's agent is marked failed, `model_fallback` logged |
+| Transient failure on the last chain model | Run parks in `awaiting_user`; nothing promotes into another tier |
+| Exact-model lock | Never advances; parks for a user decision |
+| Semantic verdict (`FAIL`, `NOT_OK`, rejected candidate) | Never a fallback trigger; the graph's repair loop or the operator handles it |
+| Denied authorization | Permanent `approval-block`; parks without spending budget |
+| Worker died mid-attempt | `collect` settles the attempt `failed` and returns the diagnostic path instead of throwing; `retry` classifies it |
+| Operation never dispatched | `collect` refuses without writing; `cancel` settles it with a diagnostic |
+| Attempt `exited` with a candidate | Must be decided; `retry` refuses it |
+| Attempt `exited` without a candidate | Transient `worker-empty-answer`; `retry` replaces it and the raw stream is retained |
 
-| Runtime scenario | Behavior |
+When a run parks after exhausted retries, the supervisor emits an in-session warning notification. No modal dialog, speech, or sound is raised, so headless and test runs never block on a desktop prompt. In a terminal the supervisor then offers Retry now, Defer, Abort, or Escalate; in ACP clients the result reports `awaiting_user` for the client to resolve.
+
+### Main session
+
+`/failover` protects the interactive session, not workers, and is inactive until enabled:
+
+| Scenario | Behavior |
 | --- | --- |
-| Delegated worker receives HTTP 429 | Failover is already armed; no `/failover enable` command is needed. |
-| Main interactive session receives HTTP 429 | The model does not switch unless `/failover enable <tier>` was run in that session. |
-| Another model from the failed provider appears next | It is skipped; the recovery sequence excludes the whole failed provider. |
-| A candidate is unavailable or unauthenticated | It is skipped and route-order search continues. |
-| More than one provider returns HTTP 429 | Recovery continues across distinct providers in frozen route order. |
-| A fallback succeeds | The replacement remains active for the current session or delegated run, temporary provider exclusions clear, and Pi's global `settings.json` bytes are restored. |
-| No eligible provider remains | Recovery returns a visible `route-exhausted` blocked result and never promotes to another tier. |
-| Manual model selection | Automatic switching locks until `/failover unlock <tier>` successfully re-arms the route. |
-| Route is an exact-model lock | Automatic switching remains disabled. |
-| Error is semantic, invalid-request, refusal, context-overflow, tool, review, or quality failure | It retains the existing non-failover behavior. |
-| A denied authorization ends the turn (ACPX permission-denied exit 5) | It is a permanent `approval-block`, not a transient worker failure, so no retry or provider switch is attempted. |
+| Delegated worker receives HTTP 429 | Already covered by the worker rules above; no `/failover enable` needed |
+| Main session receives HTTP 429 | The model switches only if `/failover enable <tier>` was run in that session |
+| Next candidate is from the failed provider | Skipped; recovery excludes the whole failed provider |
+| Candidate unavailable or unauthenticated | Skipped; route-order search continues |
+| Several providers return 429 | Recovery continues across distinct providers in route order |
+| A fallback succeeds | The replacement stays active, exclusions clear, Pi's global `settings.json` bytes are restored |
+| No provider remains | A visible `route-exhausted` blocked result; never a tier promotion |
+| Manual model selection | Automatic switching locks until `/failover unlock <tier>` re-arms the route |
+| Exact-model route | Automatic switching stays disabled |
+| Semantic, invalid-request, refusal, context, tool, or quality error | Existing non-failover behavior |
 
-Generic rate-limit 429 and quota-shaped 429 are both recoverable but remain distinct in diagnostics. `/failover status` and persisted evidence identify the source model, destination model, tier, route position, classification, and outcome. Raw provider bodies, authorization headers, credentials, and API keys are not copied into status, evidence, or substituted retry messages.
+Generic and quota-shaped 429s are both recoverable and stay distinct in diagnostics. `/failover status` and persisted evidence identify source and destination model, tier, route position, classification, and outcome. Raw provider bodies, headers, credentials, and keys never enter status, evidence, or retry messages.
 
-## CLI reference after npm publication
+## Verification tooling
 
-After npm publication, these three package binaries will be the public administrative commands. For the current source install, use the direct Node commands shown below.
+### Host audit
 
-```text
-pi-agent-wave-init [dry-run|apply|rollback] [options]
-pi-agent-wave-doctor [--json] [--agent-dir <path>] [--routing <path>] [--models <path>]
-pi-agent-wave-migrate [preflight|dry-run|apply|rollback] [options]
-```
-
-| Binary | Modes and use cases | Options |
-| --- | --- | --- |
-| `pi-agent-wave-init` | `dry-run` previews configuration, `apply` writes it, and `rollback --manifest <path>` restores a force-mode backup. | `--agent-dir`, `--routing`, `--models`, `--force`, `--backup-id`, `--non-interactive`, and the tier-chain flags documented below. |
-| `pi-agent-wave-doctor` | Always read-only; use the default human report for interactive diagnosis or `--json` for automation. | `--agent-dir`, `--routing`, and `--models` override path discovery. |
-| `pi-agent-wave-migrate` | `preflight` and `dry-run` inspect a loose installation, `apply` moves conflicts and enables the package, and `rollback --manifest <path>` restores it. | `--agent-dir`, `--package-source`, `--backup-id`, and `--manifest`. |
-
-The packaged `delegate.ts`, `herdr_delegate.py`, `policy-resolver.mjs`, and `route-picker.ts` scripts support extension runtime and pi-fzf integration. They are not installed as general-purpose public binaries.
-
-## Initial configuration
-
-Fresh installations can bootstrap a valid routing file without hand-authoring JSONC.
-
-The initializer defaults to dry-run and only writes when `apply` is explicit:
+Run the deterministic audit outside AgentFS before a final review:
 
 ```bash
-# Preview the plan without writing anything
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs --agent-dir "$PI_CODING_AGENT_DIR"
-
-# Apply the plan
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply --agent-dir "$PI_CODING_AGENT_DIR"
+node --experimental-strip-types scripts/production-audit.ts
 ```
 
-The initializer reads the existing model catalog at `models.json` (via `--models`, then `PI_MODEL_CATALOG`, then the resolved agent directory) and derives selectable model ids strictly from `providers.<provider>.models[].id`. It never creates provider definitions, credentials, or `models.json`.
+It writes `agent-output/production-acpx-worker-backend/final-audit.json` with direct argv records, expected and observed counts, source and artifact hashes, cleanup inventory, and secret-scan results; unexpected counts or stale source bindings fail closed. A reviewer consumes this bundle through ACPX `--no-terminal`, so nested AgentFS, package-manager, build, test, and Git-write commands are unavailable; embed the required source and evidence text in the task.
 
-### Tier selection
+### Live ACPX matrix
 
-Interactive mode prompts for one model per supported tier and covers all six public tiers plus the optional `local-fast` tier. Non-interactive automation supplies explicit tier flags and must name every required tier:
+`test/acpx-real-matrix.test.ts` drives live sessions against Pi, Codex, and Claude and skips unless configured. `npm run test:acpx` refuses rather than reporting skips as passes:
 
 ```bash
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply --non-interactive \
-  --tools openai-codex/gpt-5.4-mini \
-  --coding openai-codex/gpt-5.6-luna \
-  --test openai-codex/gpt-5.4-mini \
-  --review claude-code/claude-opus-5 \
-  --reasoning claude-code/claude-opus-5 \
-  --long-context openai-codex/gpt-5.6-luna \
-  --local-fast ds4/deepseek-v4-flash
+cd extensions/pi-agent-wave
+PI_CLAUDE_OAUTH_TOKEN_FILE=~/.config/pi/acpx-claude-token.txt npm run test:acpx
+npm run test:acpx -- --dry-run
 ```
 
-Each flag accepts a comma-separated chain of `provider/model-id` values; the order is preserved as the tier's fallback chain.
+`RUN_REAL_ACPX_MATRIX=1` is set by the script; set it yourself only when calling `node --test` directly. `PI_CLAUDE_OAUTH_TOKEN_FILE` must name an existing mode-600 raw token file. `MATRIX_EVIDENCE_DIR` defaults to `agent-output/production-acpx-worker-backend/final-matrix`. Use `node --test`, never `bun test`, because the matrix imports `node:sqlite`. The run spends provider credits and is bounded by a fifteen-minute timeout. `test/` is not in the published package.
 
-### Overwrite protection and backup
+### Matched live measurement
 
-Apply fails closed when an existing `model-routing.jsonc` differs or a pi-fzf `route`/`delegate-model` command would be overwritten, leaving the target unchanged. Re-run with `--force` to back up the original before replacing:
+`test/support/runtime-measure.ts` drives the production tool with real Pi-adapter workers through a fixed task and records phase durations, attempts, retries, fallbacks and outcomes into `agent-output/runtime-measure-<date>/`. `--graph research` (default) runs the research graph on a fixed corpus; `--graph build` runs the build graph on a temporary Git corpus with one implementation slice, integrates a coding candidate with `op=integrate` before deciding it, and reads review, test and audit verdicts from the worker's `VERDICT:` line; `--graph operations` runs a fixture source command through the operations graph. `--model` selects the model and therefore the adapter (`openai-codex/*` Codex, `claude-code/*` Claude, anything else Pi); the driver enables that adapter in its temporary store with the matching probe record and preflights that adapter's credential:
 
 ```bash
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs apply --force --agent-dir "$PI_CODING_AGENT_DIR"
+node --experimental-strip-types test/support/runtime-measure.ts --dry-run
+node --experimental-strip-types test/support/runtime-measure.ts --preflight
+node --experimental-strip-types test/support/runtime-measure.ts --execute --repeats 3
+node --experimental-strip-types test/support/runtime-measure.ts --graph build --execute --repeats 3
 ```
 
-Force mode writes a private, content-addressable backup under `migration-backups/pi-agent-wave-init/<id>/` (outside the auto-discovered extension directories) and retains enough data for a byte-exact rollback:
+Only `--execute` spends credits. The adapter is enabled in a temporary store only, candidates are accepted automatically by the driver (recorded as such), and cost is reported as unknown. It measures latency, turns and recovery, not quality. While workers run it samples `op=watch` every 20 s and keeps the samples as evidence. Recorded runs of 2026-09-12: research 3 + 3 repeats before the report contract was removed (runtime median 422 s), build 3 repeats (runtime median 905 s, all terminal with review PASS, test GREEN, audit PASS), operations smoke 4 (terminal, checkpoint observed), and a post-removal research smoke (terminal, 266 s), all under `agent-output/runtime-measure-*`.
+
+### Live result probe
+
+The runtime-v1 probe runs a text prompt and a read-only source check for each of Pi, Codex, and Claude with production provider snapshots and cleanup; `--agents` selects a subset:
 
 ```bash
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/init.mjs rollback --manifest /path/to/migration-backups/pi-agent-wave-init/<id>/manifest.json
+python3 test/support/runtime-result-probe.py --dry-run
+python3 test/support/runtime-result-probe.py --preflight
+python3 test/support/runtime-result-probe.py --agents claude --dry-run
 ```
 
-### Optional pi-fzf integration
+Its passing records are the adapter evidence cited by the PRD: `agent-output/runtime-result-probe-run3-20260912/pi.json` (Pi) and `agent-output/runtime-result-probe-run4-20260912/claude.json` (Claude, under the self-write rule). Codex's probe records show that without a terminal it issues no tool call; its evidence is the research smoke `agent-output/runtime-measure-codex-20260912/run-runtime-v1-1.json`, run with the terminal present as graph dispatch always is.
 
-When pi-fzf is installed (detected from `settings.json`), the initializer merges `route` and `delegate-model` list/preview commands that target the installed package's `route-picker.ts`, leaving every unrelated command and field unchanged. When pi-fzf is absent the plan reports `skipped` and does not create `fzf.json`.
+Only an explicit `--execute` spends credits. It needs a private `PI_CLAUDE_OAUTH_TOKEN_FILE` and a host that permits AgentFS loopback and mounting and process inspection. Every acpx invocation carries `--max-turns 2` because the cap is fixed at session creation. Evidence records the observed ACP session id and origin, cleanup absence, and any changed configuration keys without values. The probe does not enable `runtime-v1` and is not in the npm artifact.
 
-## Health check
+## Known limitations
 
-`pi-agent-wave-doctor` also reports `route-credentials`: for every model in the required tiers it names the executing agent and whether that agent's credential store is structurally usable, so a routing file full of models nobody can authenticate with fails the health check instead of failing at dispatch. Pi routes are reported usable because dispatch materializes their credential.
+- **Absolute host paths escape the sandbox.** On this host a process inside `agentfs run` that changes into an absolute host path writes to the host, outside the overlay, and the ownership audit cannot see it. Workers are told to stay in `.`; the operational command instruction never names a host path; a declared checkpoint that appears on the host without an overlay change fails settlement. A general guard (an AgentFS confinement option or a post-attempt host comparison) is open.
+- **Adapters.** Pi is proven end to end on build, research and operations graphs. Codex is proven on research only. Claude has passed the probe but no graph run.
+- **Quality is not measured.** The measurement driver accepts candidates automatically; review, test and audit verdicts come from the workers, and independent review of a candidate remains the caller's decision.
+- **Capture.** One Pi synthesis turn in the operations smokes exited with an incomplete capture and no answer; the retry replaced it and the raw stream is now retained whenever that happens, but the cause is not yet known.
+- **Dispatch identity is reserved at registration, not before launch.** A crash between the launcher's start and the attempt's registration leaves a launched worker with no attempt row; it is settled through `cancel`. Reserving the identity before launch is recorded as open.
+- **Live proofs need a capable host**: AgentFS loopback binding and mounting, process inspection, provider credentials, and explicit authorization to spend credits.
 
-The read-only doctor diagnoses a configuration without changing it:
+## Security
 
-```bash
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs --agent-dir "$PI_CODING_AGENT_DIR"
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs --agent-dir "$PI_CODING_AGENT_DIR" --json
-```
-
-It checks agent-directory resolution, catalog readability, routing JSONC parseability, the six required tiers and roles, non-empty model chains, catalog membership, local-model loopback validity, pi-fzf command targets, package entry points, and real `policy-resolver` and `route-picker` execution. It exits nonzero only when a required check fails; an absent pi-fzf is a non-fatal warning. Output redacts credential-bearing provider fields.
-
-## Migration and rollback
-
-The migration utility defaults to dry-run and never changes files unless `apply` is explicit:
-
-```bash
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs --agent-dir "$PI_CODING_AGENT_DIR"
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs preflight --agent-dir "$PI_CODING_AGENT_DIR"
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs apply --agent-dir "$PI_CODING_AGENT_DIR"
-```
-
-Apply moves conflicting loose extensions to `migration-backups/pi-agent-wave/`, outside Pi's auto-discovered extension directory, records a manifest, and enables the selected package source in `settings.json`. It also repairs the pi-fzf `route` and `delegate-model` list/preview commands so they execute the installed package’s `route-picker.ts` instead of the removed loose path. The original `fzf.json` bytes are retained in the private manifest for rollback.
-
-Rollback requires the manifest printed by apply:
-
-```bash
-node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/migrate.mjs rollback --manifest /path/to/manifest.json
-```
-
-Review every dry-run plan before apply. Do not run migration against a real Pi installation unless that change is explicitly authorized.
+Pi extensions execute with your user account's full system access. Review the source before installation, especially `scripts/` and the worker-launch paths. Retained failure bundles and configuration snapshots are private evidence and may contain sensitive values; do not publish them.
 
 ## Uninstall
-
-If you installed from the cloned source directory, remove the same package source:
 
 ```bash
 pi remove ./pi-agent-wave-new-design/extensions/pi-agent-wave
 ```
 
-After npm publication, remove an npm installation with:
+After npm publication:
 
 ```bash
 pi remove npm:@dpugliese/pi-agent-wave
 ```
 
-Removing pi-agent-wave does not remove Herdr, routing configuration, migration backups, or stored Delegate Graph runs. If a loose-install migration was applied, run rollback first when the original loose files, exact settings, and original pi-fzf configuration should be restored.
+Removing pi-agent-wave does not remove Herdr, routing configuration, migration backups, or stored Delegate Graph runs. If a loose-install migration was applied, run its rollback first to restore the original files, settings, and pi-fzf configuration.
+
+## Claude provider and header updates
+
+`claude-code-auth.ts` registers the `claude-code` provider for the Pi supervisor. Its source is adapted from `@cgaravitoq/pi-claude-code-auth` 2.2.2 and maintained in this package. Credential discovery and refresh use the pinned `@cgaravitoq/claude-code-core` 0.1.0 dependency; the streaming adapter uses `@anthropic-ai/sdk` 0.91.1. Upstream attribution and MIT terms are in `lib/claude-auth-LICENSE`. This section is the integration reference; the upstream README is not included.
+
+For a checkout installation, run `npm install --ignore-scripts` from this package directory before restarting Pi. If the separate auth package is already installed, remove its `npm:@cgaravitoq/pi-claude-code-auth` entry from Pi’s package list (including a source-filtered entry, if present). Do not load both providers. An existing `claude-code` login in Pi remains usable. If needed, authenticate the Claude Code CLI first, then use `/login claude-code` and choose a model with `/model`. The model catalog is inherited from the imported provider version.
+
+This provider calls the Anthropic Messages API from Pi. Graph routes named `claude-code/*` still execute the actual Claude Code CLI through ACPX; this integration does not change worker routing or credentials. Importing the extension registers the provider and command without reading credentials or starting a refresh. Login/refresh use upstream behavior, including its CLI fallback; a fallback can invoke a model and spend usage.
+
+Use these commands in Pi:
+
+```text
+/claude-headers status
+/claude-headers update
+```
+
+`update` runs only `claude --version`, with a ten-second timeout, validates the result and atomically saves a mode-600 JSON file. The file is `$PI_CODING_AGENT_DIR/claude-code-headers.json`, defaulting to `~/.pi/agent/claude-code-headers.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "claudeCodeVersion": "2.1.268"
+}
+```
+
+The default is 2.1.268 when the file is absent. Each request reads the file, so a successful update takes effect immediately. Invalid JSON or an unsupported schema produces an explicit error. A failed version query preserves the existing file. After installing a new Claude Code release, run `update`; there is no background polling or automatic installation of releases.
+
+The selected version controls both User-Agent and the existing billing system block. `ANTHROPIC_CLI_VERSION` overrides the saved version, `ANTHROPIC_USER_AGENT` overrides only User-Agent, and `CLAUDE_CODE_ENTRYPOINT` retains the upstream entrypoint override (default `sdk-cli`). `status` reports the effective version and whether the User-Agent override is present. Do not include tokens or account identifiers in the JSON. Other header-rewriting extensions can override the outgoing request again; remove overlapping rules for this provider if you want this configuration to control its headers.
+
+Version detection does not discover beta flags, billing algorithms or identity changes. Those remain tested source changes. Local request tests prove metadata construction and stream handling; they do not establish live API compatibility or that the reported “Unknown error” is fixed. Subscription acceptance remains controlled by the service.
+
+If a Claude model stops with `refusal`, Pi displays that exact reason plus the server's category and explanation when provided, preserving any partial answer and usage. An unknown stop reason is named explicitly. `model_context_window_exceeded` is treated as a truncated response. These diagnostics do not establish why a particular live request was refused; compare the actual server explanation rather than assuming a header, quota or authentication failure.
