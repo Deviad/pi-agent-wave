@@ -801,3 +801,32 @@ test("key release events are never actions in the list or the follow view", asyn
 		store.close();
 	} finally { process.env = originalEnv; }
 });
+
+test("a cancellation in flight cannot be aborted, confirmed twice, or closed over, and key repeats do not act", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-inflight-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const tui = fakeTui();
+	const run = newRun(store, "inflight");
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-slow");
+	let finish: ((report: CancelRunReport) => void) | null = null;
+	let requests = 0;
+	const slow: AgentListActions = { cancelRun: (runId) => { requests += 1; return new Promise((resolve) => { finish = (report) => resolve(report); void runId; }); } };
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, slow);
+	const ESC_REPEAT = "\u001b[27;1:2u";
+	assert.deepEqual(tui.input(ESCAPE), { consume: true });
+	assert.deepEqual(tui.input(ESC_REPEAT), { consume: true });
+	assert.ok(agentListState().confirming, "a held Escape does not abort the prompt it opened");
+	assert.deepEqual(tui.input(ENTER), { consume: true });
+	assert.equal(requests, 1);
+	assert.match(tui.last()!.at(-1)!, new RegExp(`^cancelling run ${run.runId}: 1 running worker: worker-slow \\| please wait$`), "the prompt shows the cancellation in flight");
+	assert.deepEqual(tui.input(ESCAPE), { consume: true });
+	assert.match(tui.notices.at(-1)!, /is in progress; wait for its report$/, "Escape during the cancellation does not claim an abort");
+	assert.equal(tui.notices.some((n) => /aborted; nothing was cancelled/.test(n)), false);
+	assert.deepEqual(tui.input("q"), { consume: true }); assert.equal(agentListState().open, true, "q during the cancellation does not close the list");
+	assert.deepEqual(tui.input(ENTER), { consume: true }); assert.equal(requests, 1, "Enter during the cancellation does not start a second one");
+	finish!({ runId: run.runId, cancelled: ["worker-slow"], failed: [], status: "cancelled" });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.match(tui.notices.at(-1)!, /^run .* cancelled: cancelled 1 worker \(worker-slow\)$/);
+	assert.equal(agentListState().confirming, null);
+	store.close();
+});

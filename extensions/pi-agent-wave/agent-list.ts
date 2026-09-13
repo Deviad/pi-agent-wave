@@ -222,8 +222,14 @@ export function renderSettledSummary(rows: readonly AgentListRow[]): string | nu
 export const DETAIL_KEYS = "keys: q back to list, r refresh, Esc cancels the run's workers";
 
 /** The confirmation the operator must answer before anything is cancelled; it names every worker it would stop. */
-export function renderCancelConfirmation(confirmation: CancelConfirmation): string[] {
-	return [`cancel run ${confirmation.runId}? ${confirmation.names.length} running worker${confirmation.names.length === 1 ? "" : "s"}: ${confirmation.names.join(", ")} | Enter confirms, q or Esc aborts`];
+export function renderCancelConfirmation(confirmation: CancelConfirmation, cancelling = false): string[] {
+	const workers = `${confirmation.names.length} running worker${confirmation.names.length === 1 ? "" : "s"}: ${confirmation.names.join(", ")}`;
+	return [cancelling ? `cancelling run ${confirmation.runId}: ${workers} | please wait` : `cancel run ${confirmation.runId}? ${workers} | Enter confirms, q or Esc aborts`];
+}
+
+/** A key repeat (kitty protocol event type 2) of a key that acts once must not act again; arrows may repeat. */
+export function isKeyRepeat(data: string): boolean {
+	return /;\d+:2[u~]$/.test(data);
 }
 
 /** The running workers of a run, as the operator would name them; empty when nothing is running. */
@@ -232,17 +238,17 @@ export function runningWorkerNames(store: GraphStore, runId: string): string[] {
 	return store.operations(runId, true).filter((operation) => operation.status === "running").map((operation) => agents.find((agent) => agent.id === operation.agent_id)?.name ?? operation.id);
 }
 
-export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null, showSettled = false, cursor: CursorItem | null = null): string[] {
+export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null, showSettled = false, cursor: CursorItem | null = null, cancelling = false): string[] {
 	const lines = [`agents (${rows.length}) | ${cursor ? FOCUSED_KEYS : LIST_KEYS}`];
 	const mark = (item: CursorItem) => (cursor ? (sameItem(cursor, item) ? "\u203a " : "  ") : "");
 	for (const row of rows) if (row.running || showSettled) lines.push(`${mark({ kind: "row", number: row.number })}${row.number}. ${row.agentName} | ${row.node} | ${row.state} | ${row.model} | ${row.activity}`);
 	if (!showSettled) { const summary = renderSettledSummary(rows); if (summary) lines.push(`${mark({ kind: "summary" })}${summary}`); }
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
-	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
+	if (confirmation) lines.push(...renderCancelConfirmation(confirmation, cancelling));
 	return lines;
 }
 
-export function renderAgentDetail(detail: AgentDetail, confirmation: CancelConfirmation | null = null): string[] {
+export function renderAgentDetail(detail: AgentDetail, confirmation: CancelConfirmation | null = null, cancelling = false): string[] {
 	const lines = [
 		`agent ${detail.number}: ${detail.agentName} | ${DETAIL_KEYS}`,
 		`run ${detail.runId} (${detail.runStatus}) | operation ${detail.operationId}`,
@@ -256,7 +262,7 @@ export function renderAgentDetail(detail: AgentDetail, confirmation: CancelConfi
 	lines.push("retained answer:");
 	if (detail.answer !== null) for (const line of detail.answer.split("\n")) lines.push(`  ${line}`);
 	if (detail.answerNote) lines.push(`  ${detail.answerNote}`);
-	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
+	if (confirmation) lines.push(...renderCancelConfirmation(confirmation, cancelling));
 	return lines;
 }
 
@@ -270,10 +276,10 @@ function draw(): void {
 	let content: string[];
 	if (current.selected !== null) {
 		const entry = entries.find((item) => item.number === current.selected);
-		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled, current.cursor); }
+		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled, current.cursor, current.cancelling); }
 		else {
-			try { content = renderAgentDetail(attemptDetail(current.store, entry), current.confirming); }
-			catch (error) { content = [`agent ${entry.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | ${DETAIL_KEYS}`, ...(current.confirming ? renderCancelConfirmation(current.confirming) : [])]; }
+			try { content = renderAgentDetail(attemptDetail(current.store, entry), current.confirming, current.cancelling); }
+			catch (error) { content = [`agent ${entry.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | ${DETAIL_KEYS}`, ...(current.confirming ? renderCancelConfirmation(current.confirming, current.cancelling) : [])]; }
 		}
 	} else {
 		const rows = listRows(current.store);
@@ -282,7 +288,7 @@ function draw(): void {
 			const items = visibleItems(rows, current.showSettled);
 			if (!items.some((item) => sameItem(current.cursor, item))) current.cursor = items.find((item) => item.kind === "summary") ?? items[0] ?? null;
 		}
-		content = renderAgentList(rows, current.pending, current.confirming, current.showSettled, current.cursor);
+		content = renderAgentList(rows, current.pending, current.confirming, current.showSettled, current.cursor, current.cancelling);
 	}
 	current.ctx.ui.setWidget(AGENT_LIST_WIDGET, content);
 	if (!anyRunning(current.store) && current.timer) { clearInterval(current.timer); current.timer = null; }
@@ -318,6 +324,12 @@ function handleInput(data: string): { consume: true } | undefined {
 	// release still matches the key (2026-09-13: one Escape press showed the cancel prompt and its release
 	// aborted it). Releases are never actions here.
 	if (isKeyRelease(data)) return undefined;
+	if (isKeyRepeat(data) && !matchesKey(data, "up") && !matchesKey(data, "down")) return { consume: true };
+	// A cancellation in flight cannot be aborted or confirmed twice; keys are answered, not acted on, until it reports.
+	if (current.cancelling && (matchesKey(data, "escape") || matchesKey(data, "enter") || parseKey(data) === "q")) {
+		current.ctx.ui.notify(`cancellation of run ${current.confirming?.runId ?? "?"} is in progress; wait for its report`, "info");
+		return { consume: true };
+	}
 	// Keys are matched through pi-tui so the CSI-u encodings Pi enables (Escape as an escape sequence, not a
 	// bare byte) are recognised the same as their legacy forms (2026-09-13 terminal proof: a bare-byte compare
 	// let Escape fall through to the editor).
@@ -368,7 +380,6 @@ function handleInput(data: string): { consume: true } | undefined {
 		// confirmation, or asks to cancel every running worker of the run in view. It never closes the view; q does.
 		if (current.pending) { current.pending = ""; draw(); return { consume: true }; }
 		if (current.confirming) { abortCancellation(current); return { consume: true }; }
-		if (current.cancelling) return { consume: true };
 		const runId = targetRunId(current);
 		if (!runId) { current.ctx.ui.notify("no run in the list to cancel", "warning"); return { consume: true }; }
 		const names = runningWorkerNames(current.store, runId);
@@ -408,6 +419,7 @@ function confirmCancellation(current: AgentListSession): void {
 	const confirmation = current.confirming;
 	if (!confirmation || current.cancelling) return;
 	current.cancelling = true;
+	draw();
 	current.actions.cancelRun(confirmation.runId).then((report) => {
 		const failures = report.failed.length ? `; ${report.failed.length} could not be confirmed stopped: ${report.failed.map((item) => `${item.agentName} (${item.error})`).join("; ")}` : "";
 		current.ctx.ui.notify(`run ${report.runId} ${report.status}: cancelled ${report.cancelled.length} worker${report.cancelled.length === 1 ? "" : "s"}${report.cancelled.length ? ` (${report.cancelled.join(", ")})` : ""}${failures}`, report.failed.length ? "warning" : "info");

@@ -16,7 +16,7 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
-import { attemptDetail, closeAgentList, noteRegisteredAttempt, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
+import { attemptDetail, closeAgentList, isKeyRepeat, noteRegisteredAttempt, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
@@ -386,7 +386,7 @@ function listActions(graphStore: GraphStore, pi: ExtensionAPI): AgentListActions
 }
 
 /** The follow view: the watch overview redrawn in a widget while the operator holds it open; a number plus Enter opens that worker's details. */
-export function renderFollow(view: WatchView, pending = "", confirmation: CancelConfirmation | null = null, cursorIndex: number | null = null): string[] {
+export function renderFollow(view: WatchView, pending = "", confirmation: CancelConfirmation | null = null, cursorIndex: number | null = null, cancelling = false): string[] {
 	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | ${cursorIndex === null ? "keys: Enter opens the running worker or focuses the list, up/down move, number then Enter opens by number, r refresh, q close, Esc cancels the run's workers" : "focused: up/down move, Enter opens, q unfocuses, Esc cancels the run's workers"}`];
 	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
 	view.agents.forEach((agent, index) => {
@@ -395,7 +395,7 @@ export function renderFollow(view: WatchView, pending = "", confirmation: Cancel
 		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
 	});
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
-	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
+	if (confirmation) lines.push(...renderCancelConfirmation(confirmation, cancelling));
 	return lines;
 }
 
@@ -441,10 +441,10 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 		// The cursor follows the worker; when its operation leaves the running set the cursor moves to the first row.
 		if (cursorOperation !== null && cursorIndex() === -1) cursorOperation = latest.agents[0]?.operationId ?? null;
 		if (selected) {
-			try { ctx.ui.setWidget(FOLLOW_WIDGET, renderAgentDetail(attemptDetail(graphStore, { number: selected.number, attemptKey: selected.attemptKey, runId, operationId: selected.operationId }), confirming)); }
-			catch (error) { ctx.ui.setWidget(FOLLOW_WIDGET, [`agent ${selected.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q back to list, r refresh, Esc cancels the run's workers`, ...(confirming ? renderCancelConfirmation(confirming) : [])]); }
+			try { ctx.ui.setWidget(FOLLOW_WIDGET, renderAgentDetail(attemptDetail(graphStore, { number: selected.number, attemptKey: selected.attemptKey, runId, operationId: selected.operationId }), confirming, cancelling)); }
+			catch (error) { ctx.ui.setWidget(FOLLOW_WIDGET, [`agent ${selected.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q back to list, r refresh, Esc cancels the run's workers`, ...(confirming ? renderCancelConfirmation(confirming, cancelling) : [])]); }
 		} else {
-			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending, confirming, cursorIndex()));
+			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending, confirming, cursorIndex(), cancelling));
 		}
 		if (latest.status !== "active" && followSession?.timer) { clearInterval(followSession.timer); followSession.timer = null; }
 	};
@@ -452,6 +452,7 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 	const confirmCancellation = () => {
 		if (!confirming || cancelling) return;
 		cancelling = true;
+		draw();
 		cancelRunWorkers(graphStore, pi, runId).then((report) => {
 			const failures = report.failed.length ? `; ${report.failed.length} could not be confirmed stopped: ${report.failed.map((item) => `${item.agentName} (${item.error})`).join("; ")}` : "";
 			ctx.ui.notify(`run ${report.runId} ${report.status}: cancelled ${report.cancelled.length} worker${report.cancelled.length === 1 ? "" : "s"}${report.cancelled.length ? ` (${report.cancelled.join(", ")})` : ""}${failures}`, report.failed.length ? "warning" : "info");
@@ -462,6 +463,11 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 	const unsubscribe = ctx.ui.onTerminalInput((data) => {
 		if (ctx.ui.getEditorText?.()) return undefined;
 		if (isKeyRelease(data)) return undefined;
+		if (isKeyRepeat(data) && !matchesKey(data, "up") && !matchesKey(data, "down")) return { consume: true };
+		if (cancelling && (matchesKey(data, "escape") || matchesKey(data, "enter") || parseKey(data) === "q")) {
+			ctx.ui.notify(`cancellation of run ${runId} is in progress; wait for its report`, "info");
+			return { consume: true };
+		}
 		const key = parseKey(data) ?? data;
 		if (/^[0-9]$/.test(key)) {
 			if (selected) return undefined;
@@ -497,7 +503,6 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 		if (matchesKey(data, "escape")) {
 			if (pending) { pending = ""; draw(); return { consume: true }; }
 			if (confirming) { abortCancellation(); return { consume: true }; }
-			if (cancelling) return { consume: true };
 			const names = runningWorkerNames(graphStore, runId);
 			if (!names.length) { ctx.ui.notify(`run ${runId} has no running workers to cancel`, "info"); return { consume: true }; }
 			confirming = { runId, names }; draw();
