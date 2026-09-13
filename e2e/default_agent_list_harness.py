@@ -61,6 +61,7 @@ def main():
                     workerTabSeen=False, fixtureWorkerSeen=False, selectedModelIsFixture=False, fixtureHome=None, fixtureModel=None, defaultSessionUnchanged=False,
                     listOpened=False, detailOpened=False, detailRefreshed=False, backToList=False, appendedSecondRun=False, firstNumberStable=False,
                     secondRunId=None, detailWithoutHerdrTarget=False, collectReply=None, settledDetail=False, closedByOperator=False, reopened=False,
+                    followDetailOpened=False, followClosed=False,
                     fakeSupervisorLogPath=str(log), capturesDir=str(captures), capturesSha256='',
                     secretScanFindings=0, cleanup={}, failureReason=None)
     counter = 0
@@ -334,6 +335,19 @@ def main():
         send('/graph agents')
         screen_with('agents (2) |', f'1. {first_name} |', reason='/graph agents did not reopen the list')
         evidence['reopened'] = True
+
+        # The explicit follow view opens details by number too. Opening it replaces the agent list; the second
+        # run's thinker has not been collected, so it is the follow view's running worker number 1.
+        send(f"/graph watch {evidence['secondRunId']} --follow")
+        screen_with(f"watch {evidence['secondRunId']} |", f"1. {second_agent['name']} |", reason='follow view did not open')
+        choose(1)
+        screen = screen_with(f"agent 1: {second_agent['name']} |", reason='follow view did not open details on 1 then Enter')
+        evidence['followDetailOpened'] = 'agent_not_found' not in screen and 'no pane to focus' not in screen
+        key('q')
+        screen_with(f"watch {evidence['secondRunId']} |", reason='q did not return from details to the follow view')
+        key('q')
+        wait_for(lambda: (s := capture()) and 'closed (closed by operator)' in s and f"watch {evidence['secondRunId']} |" not in s, 15, 'q did not close the follow view')
+        evidence['followClosed'] = True
         code = 0
     except MissingPrerequisite as error:
         evidence['failureReason'] = str(error)

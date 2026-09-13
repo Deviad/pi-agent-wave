@@ -88,7 +88,7 @@ test("op=watch renders what each running worker is doing from its retained strea
 	} finally { process.env = originalEnv; }
 });
 
-test("/graph watch --follow keeps the overview on screen, refreshes on r, focuses with number keys, and closes on q", async () => {
+test("/graph watch --follow keeps the overview on screen, refreshes on r, opens details by number plus Enter, and closes on q", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "runtime-follow-")); dirs.push(dir);
 	const originalEnv = { ...process.env };
 	process.env.PI_GRAPH_WATCH_INTERVAL_MS = "60";
@@ -106,7 +106,7 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, focuse
 
 		await graph.handler(`watch ${runId} --follow`, ctx);
 		assert.ok(handler, "follow subscribes to terminal input");
-		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\| node=thinker_split \\| status=active \\| keys: 1-9 focus worker, r refresh, q close$`));
+		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\| node=thinker_split \\| status=active \\| keys: number then Enter opens details, r refresh, q or Esc close$`));
 		assert.match(widgets.at(-1)![1]!, /no running workers/);
 
 		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
@@ -122,8 +122,15 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, focuse
 		assert.match(widgets.at(-1)![1]!, /^1\. worker-1 \| thinker_split \| running \| tools=0 \| Reading the corpus$/);
 		assert.deepEqual(handler!("r"), { consume: true });
 		assert.deepEqual(handler!("1"), { consume: true });
-		assert.match(notices.at(-1) ?? "", /worker-1 is a headless worker; it has no pane to focus/);
-		assert.deepEqual(handler!("7"), { consume: true });
+		assert.match(widgets.at(-1)!.at(-1)!, /^selecting: 1_ \(Enter opens, Esc clears\)$/, "the pending digit is shown");
+		assert.deepEqual(handler!("\r"), { consume: true });
+		assert.match(widgets.at(-1)![0]!, /^agent 1: worker-1 \| keys: q or Esc back to list, r refresh$/, "Enter opens the worker's details in the follow view");
+		assert.match(widgets.at(-1)![3]!, /^process running \| acceptance unavailable$/);
+		assert.ok(widgets.at(-1)!.some((line) => line.includes("Reading the corpus")), "details render the retained stream");
+		assert.equal(notices.some((notice) => /no pane to focus|agent_not_found/.test(notice)), false, "no Herdr focus is attempted");
+		assert.deepEqual(handler!("q"), { consume: true });
+		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\|`), "q returns from details to the overview");
+		assert.deepEqual(handler!("7"), { consume: true }); assert.deepEqual(handler!("\r"), { consume: true });
 		assert.match(notices.at(-1) ?? "", /no worker 7/);
 		assert.equal(handler!("x"), undefined, "other keys pass through to the editor");
 		assert.deepEqual(handler!("q"), { consume: true });

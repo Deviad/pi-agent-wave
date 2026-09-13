@@ -15,7 +15,7 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
-import { closeAgentList, noteRegisteredAttempt, reopenAgentList } from "./agent-list.ts";
+import { attemptDetail, closeAgentList, noteRegisteredAttempt, renderAgentDetail, reopenAgentList } from "./agent-list.ts";
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
@@ -351,14 +351,15 @@ export function renderWatch(view: WatchView): string {
 	return lines.join("\n");
 }
 
-/** The follow view: the watch overview redrawn in a widget while the operator holds it open, with number keys that focus a worker. */
-export function renderFollow(view: WatchView): string[] {
-	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | keys: 1-9 focus worker, r refresh, q close`];
+/** The follow view: the watch overview redrawn in a widget while the operator holds it open; a number plus Enter opens that worker's details. */
+export function renderFollow(view: WatchView, pending = ""): string[] {
+	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | keys: number then Enter opens details, r refresh, q or Esc close`];
 	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
 	view.agents.forEach((agent, index) => {
 		lines.push(`${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
 		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
 	});
+	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
 	return lines;
 }
 
@@ -378,7 +379,9 @@ function stopFollow(reason: string): void {
 /**
  * Keeps the watch overview on screen and current while the operator holds it open. The redraw timer exists
  * only for that time: it stops when the run leaves `active`, when the operator presses q, or when a new
- * follow replaces it. Number keys focus a Herdr worker; headless workers have no pane to focus.
+ * follow replaces it. A number plus Enter opens that worker's details, bound to its attempt, rendered the
+ * same way as the agent list; bringing a Herdr tab forward stays with `/graph focus`. Keys reach the view
+ * only while the editor is empty.
  */
 /** The redraw interval for interactive views, from the environment with a floor so a typo cannot spin the terminal. */
 export function watchIntervalMs(): number {
@@ -391,21 +394,42 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 	closeAgentList("replaced by watch --follow");
 	graphStore.getRun(runId);
 	let latest: WatchView = watchRun(graphStore, runId);
+	let pending = "";
+	let selected: { number: number; attemptKey: string; operationId: string } | null = null;
 	const draw = () => {
 		latest = watchRun(graphStore, runId);
-		ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest));
+		if (selected) {
+			try { ctx.ui.setWidget(FOLLOW_WIDGET, renderAgentDetail(attemptDetail(graphStore, { number: selected.number, attemptKey: selected.attemptKey, runId, operationId: selected.operationId }))); }
+			catch (error) { ctx.ui.setWidget(FOLLOW_WIDGET, [`agent ${selected.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q or Esc back to list, r refresh`]); }
+		} else {
+			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending));
+		}
 		if (latest.status !== "active" && followSession?.timer) { clearInterval(followSession.timer); followSession.timer = null; }
 	};
 	const unsubscribe = ctx.ui.onTerminalInput((data) => {
-		if (data === "q" || data === "\u001b") { stopFollow("closed by operator"); return { consume: true }; }
-		if (data === "r") { draw(); return { consume: true }; }
-		if (/^[1-9]$/.test(data)) {
-			const agent = latest.agents[Number(data) - 1];
-			if (!agent) { ctx.ui.notify(`no worker ${data} in the watch view`, "warning"); return { consume: true }; }
-			if (agent.transport !== "herdr" || !agent.agentName) { ctx.ui.notify(`${agent.agentName ?? agent.operationId} is a headless worker; it has no pane to focus`, "warning"); return { consume: true }; }
-			focusRegisteredAgent(graphStore.agents(runId), agent.agentName, process.env.HERDR_ENV === "1", executor(pi)).catch((error: unknown) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+		if (ctx.ui.getEditorText?.()) return undefined;
+		if (/^[0-9]$/.test(data)) {
+			if (selected) return undefined;
+			pending += data; draw();
 			return { consume: true };
 		}
+		if (data === "\r" || data === "\n") {
+			if (!pending) return undefined;
+			const number = Number(pending); pending = "";
+			const agent = latest.agents[number - 1];
+			const attempt = agent ? graphStore.runtimeAttemptByOperation(agent.operationId) : null;
+			if (!agent || !attempt) ctx.ui.notify(`no worker ${number} in the watch view`, "warning");
+			else selected = { number, attemptKey: attempt.attemptKey, operationId: agent.operationId };
+			draw();
+			return { consume: true };
+		}
+		if (data === "q" || data === "\u001b") {
+			if (pending) { pending = ""; draw(); return { consume: true }; }
+			if (selected) { selected = null; draw(); return { consume: true }; }
+			stopFollow("closed by operator");
+			return { consume: true };
+		}
+		if (data === "r") { draw(); return { consume: true }; }
 		return undefined;
 	});
 	const timer = setInterval(draw, intervalMs);

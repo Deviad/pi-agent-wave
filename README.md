@@ -180,7 +180,7 @@ In a Pi terminal the commands are:
 
 When the first worker of a Pi session registers, a numbered agent list opens above the editor and later workers append to it with stable numbers, including retries and workers from other runs started in the same session. Type a number and press Enter to open that worker's details in the terminal: run, node and role, model, task, process state and acceptance, the rendered tail of its live output, and its retained answer after settlement. `r` refreshes, `q` or Escape returns to the list and then closes it, and `/graph agents` reopens it. The list reads keys only while the editor is empty, so typing a command is never interrupted. Details never depend on a Herdr tab still existing and nothing in the list dispatches, cancels, settles or decides work.
 
-`/graph watch` shows what every running worker is doing right now, rendered from its stream; with `--follow` (also `/graph status <runId> --follow`) it stays on screen as the run-scoped follow view, where number keys jump to a worker's Herdr tab. Headless workers appear in the follow view but cannot be focused. Air receives the same summary as `watch` progress events.
+`/graph watch` shows what every running worker is doing right now, rendered from its stream; with `--follow` (also `/graph status <runId> --follow`) it stays on screen as the run-scoped follow view, where a number plus Enter opens that worker's details exactly as in the agent list. Bringing a worker's Herdr tab forward is `/graph focus`. Air receives the same summary as `watch` progress events.
 
 ## Optional: Herdr presentation
 
@@ -194,7 +194,7 @@ herdr
 
 Start Pi inside the Herdr workspace (Ghostty or any terminal Herdr manages). The `auto` transport selects Herdr only when the executable and complete workspace and tab identity are present; otherwise it selects headless. An explicit `herdr` transport fails closed outside a valid workspace, and an explicit `headless` transport never creates worker tabs.
 
-Each worker owns one tab named after the story and role. The tab shows the worker's stream rendered as content, never the JSON-RPC envelope: assistant text as it streams, thoughts dimmed when the role's tier enables thinking, one line per tool call, and short rules at turn boundaries. `/graph focus` and the number keys of `/graph watch --follow` bring a tab forward.
+Each worker owns one tab named after the story and role. The tab shows the worker's stream rendered as content, never the JSON-RPC envelope: assistant text as it streams, thoughts dimmed when the role's tier enables thinking, one line per tool call, and short rules at turn boundaries. `/graph focus` brings a tab forward; numbers in the agent list and the follow view open details instead.
 
 ## Worker execution and cleanup
 
