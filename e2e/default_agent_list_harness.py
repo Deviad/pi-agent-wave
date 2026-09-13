@@ -61,7 +61,7 @@ def main():
                     workerTabSeen=False, fixtureWorkerSeen=False, selectedModelIsFixture=False, fixtureHome=None, fixtureModel=None, defaultSessionUnchanged=False,
                     listOpened=False, detailOpened=False, detailRefreshed=False, backToList=False, appendedSecondRun=False, firstNumberStable=False,
                     secondRunId=None, detailWithoutHerdrTarget=False, collectReply=None, settledDetail=False, closedByOperator=False, reopened=False,
-                    followDetailOpened=False, followClosed=False,
+                    followDetailOpened=False, followClosed=False, cancelPromptShown=False, cancelAborted=False, cancelConfirmed=False, cancelledRunStatus=None,
                     fakeSupervisorLogPath=str(log), capturesDir=str(captures), capturesSha256='',
                     secretScanFindings=0, cleanup={}, failureReason=None)
     counter = 0
@@ -276,7 +276,7 @@ def main():
         screen_with('agents (1) | keys: number then Enter opens details', f'1. {first_name} |', reason='agent list did not open after registration')
         evidence['listOpened'] = True
         choose(1)
-        screen_with(f'agent 1: {first_name} | keys: q or Esc back to list', 'process running', reason='detail view did not open on 1 then Enter')
+        screen_with(f'agent 1: {first_name} | keys: q back to list', 'process running', reason='detail view did not open on 1 then Enter')
         evidence['detailOpened'] = True
         key('r')
         time.sleep(1.5)
@@ -348,6 +348,28 @@ def main():
         key('q')
         wait_for(lambda: (s := capture()) and 'closed (closed by operator)' in s and f"watch {evidence['secondRunId']} |" not in s, 15, 'q did not close the follow view')
         evidence['followClosed'] = True
+
+        # Escape in the agent list asks to cancel the run's workers: q aborts, Enter confirms. The second run's
+        # thinker is still a running operation, so it is the one cancelled; the first run is untouched.
+        send('/graph agents')
+        screen_with('agents (2) |', reason='/graph agents did not reopen the list before cancellation')
+        key('esc')
+        screen_with(f"cancel run {evidence['secondRunId']}? 1 running worker: {second_agent['name']} | Enter confirms, q or Esc aborts", reason='Escape did not show the cancel confirmation')
+        evidence['cancelPromptShown'] = True
+        key('q')
+        wait_for(lambda: 'aborted; nothing was cancelled' in capture(), 15, 'q did not abort the cancellation')
+        evidence['cancelAborted'] = True
+        key('esc')
+        screen_with('cancel run ', reason='the second Escape did not show the confirmation')
+        key('enter')
+        screen_with(f"run {evidence['secondRunId']} cancelled: cancelled 1 worker ({second_agent['name']})",
+                    f"2. {second_agent['name']} | thinker_plan | settled (cancelled) |", timeout=60, reason='the confirmed cancellation did not complete')
+        evidence['cancelConfirmed'] = True
+        with sqlite3.connect(f'file:{temp / "graph.db"}?mode=ro', uri=True) as db:
+            evidence['cancelledRunStatus'] = db.execute('SELECT status FROM state WHERE run_id=?', (evidence['secondRunId'],)).fetchone()[0]
+            first_status = db.execute('SELECT status FROM state WHERE run_id=?', (evidence['runId'],)).fetchone()[0]
+        if first_status == 'cancelled':
+            raise RuntimeError('cancelling the second run must not touch the first')
         code = 0
     except MissingPrerequisite as error:
         evidence['failureReason'] = str(error)

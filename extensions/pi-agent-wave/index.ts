@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, type RuntimeAttempt, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -15,7 +16,7 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
-import { attemptDetail, closeAgentList, noteRegisteredAttempt, renderAgentDetail, reopenAgentList } from "./agent-list.ts";
+import { attemptDetail, closeAgentList, noteRegisteredAttempt, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
@@ -351,15 +352,49 @@ export function renderWatch(view: WatchView): string {
 	return lines.join("\n");
 }
 
+/**
+ * The operator's cancel-all for one run: every running worker's process is stopped through its structured
+ * cancel script and its attempt is settled as cancelled, then the run's running operations and the run
+ * itself are recorded cancelled in one transaction. A worker whose stop cannot be confirmed is reported by
+ * name; the run is still recorded cancelled, because that is what the operator asked for.
+ */
+export async function cancelRunWorkers(graphStore: GraphStore, pi: ExtensionAPI, runId: string): Promise<CancelRunReport> {
+	const state = graphStore.getState(runId);
+	if (state.status !== "active") throw new Error(`run ${runId} is ${state.status}; nothing to cancel`);
+	const agents = graphStore.agents(runId);
+	const cancelled: string[] = [];
+	const failed: { agentName: string; error: string }[] = [];
+	for (const operation of graphStore.operations(runId, true).filter((candidate) => candidate.status === "running")) {
+		const agent = agents.find((candidate) => candidate.id === operation.agent_id);
+		if (!agent) continue;
+		try {
+			await cancelRegisteredAgent([agent], agent.name, executor(pi));
+		} catch (error) {
+			if (agent.acpx_state !== "no-session") { failed.push({ agentName: agent.name, error: error instanceof Error ? error.message : String(error) }); continue; }
+		}
+		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
+		if (attempt && !attempt.outcome) graphStore.settleRuntimeAttempt({ attemptKey: attempt.attemptKey, outcome: { kind: "cancelled", signal: null } });
+		cancelled.push(agent.name);
+	}
+	const reason = failed.length ? `operator cancelled the run; ${failed.map((item) => item.agentName).join(", ")} could not be confirmed stopped` : "operator cancelled the run";
+	const result = graphStore.cancelRunningOperations(runId, reason);
+	return { runId, cancelled, failed, status: result.state.status };
+}
+
+function listActions(graphStore: GraphStore, pi: ExtensionAPI): AgentListActions {
+	return { cancelRun: (runId) => cancelRunWorkers(graphStore, pi, runId) };
+}
+
 /** The follow view: the watch overview redrawn in a widget while the operator holds it open; a number plus Enter opens that worker's details. */
-export function renderFollow(view: WatchView, pending = ""): string[] {
-	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | keys: number then Enter opens details, r refresh, q or Esc close`];
+export function renderFollow(view: WatchView, pending = "", confirmation: CancelConfirmation | null = null): string[] {
+	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers`];
 	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
 	view.agents.forEach((agent, index) => {
 		lines.push(`${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
 		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
 	});
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
+	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
 	return lines;
 }
 
@@ -396,24 +431,39 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 	let latest: WatchView = watchRun(graphStore, runId);
 	let pending = "";
 	let selected: { number: number; attemptKey: string; operationId: string } | null = null;
+	let confirming: CancelConfirmation | null = null;
+	let cancelling = false;
 	const draw = () => {
 		latest = watchRun(graphStore, runId);
 		if (selected) {
-			try { ctx.ui.setWidget(FOLLOW_WIDGET, renderAgentDetail(attemptDetail(graphStore, { number: selected.number, attemptKey: selected.attemptKey, runId, operationId: selected.operationId }))); }
-			catch (error) { ctx.ui.setWidget(FOLLOW_WIDGET, [`agent ${selected.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q or Esc back to list, r refresh`]); }
+			try { ctx.ui.setWidget(FOLLOW_WIDGET, renderAgentDetail(attemptDetail(graphStore, { number: selected.number, attemptKey: selected.attemptKey, runId, operationId: selected.operationId }), confirming)); }
+			catch (error) { ctx.ui.setWidget(FOLLOW_WIDGET, [`agent ${selected.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q back to list, r refresh, Esc cancels the run's workers`, ...(confirming ? renderCancelConfirmation(confirming) : [])]); }
 		} else {
-			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending));
+			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending, confirming));
 		}
 		if (latest.status !== "active" && followSession?.timer) { clearInterval(followSession.timer); followSession.timer = null; }
 	};
+	const abortCancellation = () => { confirming = null; draw(); ctx.ui.notify(`cancellation of run ${runId} aborted; nothing was cancelled`, "info"); };
+	const confirmCancellation = () => {
+		if (!confirming || cancelling) return;
+		cancelling = true;
+		cancelRunWorkers(graphStore, pi, runId).then((report) => {
+			const failures = report.failed.length ? `; ${report.failed.length} could not be confirmed stopped: ${report.failed.map((item) => `${item.agentName} (${item.error})`).join("; ")}` : "";
+			ctx.ui.notify(`run ${report.runId} ${report.status}: cancelled ${report.cancelled.length} worker${report.cancelled.length === 1 ? "" : "s"}${report.cancelled.length ? ` (${report.cancelled.join(", ")})` : ""}${failures}`, report.failed.length ? "warning" : "info");
+		}).catch((error: unknown) => {
+			ctx.ui.notify(`cancellation of run ${runId} failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}).finally(() => { cancelling = false; confirming = null; if (followSession?.runId === runId) draw(); });
+	};
 	const unsubscribe = ctx.ui.onTerminalInput((data) => {
 		if (ctx.ui.getEditorText?.()) return undefined;
-		if (/^[0-9]$/.test(data)) {
+		const key = parseKey(data) ?? data;
+		if (/^[0-9]$/.test(key)) {
 			if (selected) return undefined;
-			pending += data; draw();
+			pending += key; draw();
 			return { consume: true };
 		}
-		if (data === "\r" || data === "\n") {
+		if (matchesKey(data, "enter")) {
+			if (confirming) { confirmCancellation(); return { consume: true }; }
 			if (!pending) return undefined;
 			const number = Number(pending); pending = "";
 			const agent = latest.agents[number - 1];
@@ -423,13 +473,23 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 			draw();
 			return { consume: true };
 		}
-		if (data === "q" || data === "\u001b") {
+		if (matchesKey(data, "escape")) {
 			if (pending) { pending = ""; draw(); return { consume: true }; }
+			if (confirming) { abortCancellation(); return { consume: true }; }
+			if (cancelling) return { consume: true };
+			const names = runningWorkerNames(graphStore, runId);
+			if (!names.length) { ctx.ui.notify(`run ${runId} has no running workers to cancel`, "info"); return { consume: true }; }
+			confirming = { runId, names }; draw();
+			return { consume: true };
+		}
+		if (key === "q") {
+			if (pending) { pending = ""; draw(); return { consume: true }; }
+			if (confirming) { abortCancellation(); return { consume: true }; }
 			if (selected) { selected = null; draw(); return { consume: true }; }
 			stopFollow("closed by operator");
 			return { consume: true };
 		}
-		if (data === "r") { draw(); return { consume: true }; }
+		if (key === "r") { draw(); return { consume: true }; }
 		return undefined;
 	});
 	const timer = setInterval(draw, intervalMs);
@@ -744,7 +804,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						// The worker is registered; presentation runs after that fact and a UI failure cannot reclassify the dispatch.
 						try {
 							if (ctx.mode === "tui") stopFollow("replaced by agent list");
-							noteRegisteredAttempt(graphStore, ctx, { attemptKey: attempt.attemptKey, runId, operationId }, watchIntervalMs());
+							noteRegisteredAttempt(graphStore, ctx, { attemptKey: attempt.attemptKey, runId, operationId }, watchIntervalMs(), listActions(graphStore, pi));
 						} catch (error) {
 							ctx.ui.notify(`agent list unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
 						}
@@ -855,7 +915,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 				const graphStore = getStore();
 				if (subcommand === "agents") {
 					if (ctx.mode !== "tui") { ctx.ui.notify("the agent list needs the interactive terminal", "warning"); return; }
-					if (!reopenAgentList(graphStore, ctx, watchIntervalMs())) ctx.ui.notify("no worker has registered in this session yet", "info");
+					if (!reopenAgentList(graphStore, ctx, watchIntervalMs(), listActions(graphStore, pi))) ctx.ui.notify("no worker has registered in this session yet", "info");
 					return;
 				}
 				// `status --follow <runId>` and `status <runId> --follow` are aliases of `watch <runId> --follow`; bare status stays one-shot.

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { summarizeAcpxStream } from "./lib/acpx-render.ts";
@@ -55,14 +56,31 @@ export interface AgentDetail {
 	readonly answerNote: string | null;
 }
 
+export interface CancelRunReport {
+	readonly runId: string;
+	readonly cancelled: readonly string[];
+	readonly failed: readonly { agentName: string; error: string }[];
+	readonly status: string;
+}
+
+/** The one mutation the views may trigger, supplied by the entry point so this module never executes anything itself. */
+export interface AgentListActions {
+	cancelRun(runId: string): Promise<CancelRunReport>;
+}
+
+export interface CancelConfirmation { readonly runId: string; readonly names: readonly string[] }
+
 interface AgentListSession {
 	readonly ctx: ExtensionContext;
 	readonly store: GraphStore;
 	readonly intervalMs: number;
+	readonly actions: AgentListActions;
 	timer: ReturnType<typeof setInterval> | null;
 	unsubscribe: () => void;
 	selected: number | null;
 	pending: string;
+	confirming: CancelConfirmation | null;
+	cancelling: boolean;
 }
 
 const entries: AgentListEntry[] = [];
@@ -173,16 +191,31 @@ export function listRows(store: GraphStore): AgentListRow[] {
 	});
 }
 
-export function renderAgentList(rows: readonly AgentListRow[], pending: string): string[] {
-	const lines = [`agents (${rows.length}) | keys: number then Enter opens details, r refresh, q or Esc close`];
+export const LIST_KEYS = "keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers";
+export const DETAIL_KEYS = "keys: q back to list, r refresh, Esc cancels the run's workers";
+
+/** The confirmation the operator must answer before anything is cancelled; it names every worker it would stop. */
+export function renderCancelConfirmation(confirmation: CancelConfirmation): string[] {
+	return [`cancel run ${confirmation.runId}? ${confirmation.names.length} running worker${confirmation.names.length === 1 ? "" : "s"}: ${confirmation.names.join(", ")} | Enter confirms, q or Esc aborts`];
+}
+
+/** The running workers of a run, as the operator would name them; empty when nothing is running. */
+export function runningWorkerNames(store: GraphStore, runId: string): string[] {
+	const agents = store.agents(runId);
+	return store.operations(runId, true).filter((operation) => operation.status === "running").map((operation) => agents.find((agent) => agent.id === operation.agent_id)?.name ?? operation.id);
+}
+
+export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null): string[] {
+	const lines = [`agents (${rows.length}) | ${LIST_KEYS}`];
 	for (const row of rows) lines.push(`${row.number}. ${row.agentName} | ${row.node} | ${row.state} | ${row.model} | ${row.activity}`);
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
+	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
 	return lines;
 }
 
-export function renderAgentDetail(detail: AgentDetail): string[] {
+export function renderAgentDetail(detail: AgentDetail, confirmation: CancelConfirmation | null = null): string[] {
 	const lines = [
-		`agent ${detail.number}: ${detail.agentName} | keys: q or Esc back to list, r refresh`,
+		`agent ${detail.number}: ${detail.agentName} | ${DETAIL_KEYS}`,
 		`run ${detail.runId} (${detail.runStatus}) | operation ${detail.operationId}`,
 		`node ${detail.node} | role ${detail.role} | transport ${detail.transport} | model ${detail.model}`,
 		`process ${detail.processState} | acceptance ${detail.acceptance}`,
@@ -194,6 +227,7 @@ export function renderAgentDetail(detail: AgentDetail): string[] {
 	lines.push("retained answer:");
 	if (detail.answer !== null) for (const line of detail.answer.split("\n")) lines.push(`  ${line}`);
 	if (detail.answerNote) lines.push(`  ${detail.answerNote}`);
+	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
 	return lines;
 }
 
@@ -207,13 +241,13 @@ function draw(): void {
 	let content: string[];
 	if (current.selected !== null) {
 		const entry = entries.find((item) => item.number === current.selected);
-		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending); }
+		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming); }
 		else {
-			try { content = renderAgentDetail(attemptDetail(current.store, entry)); }
-			catch (error) { content = [`agent ${entry.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q or Esc back to list, r refresh`]; }
+			try { content = renderAgentDetail(attemptDetail(current.store, entry), current.confirming); }
+			catch (error) { content = [`agent ${entry.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | ${DETAIL_KEYS}`, ...(current.confirming ? renderCancelConfirmation(current.confirming) : [])]; }
 		}
 	} else {
-		content = renderAgentList(listRows(current.store), current.pending);
+		content = renderAgentList(listRows(current.store), current.pending, current.confirming);
 	}
 	current.ctx.ui.setWidget(AGENT_LIST_WIDGET, content);
 	if (!anyRunning(current.store) && current.timer) { clearInterval(current.timer); current.timer = null; }
@@ -245,13 +279,18 @@ function handleInput(data: string): { consume: true } | undefined {
 	// reach the list only while the editor is empty (2026-09-13 terminal proof: digits, r and q vanished from a
 	// typed /graph command).
 	if (current.ctx.ui.getEditorText?.()) return undefined;
-	if (/^[0-9]$/.test(data)) {
+	// Keys are matched through pi-tui so the CSI-u encodings Pi enables (Escape as an escape sequence, not a
+	// bare byte) are recognised the same as their legacy forms (2026-09-13 terminal proof: a bare-byte compare
+	// let Escape fall through to the editor).
+	const key = parseKey(data) ?? data;
+	if (/^[0-9]$/.test(key)) {
 		if (current.selected !== null) return undefined;
-		current.pending += data;
+		current.pending += key;
 		draw();
 		return { consume: true };
 	}
-	if (data === "\r" || data === "\n") {
+	if (matchesKey(data, "enter")) {
+		if (current.confirming) { confirmCancellation(current); return { consume: true }; }
 		if (!current.pending) return undefined;
 		const number = Number(current.pending);
 		current.pending = "";
@@ -260,20 +299,63 @@ function handleInput(data: string): { consume: true } | undefined {
 		draw();
 		return { consume: true };
 	}
-	if (data === "q" || data === "") {
+	if (matchesKey(data, "escape")) {
+		// Escape is the cancel key (operator decision 2026-09-13): it clears a pending number, aborts a pending
+		// confirmation, or asks to cancel every running worker of the run in view. It never closes the view; q does.
 		if (current.pending) { current.pending = ""; draw(); return { consume: true }; }
+		if (current.confirming) { abortCancellation(current); return { consume: true }; }
+		if (current.cancelling) return { consume: true };
+		const runId = targetRunId(current);
+		if (!runId) { current.ctx.ui.notify("no run in the list to cancel", "warning"); return { consume: true }; }
+		const names = runningWorkerNames(current.store, runId);
+		if (!names.length) { current.ctx.ui.notify(`run ${runId} has no running workers to cancel`, "info"); return { consume: true }; }
+		current.confirming = { runId, names };
+		draw();
+		return { consume: true };
+	}
+	if (key === "q") {
+		if (current.pending) { current.pending = ""; draw(); return { consume: true }; }
+		if (current.confirming) { abortCancellation(current); return { consume: true }; }
 		if (current.selected !== null) { current.selected = null; draw(); return { consume: true }; }
 		closeAgentList("closed by operator");
 		return { consume: true };
 	}
-	if (data === "r") { draw(); return { consume: true }; }
+	if (key === "r") { draw(); return { consume: true }; }
 	return undefined;
 }
 
-function open(store: GraphStore, ctx: ExtensionContext, intervalMs: number): void {
+/** The run the operator is looking at: the selected worker's run, otherwise the most recently registered one. */
+function targetRunId(current: AgentListSession): string | null {
+	const entry = current.selected !== null ? entries.find((item) => item.number === current.selected) : entries.at(-1);
+	return entry?.runId ?? null;
+}
+
+function abortCancellation(current: AgentListSession): void {
+	const runId = current.confirming?.runId;
+	current.confirming = null;
+	draw();
+	if (runId) current.ctx.ui.notify(`cancellation of run ${runId} aborted; nothing was cancelled`, "info");
+}
+
+/** Runs the confirmed cancellation through the injected action, reports the outcome, and redraws whatever remains. */
+function confirmCancellation(current: AgentListSession): void {
+	const confirmation = current.confirming;
+	if (!confirmation || current.cancelling) return;
+	current.cancelling = true;
+	current.actions.cancelRun(confirmation.runId).then((report) => {
+		const failures = report.failed.length ? `; ${report.failed.length} could not be confirmed stopped: ${report.failed.map((item) => `${item.agentName} (${item.error})`).join("; ")}` : "";
+		current.ctx.ui.notify(`run ${report.runId} ${report.status}: cancelled ${report.cancelled.length} worker${report.cancelled.length === 1 ? "" : "s"}${report.cancelled.length ? ` (${report.cancelled.join(", ")})` : ""}${failures}`, report.failed.length ? "warning" : "info");
+	}).catch((error: unknown) => {
+		current.ctx.ui.notify(`cancellation of run ${confirmation.runId} failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}).finally(() => {
+		if (session === current) { current.cancelling = false; current.confirming = null; draw(); }
+	});
+}
+
+function open(store: GraphStore, ctx: ExtensionContext, intervalMs: number, actions: AgentListActions): void {
 	if (session) return;
 	const unsubscribe = ctx.ui.onTerminalInput(handleInput);
-	session = { ctx, store, intervalMs, timer: null, unsubscribe, selected: null, pending: "" };
+	session = { ctx, store, intervalMs, actions, timer: null, unsubscribe, selected: null, pending: "", confirming: null, cancelling: false };
 	ensureTimer();
 	draw();
 }
@@ -283,26 +365,26 @@ function open(store: GraphStore, ctx: ExtensionContext, intervalMs: number): voi
  * number and opens the list if it is not on screen. A manual close does not block a later registration
  * from reopening it. Non-TUI contexts get nothing: no widget, no subscription, no timer.
  */
-export function noteRegisteredAttempt(store: GraphStore, ctx: ExtensionContext, registration: { attemptKey: string; runId: string; operationId: string }, intervalMs: number): void {
+export function noteRegisteredAttempt(store: GraphStore, ctx: ExtensionContext, registration: { attemptKey: string; runId: string; operationId: string }, intervalMs: number, actions: AgentListActions): void {
 	if (ctx.mode !== "tui") return;
 	if (!entries.some((entry) => entry.attemptKey === registration.attemptKey)) {
 		entries.push({ number: entries.length + 1, attemptKey: registration.attemptKey, runId: registration.runId, operationId: registration.operationId });
 	}
 	if (session) { ensureTimer(); draw(); return; }
-	open(store, ctx, intervalMs);
+	open(store, ctx, intervalMs, actions);
 }
 
 /** Explicit reopening of the overview for the attempts this session has seen; nothing to show is reported, not invented. */
-export function reopenAgentList(store: GraphStore, ctx: ExtensionContext, intervalMs: number): boolean {
+export function reopenAgentList(store: GraphStore, ctx: ExtensionContext, intervalMs: number, actions: AgentListActions): boolean {
 	if (ctx.mode !== "tui" || !entries.length) return false;
-	if (session) { session.selected = null; session.pending = ""; draw(); return true; }
-	open(store, ctx, intervalMs);
+	if (session) { session.selected = null; session.pending = ""; session.confirming = null; draw(); return true; }
+	open(store, ctx, intervalMs, actions);
 	return true;
 }
 
 /** Read-only view of the session state, for tests and diagnostics. */
-export function agentListState(): { entries: readonly AgentListEntry[]; open: boolean; selected: number | null; pending: string; timerActive: boolean } {
-	return { entries: [...entries], open: session !== null, selected: session?.selected ?? null, pending: session?.pending ?? "", timerActive: session !== null && session.timer !== null };
+export function agentListState(): { entries: readonly AgentListEntry[]; open: boolean; selected: number | null; pending: string; timerActive: boolean; confirming: CancelConfirmation | null } {
+	return { entries: [...entries], open: session !== null, selected: session?.selected ?? null, pending: session?.pending ?? "", timerActive: session !== null && session.timer !== null, confirming: session?.confirming ?? null };
 }
 
 /** Test-only: forgets every entry and closes the view without notifying. */

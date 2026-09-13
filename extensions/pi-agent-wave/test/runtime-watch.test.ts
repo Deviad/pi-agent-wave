@@ -8,11 +8,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { GraphStore } from "../store.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { renderFollow, renderWatch, watchRun } from "../index.ts";
-import { AGENT_LIST_WIDGET, agentListState, attemptDetail, noteRegisteredAttempt, resetAgentListForTests } from "../agent-list.ts";
+import { AGENT_LIST_WIDGET, agentListState, attemptDetail, noteRegisteredAttempt, resetAgentListForTests, type AgentListActions, type CancelRunReport } from "../agent-list.ts";
+import { cancelRunWorkers } from "../index.ts";
 import { renderStatus } from "../commands.ts";
 
 const dirs: string[] = [];
-afterEach(() => { resetAgentListForTests(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { resetAgentListForTests(); cancelRequests.length = 0; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function parsed(result: unknown): Record<string, any> { return JSON.parse((result as { content: { text: string }[] }).content[0].text); }
 const ROLES = ["thinker", "implementer", "reviewer", "tester", "auditor", "searcher"];
 
@@ -106,7 +107,7 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, opens 
 
 		await graph.handler(`watch ${runId} --follow`, ctx);
 		assert.ok(handler, "follow subscribes to terminal input");
-		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\| node=thinker_split \\| status=active \\| keys: number then Enter opens details, r refresh, q or Esc close$`));
+		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\| node=thinker_split \\| status=active \\| keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers$`));
 		assert.match(widgets.at(-1)![1]!, /no running workers/);
 
 		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
@@ -124,7 +125,7 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, opens 
 		assert.deepEqual(handler!("1"), { consume: true });
 		assert.match(widgets.at(-1)!.at(-1)!, /^selecting: 1_ \(Enter opens, Esc clears\)$/, "the pending digit is shown");
 		assert.deepEqual(handler!("\r"), { consume: true });
-		assert.match(widgets.at(-1)![0]!, /^agent 1: worker-1 \| keys: q or Esc back to list, r refresh$/, "Enter opens the worker's details in the follow view");
+		assert.match(widgets.at(-1)![0]!, /^agent 1: worker-1 \| keys: q back to list, r refresh, Esc cancels the run's workers$/, "Enter opens the worker's details in the follow view");
 		assert.match(widgets.at(-1)![3]!, /^process running \| acceptance unavailable$/);
 		assert.ok(widgets.at(-1)!.some((line) => line.includes("Reading the corpus")), "details render the retained stream");
 		assert.equal(notices.some((notice) => /no pane to focus|agent_not_found/.test(notice)), false, "no Herdr focus is attempted");
@@ -189,6 +190,9 @@ function fakeTui(mode: "tui" | "headless" = "tui"): FakeTui {
 
 const ENTER = "\r";
 const ESCAPE = "";
+const cancelRequests: string[] = [];
+/** The default action double: records the request and reports nothing cancelled; tests that cancel for real use cancelRunWorkers. */
+const actions: AgentListActions = { cancelRun: async (runId) => { cancelRequests.push(runId); return { runId, cancelled: [], failed: [], status: "active" }; } };
 
 interface Registered { attemptKey: string; agentId: string; attemptDir: string; identity: ReturnType<typeof createHeadlessAcpxAttemptIdentity> }
 /** Registers a worker for an operation the way the dispatch path does, without a real launch. */
@@ -251,7 +255,7 @@ test("agent list opens on registered dispatch only", async () => {
 		assert.ok(events.includes("runtime_attempt_registered"));
 		assert.equal(agentListState().open, true);
 		assert.deepEqual(agentListState().entries.map((e) => [e.number, e.attemptKey]), [[1, planned.attemptKey]]);
-		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: number then Enter opens details, r refresh, q or Esc close$/);
+		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers$/);
 		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no stream\)$/);
 	} finally { process.env = originalEnv; }
 });
@@ -262,14 +266,14 @@ test("registered attempts append without renumbering or replacing selection", as
 	const tui = fakeTui();
 	const a = newRun(store, "first"); const b = newRun(store, "second");
 	const first = registerWorker(store, dir, a.runId, a.operationId, "worker-a");
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: a.runId, operationId: a.operationId }, 60);
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: a.runId, operationId: a.operationId }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: a.runId, operationId: a.operationId }, 60, actions);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: a.runId, operationId: a.operationId }, 60, actions);
 	assert.equal(agentListState().entries.length, 1, "a duplicate acknowledgement adds no row");
 	select(tui, 1);
 	assert.equal(agentListState().selected, 1);
 	assert.match(tui.last()![0]!, /^agent 1: worker-a \|/);
 	const second = registerWorker(store, dir, b.runId, b.operationId, "worker-b");
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: second.attemptKey, runId: b.runId, operationId: b.operationId }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: second.attemptKey, runId: b.runId, operationId: b.operationId }, 60, actions);
 	assert.deepEqual(agentListState().entries.map((e) => [e.number, e.runId]), [[1, a.runId], [2, b.runId]], "another run's worker appends with the next number");
 	assert.equal(agentListState().selected, 1, "a new worker does not replace the selected details");
 	assert.match(tui.last()![0]!, /^agent 1: worker-a \|/);
@@ -284,7 +288,7 @@ test("automatic agent list is TUI only", async () => {
 	const run = newRun(store, "headless");
 	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-h");
 	const headless = fakeTui("headless");
-	noteRegisteredAttempt(store, headless.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60);
+	noteRegisteredAttempt(store, headless.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	assert.deepEqual(headless.widgets, []); assert.equal(headless.unsubscribed, 0); assert.equal(agentListState().open, false); assert.equal(agentListState().entries.length, 0);
 	assert.throws(() => headless.input("1"), /no terminal input handler/);
 	store.close();
@@ -296,10 +300,10 @@ test("number selection shows attempt-bound live and retained details", async () 
 	const tui = fakeTui();
 	const run = newRun(store, "detail");
 	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-d");
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	select(tui, 1);
 	let view = tui.last()!;
-	assert.match(view[0]!, /^agent 1: worker-d \| keys: q or Esc back to list, r refresh$/);
+	assert.match(view[0]!, /^agent 1: worker-d \| keys: q back to list, r refresh, Esc cancels the run's workers$/);
 	assert.match(view[1]!, new RegExp(`^run ${run.runId} \\(active\\) \\| operation ${run.operationId}$`));
 	assert.match(view[2]!, /^node thinker_split \| role thinker \| transport headless \| model openai-codex\/gpt-5\.6-sol$/);
 	assert.match(view[3]!, /^process running \| acceptance unavailable$/);
@@ -329,14 +333,14 @@ test("settled and superseded entries retain their own details", async () => {
 	const tui = fakeTui();
 	const run = newRun(store, "superseded");
 	const first = registerWorker(store, dir, run.runId, run.operationId, "worker-1");
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: run.runId, operationId: run.operationId }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	store.settleRuntimeAttempt({ attemptKey: first.attemptKey, outcome: { kind: "failed", exitCode: 1, error: "fixture failure" } });
 	assert.deepEqual(tui.input("r"), { consume: true });
 	assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| settled \(failed 1\) \|/, "a settled candidate is labeled settled, never running");
 	const parked = store.retryRuntimeAttempt({ runId: run.runId, operationId: run.operationId });
 	const retry = parked.state.status === "active" ? parked : store.retryRuntimeAttempt({ runId: run.runId, operationId: run.operationId, approved: true });
 	const second = registerWorker(store, dir, run.runId, retry.operation.id, "worker-2", { transientAttempt: retry.operation.transient_attempts });
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: second.attemptKey, runId: run.runId, operationId: retry.operation.id }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: second.attemptKey, runId: run.runId, operationId: retry.operation.id }, 60, actions);
 	assert.deepEqual(agentListState().entries.map((e) => e.number), [1, 2]);
 	assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| superseded \(failed\) \|/);
 	assert.match(tui.last()![2]!, /^2\. worker-2 \| thinker_split \| running \|/);
@@ -360,7 +364,7 @@ test("missing Herdr agent cannot prevent detail inspection or mutate a run", asy
 		const run = newRun(store, "herdr");
 		const worker = registerWorker(store, dir, run.runId, run.operationId, "dg_run-5052_thinker_d9c14f15", { transport: "herdr" });
 		const before = snapshot(store, run.runId);
-		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60);
+		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 		select(tui, 1);
 		const view = tui.last()!;
 		assert.match(view[0]!, /^agent 1: dg_run-5052_thinker_d9c14f15 \|/);
@@ -379,7 +383,7 @@ test("multi-digit selection addresses the displayed attempt", async () => {
 	for (let index = 1; index <= 12; index += 1) {
 		const run = newRun(store, `many-${index}`);
 		const worker = registerWorker(store, dir, run.runId, run.operationId, `worker-${index}`);
-		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60);
+		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	}
 	assert.equal(tui.last()!.length, 13);
 	assert.match(tui.last()![12]!, /^12\. worker-12 \|/);
@@ -413,11 +417,11 @@ test("agent list navigation and closing are read-only", async () => {
 	const run = newRun(store, "close");
 	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-c");
 	const before = snapshot(store, run.runId);
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	assert.equal(agentListState().timerActive, true);
 	select(tui, 1);
 	assert.deepEqual(tui.input("r"), { consume: true }); assert.match(tui.last()![0]!, /^agent 1:/);
-	assert.deepEqual(tui.input(ESCAPE), { consume: true }); assert.match(tui.last()![0]!, /^agents \(1\)/, "Escape returns from detail to the list");
+	assert.deepEqual(tui.input("q"), { consume: true }); assert.match(tui.last()![0]!, /^agents \(1\)/, "q returns from detail to the list");
 	assert.deepEqual(tui.input("q"), { consume: true });
 	assert.equal(tui.last(), undefined, "closing removes the widget"); assert.equal(tui.unsubscribed, 1); assert.equal(agentListState().open, false); assert.equal(agentListState().timerActive, false);
 	assert.match(tui.notices.at(-1)!, /closed by operator/);
@@ -427,7 +431,7 @@ test("agent list navigation and closing are read-only", async () => {
 	assert.equal(agentListState().entries.length, 1, "entries and numbers survive a close");
 	const other = newRun(store, "close-2");
 	const later = registerWorker(store, dir, other.runId, other.operationId, "worker-c2");
-	noteRegisteredAttempt(store, tui.ctx, { attemptKey: later.attemptKey, runId: other.runId, operationId: other.operationId }, 60);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: later.attemptKey, runId: other.runId, operationId: other.operationId }, 60, actions);
 	assert.equal(agentListState().open, true, "a later successful worker start reopens the list");
 	assert.match(tui.last()![2]!, /^2\. worker-c2 \|/);
 	assert.equal(snapshot(store, run.runId), before);
@@ -471,7 +475,7 @@ test("agent list refresh resources follow view lifetime", async () => {
 		const tui = fakeTui();
 		const run = newRun(store, "timer");
 		const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-t");
-		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 40);
+		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 40, actions);
 		const drawn = tui.widgets.length;
 		await new Promise((resolve) => setTimeout(resolve, 130));
 		assert.ok(tui.widgets.length > drawn, "the list redraws while a tracked worker runs");
@@ -487,6 +491,149 @@ test("agent list refresh resources follow view lifetime", async () => {
 		assert.ok(shutdown, "the extension closes its views on session shutdown");
 		shutdown!({}, tui.ctx);
 		assert.equal(agentListState().open, false); assert.equal(tui.unsubscribed, 1); assert.equal(tui.last(), undefined);
+		store.close();
+	} finally { process.env = originalEnv; }
+});
+
+
+// ---------------------------------------------------------------------------------------------------------
+// Escape cancels the run's workers after confirmation (tasks/prd-cancel-run-from-list.md).
+// ---------------------------------------------------------------------------------------------------------
+
+/** A structured-cancel executor double: the cancel script of a registered worker answers as acpx-cancel.ts would. */
+function cancelExecutor(known: Map<string, Registered>, behaviour: (worker: Registered) => "ok" | "fail"): { exec: Exec; calls: string[] } {
+	const calls: string[] = [];
+	const exec: Exec = async (command) => {
+		const worker = known.get(command);
+		if (!worker) throw new Error(`unexpected execution: ${command}`);
+		calls.push(command);
+		if (behaviour(worker) === "fail") return { code: 1, stdout: "", stderr: "acpx cancel timed out", killed: false };
+		return { code: 0, stdout: `${JSON.stringify({ action: "cancel_attempt", sessionName: worker.identity.sessionName, recordId: worker.identity.sessionName, attemptKey: worker.attemptKey, cancelled: true, structuredCancelled: true, closed: true, noSession: true })}\n`, stderr: "", killed: false };
+	};
+	return { exec, calls };
+}
+
+test("Escape asks before cancelling and q or a second Escape aborts without touching anything", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-cancel-ask-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const tui = fakeTui();
+	const run = newRun(store, "ask");
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-ask");
+	const before = snapshot(store, run.runId);
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
+	assert.match(tui.last()![0]!, /Esc cancels the run's workers$/, "the key legend names the cancel key");
+	assert.deepEqual(tui.input(ESCAPE), { consume: true });
+	assert.deepEqual(agentListState().confirming, { runId: run.runId, names: ["worker-ask"] });
+	assert.equal(tui.last()!.at(-1), `cancel run ${run.runId}? 1 running worker: worker-ask | Enter confirms, q or Esc aborts`);
+	assert.deepEqual(tui.input("q"), { consume: true });
+	assert.equal(agentListState().confirming, null); assert.equal(agentListState().open, true, "q on the prompt aborts the prompt, not the view");
+	assert.match(tui.notices.at(-1)!, /cancellation of run .* aborted; nothing was cancelled/);
+	assert.deepEqual(tui.input(ESCAPE), { consume: true }); assert.deepEqual(tui.input(ESCAPE), { consume: true });
+	assert.equal(agentListState().confirming, null, "a second Escape aborts too");
+	assert.deepEqual(cancelRequests, [], "nothing was requested");
+	assert.equal(snapshot(store, run.runId), before);
+	// Escape inside details asks for that worker's run; digits typed before it are cleared first.
+	select(tui, 1);
+	assert.deepEqual(tui.input(ESCAPE), { consume: true });
+	assert.match(tui.last()![0]!, /^agent 1: worker-ask \|/, "the prompt is shown on top of the details, not instead of them");
+	assert.equal(tui.last()!.at(-1), `cancel run ${run.runId}? 1 running worker: worker-ask | Enter confirms, q or Esc aborts`);
+	assert.deepEqual(tui.input("q"), { consume: true }); assert.equal(agentListState().selected, 1, "aborting keeps the details open");
+	store.close();
+});
+
+test("Escape then Enter cancels every running worker of the run in view and only that run", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-cancel-run-")); dirs.push(dir);
+	const originalEnv = { ...process.env };
+	try {
+		const known = new Map<string, Registered>();
+		const executor = cancelExecutor(known, () => "ok");
+		await harnessWith(dir, executor.exec);
+		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+		const { default: extensionModule } = await import(`../index.ts?cancel-run=${Date.now()}`);
+		void extensionModule;
+		const tui = fakeTui();
+		const a = newRun(store, "keep"); const b = newRun(store, "stop");
+		const keep = registerWorker(store, dir, a.runId, a.operationId, "worker-keep"); known.set(join(keep.attemptDir, "cancel-acpx.sh"), keep);
+		const stop = registerWorker(store, dir, b.runId, b.operationId, "worker-stop"); known.set(join(stop.attemptDir, "cancel-acpx.sh"), stop);
+		const fakePi = { exec: async (command: string, args: string[]) => { const r = await executor.exec(command, args); return { code: r.code, stdout: r.stdout, stderr: r.stderr, killed: false }; } } as unknown as ExtensionAPI;
+		const real: AgentListActions = { cancelRun: (runId) => cancelRunWorkers(store, fakePi, runId) };
+		noteRegisteredAttempt(store, tui.ctx, { attemptKey: keep.attemptKey, runId: a.runId, operationId: a.operationId }, 60, real);
+		noteRegisteredAttempt(store, tui.ctx, { attemptKey: stop.attemptKey, runId: b.runId, operationId: b.operationId }, 60, real);
+		// Nothing selected: the most recently registered run is the one in view.
+		assert.deepEqual(tui.input(ESCAPE), { consume: true });
+		assert.equal(agentListState().confirming?.runId, b.runId);
+		assert.deepEqual(tui.input(ENTER), { consume: true });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.deepEqual(executor.calls, [join(stop.attemptDir, "cancel-acpx.sh")], "only the run in view had its worker's cancel script executed");
+		assert.match(tui.notices.at(-1)!, new RegExp(`^run ${b.runId} cancelled: cancelled 1 worker \\(worker-stop\\)$`));
+		assert.equal(store.getState(b.runId).status, "cancelled");
+		assert.equal(store.getOperation(b.operationId).status, "cancelled");
+		assert.deepEqual(store.runtimeAttempt(stop.attemptKey).outcome, { kind: "cancelled", signal: null });
+		assert.equal(store.getState(a.runId).status, "active"); assert.equal(store.getOperation(a.operationId).status, "running");
+		assert.equal(store.runtimeAttempt(keep.attemptKey).outcome, null);
+		assert.equal(agentListState().confirming, null);
+		assert.match(tui.last()![1]!, /^1\. worker-keep \| thinker_split \| running \|/);
+		assert.match(tui.last()![2]!, /^2\. worker-stop \| thinker_split \| settled \(cancelled\) \|/, "the cancelled worker reads settled (cancelled) with its number intact");
+		assert.deepEqual(tui.input(ESCAPE), { consume: true });
+		assert.match(tui.notices.at(-1)!, new RegExp(`^run ${b.runId} has no running workers to cancel$`), "a cancelled run has nothing left to cancel");
+		// Selecting the other run's worker targets that run.
+		select(tui, 1);
+		assert.deepEqual(tui.input(ESCAPE), { consume: true });
+		assert.equal(agentListState().confirming?.runId, a.runId);
+		assert.deepEqual(tui.input("q"), { consume: true });
+		assert.equal(store.getState(a.runId).status, "active");
+		store.close();
+	} finally { process.env = originalEnv; }
+});
+
+test("a worker that cannot be confirmed stopped is named, and the run is still recorded cancelled", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-cancel-fail-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const known = new Map<string, Registered>();
+	const executor = cancelExecutor(known, () => "fail");
+	const tui = fakeTui();
+	const run = newRun(store, "stubborn");
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-stubborn"); known.set(join(worker.attemptDir, "cancel-acpx.sh"), worker);
+	const fakePi = { exec: async (command: string, args: string[]) => { const r = await executor.exec(command, args); return { code: r.code, stdout: r.stdout, stderr: r.stderr, killed: false }; } } as unknown as ExtensionAPI;
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, { cancelRun: (runId) => cancelRunWorkers(store, fakePi, runId) });
+	assert.deepEqual(tui.input(ESCAPE), { consume: true }); assert.deepEqual(tui.input(ENTER), { consume: true });
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.match(tui.notices.at(-1)!, /^run .* cancelled: cancelled 0 workers; 1 could not be confirmed stopped: worker-stubborn \(acpx cancel timed out\)$/);
+	assert.equal(store.getState(run.runId).status, "cancelled");
+	assert.equal(store.getOperation(run.operationId).status, "cancelled");
+	assert.match(String(store.getOperation(run.operationId).last_error), /worker-stubborn could not be confirmed stopped/);
+	assert.equal(store.runtimeAttempt(worker.attemptKey).outcome, null, "an unconfirmed stop does not fabricate a cancelled outcome");
+	store.close();
+});
+
+test("the follow view cancels its run through the same confirmation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "follow-cancel-")); dirs.push(dir);
+	const originalEnv = { ...process.env };
+	process.env.PI_GRAPH_WATCH_INTERVAL_MS = "60";
+	try {
+		const known = new Map<string, Registered>();
+		const executor = cancelExecutor(known, () => "ok");
+		const tool = await harnessWith(dir, executor.exec);
+		const graph = commands.get("graph")!;
+		const init = parsed(await tool.execute("init", { op: "init", story: "follow-cancel", graph: "research", task: "Investigate", modelPolicy: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "fixture" } }, undefined, () => {}, {} as ExtensionContext));
+		const runId: string = init.state.runId; const operationId: string = init.next.operations[0].id;
+		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+		const worker = registerWorker(store, dir, runId, operationId, "worker-f"); known.set(join(worker.attemptDir, "cancel-acpx.sh"), worker);
+		const widgets: (string[] | undefined)[] = []; const notices: string[] = []; let handler: ((data: string) => unknown) | null = null;
+		const ctx = { mode: "tui", ui: { getEditorText: () => "", notify: (m: string) => notices.push(m), setWidget: (_k: string, c: string[] | undefined) => widgets.push(c), onTerminalInput: (h: (data: string) => unknown) => { handler = h; return () => {}; } } } as unknown as ExtensionContext;
+		await graph.handler(`watch ${runId} --follow`, ctx);
+		assert.match(widgets.at(-1)![0]!, /Esc cancels the run's workers$/);
+		assert.deepEqual(handler!(ESCAPE), { consume: true });
+		assert.equal(widgets.at(-1)!.at(-1), `cancel run ${runId}? 1 running worker: worker-f | Enter confirms, q or Esc aborts`);
+		assert.deepEqual(handler!("q"), { consume: true });
+		assert.match(notices.at(-1)!, /aborted; nothing was cancelled/); assert.deepEqual(executor.calls, []);
+		assert.deepEqual(handler!(ESCAPE), { consume: true }); assert.deepEqual(handler!(ENTER), { consume: true });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.deepEqual(executor.calls, [join(worker.attemptDir, "cancel-acpx.sh")]);
+		assert.match(notices.at(-1)!, new RegExp(`^run ${runId} cancelled: cancelled 1 worker \\(worker-f\\)$`));
+		assert.equal(store.getState(runId).status, "cancelled");
+		assert.match(widgets.at(-1)![1]!, /^\(run is cancelled; nothing is running\)$/, "the overview redraws to the cancelled run");
+		assert.deepEqual(handler!("q"), { consume: true });
 		store.close();
 	} finally { process.env = originalEnv; }
 });

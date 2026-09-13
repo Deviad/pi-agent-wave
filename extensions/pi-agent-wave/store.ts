@@ -1627,6 +1627,28 @@ export class GraphStore {
 		return selectModelFallback(route.chain, operation.model_attempt, error, { exactLock: policy.input.kind === "model" });
 	}
 
+	/**
+	 * The operator's cancel-all: every running operation of the current node is marked cancelled and the run
+	 * leaves `active` for `cancelled` in one transaction. Worker processes are the caller's concern and are
+	 * stopped before this is recorded; the reason names any that could not be confirmed stopped.
+	 */
+	cancelRunningOperations(runId: string, reason: string): { state: RunState; operations: OperationRow[] } {
+		return this.transaction(() => {
+			const state = this.getState(runId);
+			if (state.status !== "active") throw new Error(`run ${runId} is ${state.status}; nothing to cancel`);
+			const now = this.iso();
+			const running = this.operations(runId, true).filter((operation) => operation.status === "running");
+			for (const operation of running) {
+				this.db.query("UPDATE operations SET status='cancelled',last_error=?,finished_at=? WHERE id=?").run(reason, now, operation.id);
+				if (operation.agent_id) this.db.query("UPDATE agents SET status='cancelled',last_activity_at=? WHERE id=?").run(now, operation.agent_id);
+				this.event({ runId, type: "operation_cancelled", node: operation.node, operationId: operation.id, toAgent: "user", replyTo: "user", payload: { reason } });
+			}
+			this.setState(runId, state.currentNode, state.round, state.fixIteration, "cancelled");
+			this.event({ runId, type: "run_cancelled", node: state.currentNode, toAgent: "user", replyTo: "user", payload: { reason, operations: running.map((operation) => operation.id) } });
+			return { state: this.getState(runId), operations: running.map((operation) => this.getOperation(operation.id)) };
+		});
+	}
+
 	/** Records one operation transition and atomically advances the graph when its join is complete. */
 	/** The only remaining record transition: cancellation of the current operation (report settlement was removed with legacy-v1). */
 	record(input: RecordOperationInput): RecordOperationResult {

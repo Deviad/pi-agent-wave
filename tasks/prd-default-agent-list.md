@@ -17,7 +17,7 @@ The current source exposes `/graph watch <runId> --follow`. `/graph status` is p
 - Display the overview at successful worker registration, not at empty graph creation or failed launch.
 - Keep one numbered list, appending subsequent attempts without changing existing numbers or selected detail.
 - Make details available for running and settled attempts without a live Herdr target.
-- Preserve read-only observation: opening, refreshing, selecting or closing never dispatches, cancels, settles, retries or decides work.
+- Preserve read-only observation: opening, refreshing, selecting or closing never dispatches, cancels, settles, retries or decides work. (Amended 2026-09-13: the one exception is the operator's explicit, confirmed cancellation on Escape, specified in [prd-cancel-run-from-list.md](prd-cancel-run-from-list.md).) (Amended 2026-09-13: the one exception is the operator's explicit, confirmed cancellation on Escape, specified in [prd-cancel-run-from-list.md](prd-cancel-run-from-list.md).)
 
 ## User Stories
 
@@ -54,7 +54,7 @@ The test names and the new E2E artifact below are proposed deliverables, not exi
 
 **Acceptance Criteria:**
 
-- [x] `r` refreshes the current view; `q` or Escape returns from detail to list and closes when already in the list. Closing removes the widget, input subscription and timer without changing graph state. A later successful worker start reopens the list, but an ordinary refresh does not undo a manual close. Proof: proposed test `agent list navigation and closing are read-only` in `extensions/pi-agent-wave/test/runtime-watch.test.ts`.
+- [x] `r` refreshes the current view; `q` or Escape returns from detail to list and closes when already in the list. (Escape's role was later changed by [Cancel the run's workers from the list](prd-cancel-run-from-list.md): it now asks to cancel the run's workers, and `q` alone navigates and closes.) (Escape's role was later changed by [Cancel the run's workers from the list](prd-cancel-run-from-list.md): it now asks to cancel the run's workers, and `q` alone navigates and closes.) Closing removes the widget, input subscription and timer without changing graph state. A later successful worker start reopens the list, but an ordinary refresh does not undo a manual close. Proof: proposed test `agent list navigation and closing are read-only` in `extensions/pi-agent-wave/test/runtime-watch.test.ts`.
 - [x] Existing `/graph watch <runId> --follow` still opens the run-scoped interactive view; `/graph status --follow <runId>` and `/graph status <runId> --follow` are aliases. Bare `/graph status <runId>` and `op=status` keep their existing one-shot contracts. Proof: proposed test `follow command aliases preserve one-shot status` in that file.
 - [x] Refreshing is limited to the open view; when no tracked worker is running, automatic redraw stops while retained details remain manually accessible. Session end or view replacement removes obsolete input handlers and timers. Proof: proposed test `agent list refresh resources follow view lifetime` in that file.
 - [x] Both READMEs and the project `AGENTS.md` describe automatic opening, numbering, in-TUI details and controls without claiming number selection focuses Herdr. Proof: updated files plus the relevant existing documentation tests and `git diff --check`.
