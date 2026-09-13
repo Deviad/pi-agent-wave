@@ -33,6 +33,8 @@ export interface AgentListRow {
 	readonly state: string;
 	readonly model: string;
 	readonly activity: string;
+	/** False once the attempt settled or was superseded; such rows collapse into the settled summary. */
+	readonly running: boolean;
 }
 
 export interface AgentDetail {
@@ -81,6 +83,8 @@ interface AgentListSession {
 	pending: string;
 	confirming: CancelConfirmation | null;
 	cancelling: boolean;
+	/** Settled rows are collapsed into one summary line unless the operator toggles them with s. */
+	showSettled: boolean;
 }
 
 const entries: AgentListEntry[] = [];
@@ -184,14 +188,20 @@ export function listRows(store: GraphStore): AgentListRow[] {
 			const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
 			const streamPath = streamPathFor(store, attempt);
 			const activity = streamPath ? summarizeAcpxStream(readTail(streamPath, STREAM_TAIL_BYTES), 1).lastActivity ?? "(no output yet)" : "(no stream)";
-			return { number: entry.number, agentName: agent?.name ?? entry.operationId, node: store.getOperation(entry.operationId).node, state: processLabel(attempt), model: shortModel(agent?.selected_model ?? null), activity };
+			return { number: entry.number, agentName: agent?.name ?? entry.operationId, node: store.getOperation(entry.operationId).node, state: processLabel(attempt), model: shortModel(agent?.selected_model ?? null), activity, running: attempt.processState === "running" && !attempt.supersededAt };
 		} catch (error) {
-			return { number: entry.number, agentName: entry.operationId, node: "?", state: `unavailable (${error instanceof Error ? error.message : String(error)})`, model: "?", activity: "" };
+			return { number: entry.number, agentName: entry.operationId, node: "?", state: `unavailable (${error instanceof Error ? error.message : String(error)})`, model: "?", activity: "", running: false };
 		}
 	});
 }
 
-export const LIST_KEYS = "keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers";
+export const LIST_KEYS = "keys: number then Enter opens details, s shows or hides settled, r refresh, q close, Esc cancels the run's workers";
+
+/** The one line settled workers fold into; their numbers stay valid and still open details. */
+export function renderSettledSummary(rows: readonly AgentListRow[]): string | null {
+	const settled = rows.filter((row) => !row.running);
+	return settled.length ? `settled (${settled.length}): ${settled.map((row) => row.number).join(", ")} | s shows them` : null;
+}
 export const DETAIL_KEYS = "keys: q back to list, r refresh, Esc cancels the run's workers";
 
 /** The confirmation the operator must answer before anything is cancelled; it names every worker it would stop. */
@@ -205,9 +215,10 @@ export function runningWorkerNames(store: GraphStore, runId: string): string[] {
 	return store.operations(runId, true).filter((operation) => operation.status === "running").map((operation) => agents.find((agent) => agent.id === operation.agent_id)?.name ?? operation.id);
 }
 
-export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null): string[] {
+export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null, showSettled = false): string[] {
 	const lines = [`agents (${rows.length}) | ${LIST_KEYS}`];
-	for (const row of rows) lines.push(`${row.number}. ${row.agentName} | ${row.node} | ${row.state} | ${row.model} | ${row.activity}`);
+	for (const row of rows) if (row.running || showSettled) lines.push(`${row.number}. ${row.agentName} | ${row.node} | ${row.state} | ${row.model} | ${row.activity}`);
+	if (!showSettled) { const summary = renderSettledSummary(rows); if (summary) lines.push(summary); }
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
 	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
 	return lines;
@@ -241,13 +252,13 @@ function draw(): void {
 	let content: string[];
 	if (current.selected !== null) {
 		const entry = entries.find((item) => item.number === current.selected);
-		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming); }
+		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled); }
 		else {
 			try { content = renderAgentDetail(attemptDetail(current.store, entry), current.confirming); }
 			catch (error) { content = [`agent ${entry.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | ${DETAIL_KEYS}`, ...(current.confirming ? renderCancelConfirmation(current.confirming) : [])]; }
 		}
 	} else {
-		content = renderAgentList(listRows(current.store), current.pending, current.confirming);
+		content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled);
 	}
 	current.ctx.ui.setWidget(AGENT_LIST_WIDGET, content);
 	if (!anyRunning(current.store) && current.timer) { clearInterval(current.timer); current.timer = null; }
@@ -321,6 +332,7 @@ function handleInput(data: string): { consume: true } | undefined {
 		return { consume: true };
 	}
 	if (key === "r") { draw(); return { consume: true }; }
+	if (key === "s") { current.showSettled = !current.showSettled; draw(); return { consume: true }; }
 	return undefined;
 }
 
@@ -355,7 +367,7 @@ function confirmCancellation(current: AgentListSession): void {
 function open(store: GraphStore, ctx: ExtensionContext, intervalMs: number, actions: AgentListActions): void {
 	if (session) return;
 	const unsubscribe = ctx.ui.onTerminalInput(handleInput);
-	session = { ctx, store, intervalMs, actions, timer: null, unsubscribe, selected: null, pending: "", confirming: null, cancelling: false };
+	session = { ctx, store, intervalMs, actions, timer: null, unsubscribe, selected: null, pending: "", confirming: null, cancelling: false, showSettled: false };
 	ensureTimer();
 	draw();
 }
@@ -383,8 +395,8 @@ export function reopenAgentList(store: GraphStore, ctx: ExtensionContext, interv
 }
 
 /** Read-only view of the session state, for tests and diagnostics. */
-export function agentListState(): { entries: readonly AgentListEntry[]; open: boolean; selected: number | null; pending: string; timerActive: boolean; confirming: CancelConfirmation | null } {
-	return { entries: [...entries], open: session !== null, selected: session?.selected ?? null, pending: session?.pending ?? "", timerActive: session !== null && session.timer !== null, confirming: session?.confirming ?? null };
+export function agentListState(): { entries: readonly AgentListEntry[]; open: boolean; selected: number | null; pending: string; timerActive: boolean; confirming: CancelConfirmation | null; showSettled: boolean } {
+	return { entries: [...entries], open: session !== null, selected: session?.selected ?? null, pending: session?.pending ?? "", timerActive: session !== null && session.timer !== null, confirming: session?.confirming ?? null, showSettled: session?.showSettled ?? false };
 }
 
 /** Test-only: forgets every entry and closes the view without notifying. */

@@ -61,7 +61,7 @@ def main():
                     workerTabSeen=False, fixtureWorkerSeen=False, selectedModelIsFixture=False, fixtureHome=None, fixtureModel=None, defaultSessionUnchanged=False,
                     listOpened=False, detailOpened=False, detailRefreshed=False, backToList=False, appendedSecondRun=False, firstNumberStable=False,
                     secondRunId=None, detailWithoutHerdrTarget=False, collectReply=None, settledDetail=False, closedByOperator=False, reopened=False,
-                    followDetailOpened=False, followClosed=False, cancelPromptShown=False, cancelAborted=False, cancelConfirmed=False, cancelledRunStatus=None,
+                    followDetailOpened=False, followClosed=False, cancelPromptShown=False, cancelAborted=False, cancelConfirmed=False, cancelledRunStatus=None, settledCollapsed=False, settledToggled=False,
                     fakeSupervisorLogPath=str(log), capturesDir=str(captures), capturesSha256='',
                     secretScanFindings=0, cleanup={}, failureReason=None)
     counter = 0
@@ -333,8 +333,14 @@ def main():
         wait_for(lambda: (s := capture()) and 'agent list closed' in s and 'agents (2) |' not in s, 15, 'q on the list did not close it')
         evidence['closedByOperator'] = True
         send('/graph agents')
-        screen_with('agents (2) |', f'1. {first_name} |', reason='/graph agents did not reopen the list')
+        screen_with('agents (2) |', 'settled (1): 1 | s shows them', f"2. {second_agent['name']} |", reason='/graph agents did not reopen the list with the collected worker collapsed')
         evidence['reopened'] = True
+        evidence['settledCollapsed'] = True
+        key('s')
+        screen_with(f'1. {first_name} | thinker_plan | settled (exited 0) |', reason='s did not show the settled row')
+        key('s')
+        screen_with('settled (1): 1 | s shows them', reason='s did not hide the settled row again')
+        evidence['settledToggled'] = True
 
         # The explicit follow view opens details by number too. Opening it replaces the agent list; the second
         # run's thinker has not been collected, so it is the follow view's running worker number 1.
@@ -363,7 +369,9 @@ def main():
         screen_with('cancel run ', reason='the second Escape did not show the confirmation')
         key('enter')
         screen_with(f"run {evidence['secondRunId']} cancelled: cancelled 1 worker ({second_agent['name']})",
-                    f"2. {second_agent['name']} | thinker_plan | settled (cancelled) |", timeout=60, reason='the confirmed cancellation did not complete')
+                    'settled (2): 1, 2 | s shows them', timeout=60, reason='the confirmed cancellation did not complete')
+        key('s')
+        screen_with(f"2. {second_agent['name']} | thinker_plan | settled (cancelled) |", reason='the cancelled row did not show as settled (cancelled)')
         evidence['cancelConfirmed'] = True
         with sqlite3.connect(f'file:{temp / "graph.db"}?mode=ro', uri=True) as db:
             evidence['cancelledRunStatus'] = db.execute('SELECT status FROM state WHERE run_id=?', (evidence['secondRunId'],)).fetchone()[0]

@@ -255,7 +255,7 @@ test("agent list opens on registered dispatch only", async () => {
 		assert.ok(events.includes("runtime_attempt_registered"));
 		assert.equal(agentListState().open, true);
 		assert.deepEqual(agentListState().entries.map((e) => [e.number, e.attemptKey]), [[1, planned.attemptKey]]);
-		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers$/);
+		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: number then Enter opens details, s shows or hides settled, r refresh, q close, Esc cancels the run's workers$/);
 		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no stream\)$/);
 	} finally { process.env = originalEnv; }
 });
@@ -336,6 +336,8 @@ test("settled and superseded entries retain their own details", async () => {
 	noteRegisteredAttempt(store, tui.ctx, { attemptKey: first.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	store.settleRuntimeAttempt({ attemptKey: first.attemptKey, outcome: { kind: "failed", exitCode: 1, error: "fixture failure" } });
 	assert.deepEqual(tui.input("r"), { consume: true });
+	assert.equal(tui.last()![1], "settled (1): 1 | s shows them", "a settled worker folds into the summary with its number");
+	assert.deepEqual(tui.input("s"), { consume: true });
 	assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| settled \(failed 1\) \|/, "a settled candidate is labeled settled, never running");
 	const parked = store.retryRuntimeAttempt({ runId: run.runId, operationId: run.operationId });
 	const retry = parked.state.status === "active" ? parked : store.retryRuntimeAttempt({ runId: run.runId, operationId: run.operationId, approved: true });
@@ -573,7 +575,10 @@ test("Escape then Enter cancels every running worker of the run in view and only
 		assert.equal(store.runtimeAttempt(keep.attemptKey).outcome, null);
 		assert.equal(agentListState().confirming, null);
 		assert.match(tui.last()![1]!, /^1\. worker-keep \| thinker_split \| running \|/);
+		assert.equal(tui.last()![2], "settled (1): 2 | s shows them", "the cancelled worker folds into the settled summary with its number intact");
+		assert.deepEqual(tui.input("s"), { consume: true });
 		assert.match(tui.last()![2]!, /^2\. worker-stop \| thinker_split \| settled \(cancelled\) \|/, "the cancelled worker reads settled (cancelled) with its number intact");
+		assert.deepEqual(tui.input("s"), { consume: true });
 		assert.deepEqual(tui.input(ESCAPE), { consume: true });
 		assert.match(tui.notices.at(-1)!, new RegExp(`^run ${b.runId} has no running workers to cancel$`), "a cancelled run has nothing left to cancel");
 		// Selecting the other run's worker targets that run.
@@ -636,4 +641,33 @@ test("the follow view cancels its run through the same confirmation", async () =
 		assert.deepEqual(handler!("q"), { consume: true });
 		store.close();
 	} finally { process.env = originalEnv; }
+});
+
+test("settled rows collapse into a summary and stay selectable by number", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-collapse-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const tui = fakeTui();
+	const runs = [newRun(store, "c1"), newRun(store, "c2"), newRun(store, "c3")];
+	const workers = runs.map((run, index) => registerWorker(store, dir, run.runId, run.operationId, `worker-${index + 1}`));
+	workers.forEach((worker, index) => noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: runs[index]!.runId, operationId: runs[index]!.operationId }, 60, actions));
+	assert.equal(tui.last()!.length, 4, "three running rows, no summary");
+	store.settleRuntimeAttempt({ attemptKey: workers[0]!.attemptKey, outcome: { kind: "exited", exitCode: 0 } });
+	store.settleRuntimeAttempt({ attemptKey: workers[2]!.attemptKey, outcome: { kind: "failed", exitCode: 1, error: "fixture" } });
+	assert.deepEqual(tui.input("r"), { consume: true });
+	assert.equal(tui.last()!.length, 3, "one running row plus one summary line");
+	assert.equal(tui.last()![2], "settled (2): 1, 3 | s shows them", "settled workers fold into one line naming their numbers");
+	assert.match(tui.last()![1]!, /^2\. worker-2 \| thinker_split \| running \|/, "the running worker keeps its own number");
+	select(tui, 3);
+	assert.match(tui.last()![0]!, /^agent 3: worker-3 \|/, "a collapsed number still opens its details");
+	assert.match(tui.last()![3]!, /^process settled \(failed 1\)/);
+	assert.deepEqual(tui.input("q"), { consume: true });
+	assert.deepEqual(tui.input("s"), { consume: true });
+	assert.equal(agentListState().showSettled, true);
+	assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| settled \(exited 0\) \|/);
+	assert.match(tui.last()![2]!, /^2\. worker-2 \| thinker_split \| running \|/);
+	assert.match(tui.last()![3]!, /^3\. worker-3 \| thinker_split \| settled \(failed 1\) \|/, "shown settled rows keep their original order and numbers");
+	assert.equal(tui.last()!.some((line) => line.startsWith("settled (")), false, "no summary while settled rows are shown");
+	assert.deepEqual(tui.input("s"), { consume: true });
+	assert.equal(tui.last()!.at(-1), "settled (2): 1, 3 | s shows them");
+	store.close();
 });
