@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { matchesKey, parseKey } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, type RuntimeAttempt, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -461,6 +461,7 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 	};
 	const unsubscribe = ctx.ui.onTerminalInput((data) => {
 		if (ctx.ui.getEditorText?.()) return undefined;
+		if (isKeyRelease(data)) return undefined;
 		const key = parseKey(data) ?? data;
 		if (/^[0-9]$/.test(key)) {
 			if (selected) return undefined;

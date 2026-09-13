@@ -761,3 +761,43 @@ test("the follow view opens the sole running worker on Enter and walks several w
 		store.close();
 	} finally { process.env = originalEnv; }
 });
+
+test("key release events are never actions in the list or the follow view", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-release-")); dirs.push(dir);
+	const originalEnv = { ...process.env };
+	process.env.PI_GRAPH_WATCH_INTERVAL_MS = "60";
+	try {
+		const tool = await harnessWith(dir, async () => { throw new Error("no delegate execution expected"); });
+		const graph = commands.get("graph")!;
+		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+		const tui = fakeTui();
+		const run = newRun(store, "release");
+		const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-rel");
+		noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
+		// Kitty keyboard protocol: CSI <code>;<mods>:3 u is a release of that key.
+		const ESC_RELEASE = "\u001b[27;1:3u"; const ENTER_RELEASE = "\u001b[13;1:3u"; const Q_RELEASE = "\u001b[113;1:3u"; const DOWN_RELEASE = "\u001b[1;1:3B";
+		assert.deepEqual(tui.input(ESCAPE), { consume: true });
+		assert.ok(agentListState().confirming, "Escape press asks to cancel");
+		assert.equal(tui.input(ESC_RELEASE), undefined, "the Escape release is ignored");
+		assert.ok(agentListState().confirming, "the prompt survives the release");
+		assert.equal(tui.input(Q_RELEASE), undefined); assert.ok(agentListState().confirming);
+		assert.equal(tui.input(ENTER_RELEASE), undefined); assert.ok(agentListState().confirming, "an Enter release does not confirm either");
+		assert.deepEqual(cancelRequests, []);
+		assert.deepEqual(tui.input("q"), { consume: true }); assert.equal(agentListState().confirming, null);
+		assert.equal(tui.input(DOWN_RELEASE), undefined);
+		assert.equal(agentListState().open, true);
+
+		const init = parsed(await tool.execute("init", { op: "init", story: "release-follow", graph: "research", task: "Investigate", modelPolicy: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "fixture" } }, undefined, () => {}, {} as ExtensionContext));
+		registerWorker(store, dir, init.state.runId, init.next.operations[0].id, "worker-f");
+		const widgets: (string[] | undefined)[] = []; let handler: ((data: string) => unknown) | null = null; let unsubscribed = 0;
+		const ctx = { mode: "tui", ui: { getEditorText: () => "", notify: () => {}, setWidget: (_k: string, c: string[] | undefined) => widgets.push(c), onTerminalInput: (h: (data: string) => unknown) => { handler = h; return () => { unsubscribed += 1; }; } } } as unknown as ExtensionContext;
+		await graph.handler(`watch ${init.state.runId} --follow`, ctx);
+		assert.deepEqual(handler!(ESCAPE), { consume: true });
+		assert.equal(handler!(ESC_RELEASE), undefined);
+		assert.ok(widgets.at(-1)!.at(-1)!.startsWith("cancel run "), "the follow view's prompt survives the release too");
+		assert.equal(handler!(Q_RELEASE), undefined);
+		assert.equal(unsubscribed, 0, "a q release does not close the follow view");
+		assert.deepEqual(handler!("q"), { consume: true }); assert.deepEqual(handler!("q"), { consume: true });
+		store.close();
+	} finally { process.env = originalEnv; }
+});

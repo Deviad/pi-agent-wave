@@ -61,6 +61,7 @@ Escape therefore no longer closes a view or steps back; `q` does both. Escape cl
 ## Verified behaviours and gotchas
 
 - The first terminal run showed Escape reaching the editor rather than the list: Pi enables the CSI-u keyboard protocol, under which Escape (and Enter) arrive as escape sequences, not the bare byte a string compare expects. Both views now match keys through pi-tui's `matchesKey` and `parseKey`, which accept the legacy and CSI-u encodings alike; the unit doubles still send bare bytes and pass.
+- Operator report after release: one Escape press showed the prompt and it was immediately "aborted; nothing was cancelled". The terminal reports key releases under the kitty keyboard protocol (`CSI 27;1:3 u`), and pi-tui's `matchesKey` accepts a release as the key. Both views now ignore `isKeyRelease` events before matching anything; a unit test feeds the release sequences for Escape, Enter, q and an arrow. The harness cannot reproduce this because Herdr and tmux send no release events.
 - Escape must be matched before any other key, because under CSI-u a letter can also arrive as a sequence; `parseKey` yields the plain letter for `q` and `r`.
 - The fake acpx fixture answers the cancel script's `cancel`, `close` and `status` calls, so the terminal proof runs the real structured cancel path and settles the attempt from its report.
 

@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { matchesKey, parseKey } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { summarizeAcpxStream } from "./lib/acpx-render.ts";
@@ -314,6 +314,10 @@ function handleInput(data: string): { consume: true } | undefined {
 	// reach the list only while the editor is empty (2026-09-13 terminal proof: digits, r and q vanished from a
 	// typed /graph command).
 	if (current.ctx.ui.getEditorText?.()) return undefined;
+	// Under the kitty keyboard protocol a terminal may report the release of a key as well as its press, and the
+	// release still matches the key (2026-09-13: one Escape press showed the cancel prompt and its release
+	// aborted it). Releases are never actions here.
+	if (isKeyRelease(data)) return undefined;
 	// Keys are matched through pi-tui so the CSI-u encodings Pi enables (Escape as an escape sequence, not a
 	// bare byte) are recognised the same as their legacy forms (2026-09-13 terminal proof: a bare-byte compare
 	// let Escape fall through to the editor).
