@@ -11,7 +11,7 @@ describe("package manifest", () => {
 		expect(basename(ROOT)).toBe("pi-agent-wave");
 		expect(manifest).toMatchObject({
 			name: "@dpugliese/pi-agent-wave",
-			version: "0.1.0",
+			version: "0.2.0",
 			type: "module",
 			license: "MIT",
 			keywords: expect.arrayContaining(["pi-package"]),
