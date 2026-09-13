@@ -5,3 +5,5 @@ extensions/pi-agent-wave/node_modules/
 agent-output/
 __pycache__/
 *.pyc
+.claude/
+.planning/
