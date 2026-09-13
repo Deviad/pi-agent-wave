@@ -26,7 +26,7 @@ def test_terminal_dispatch_registers_fake_worker():
     assert result.returncode == 0, result.stdout + result.stderr
     for key in ('dispatched', 'registeredEventSeen', 'workerTabSeen', 'fixtureWorkerSeen', 'selectedModelIsFixture', 'defaultSessionUnchanged',
                 'listOpened', 'detailOpened', 'detailRefreshed', 'backToList', 'appendedSecondRun', 'firstNumberStable',
-                'detailWithoutHerdrTarget', 'settledDetail', 'closedByOperator', 'reopened', 'followDetailOpened', 'followClosed', 'cancelPromptShown', 'cancelAborted', 'cancelConfirmed', 'settledCollapsed', 'settledToggled'):
+                'detailWithoutHerdrTarget', 'settledDetail', 'closedByOperator', 'reopened', 'followDetailOpened', 'followClosed', 'cancelPromptShown', 'cancelAborted', 'cancelConfirmed', 'settledCollapsed', 'settledToggled', 'enterOpensSole', 'arrowsSelect'):
         assert evidence[key] is True, key
     assert evidence['collectReply'].startswith('FAKE_SUPERVISOR_COLLECTED'), evidence['collectReply']
     assert evidence['cancelledRunStatus'] == 'cancelled', evidence['cancelledRunStatus']

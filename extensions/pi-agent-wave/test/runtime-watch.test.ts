@@ -107,7 +107,7 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, opens 
 
 		await graph.handler(`watch ${runId} --follow`, ctx);
 		assert.ok(handler, "follow subscribes to terminal input");
-		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\| node=thinker_split \\| status=active \\| keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers$`));
+		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\| node=thinker_split \\| status=active \\| keys: Enter opens the running worker or focuses the list, up/down move, number then Enter opens by number, r refresh, q close, Esc cancels the run's workers$`));
 		assert.match(widgets.at(-1)![1]!, /no running workers/);
 
 		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
@@ -255,7 +255,7 @@ test("agent list opens on registered dispatch only", async () => {
 		assert.ok(events.includes("runtime_attempt_registered"));
 		assert.equal(agentListState().open, true);
 		assert.deepEqual(agentListState().entries.map((e) => [e.number, e.attemptKey]), [[1, planned.attemptKey]]);
-		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: number then Enter opens details, s shows or hides settled, r refresh, q close, Esc cancels the run's workers$/);
+		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: Enter opens the running worker or focuses the list, up\/down move, number then Enter opens by number, s shows or hides settled, r refresh, q close, Esc cancels the run's workers$/);
 		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no stream\)$/);
 	} finally { process.env = originalEnv; }
 });
@@ -670,4 +670,94 @@ test("settled rows collapse into a summary and stay selectable by number", async
 	assert.deepEqual(tui.input("s"), { consume: true });
 	assert.equal(tui.last()!.at(-1), "settled (2): 1, 3 | s shows them");
 	store.close();
+});
+
+const UP = "\u001b[A";
+const DOWN = "\u001b[B";
+
+test("Enter alone opens the only running worker, and reports when none is running", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-enter-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const tui = fakeTui();
+	const runs = [newRun(store, "e1"), newRun(store, "e2")];
+	const workers = runs.map((run, index) => registerWorker(store, dir, run.runId, run.operationId, `worker-${index + 1}`));
+	workers.forEach((worker, index) => noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: runs[index]!.runId, operationId: runs[index]!.operationId }, 60, actions));
+	store.settleRuntimeAttempt({ attemptKey: workers[0]!.attemptKey, outcome: { kind: "exited", exitCode: 0 } });
+	assert.deepEqual(tui.input(ENTER), { consume: true });
+	assert.match(tui.last()![0]!, /^agent 2: worker-2 \|/, "the sole running worker opens without a number, whatever its number is");
+	assert.deepEqual(tui.input("q"), { consume: true });
+	assert.equal(agentListState().cursor, null, "opening the sole worker leaves the list unfocused");
+	store.settleRuntimeAttempt({ attemptKey: workers[1]!.attemptKey, outcome: { kind: "exited", exitCode: 0 } });
+	assert.deepEqual(tui.input(ENTER), { consume: true });
+	assert.match(tui.notices.at(-1)!, /^no running worker to open; type a settled worker's number/);
+	assert.equal(agentListState().selected, null);
+	store.close();
+});
+
+test("Enter with several running workers focuses the list and the arrows choose", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-arrows-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const tui = fakeTui();
+	const runs = [newRun(store, "a1"), newRun(store, "a2"), newRun(store, "a3")];
+	const workers = runs.map((run, index) => registerWorker(store, dir, run.runId, run.operationId, `worker-${index + 1}`));
+	workers.forEach((worker, index) => noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: runs[index]!.runId, operationId: runs[index]!.operationId }, 60, actions));
+	assert.equal(tui.input(UP), undefined, "arrows reach the editor while the list is not focused");
+	assert.deepEqual(tui.input(ENTER), { consume: true });
+	assert.deepEqual(agentListState().cursor, { kind: "row", number: 1 });
+	assert.match(tui.last()![0]!, /\| focused: up\/down move, Enter opens, q unfocuses, Esc cancels the run's workers$/, "focus is visible in the header");
+	assert.match(tui.last()![1]!, /^\u203a 1\. worker-1 \|/, "the cursor marks the first running row");
+	assert.match(tui.last()![2]!, /^  2\. worker-2 \|/);
+	assert.deepEqual(tui.input(DOWN), { consume: true });
+	assert.match(tui.last()![2]!, /^\u203a 2\. worker-2 \|/);
+	assert.deepEqual(tui.input(UP), { consume: true }); assert.deepEqual(tui.input(UP), { consume: true });
+	assert.match(tui.last()![1]!, /^\u203a 1\. worker-1 \|/, "the cursor stops at the top");
+	assert.deepEqual(tui.input(DOWN), { consume: true });
+	assert.deepEqual(tui.input(ENTER), { consume: true });
+	assert.match(tui.last()![0]!, /^agent 2: worker-2 \|/, "Enter opens the row under the cursor");
+	assert.deepEqual(tui.input("q"), { consume: true });
+	assert.deepEqual(agentListState().cursor, { kind: "row", number: 2 }, "leaving details keeps the cursor where it was");
+	assert.match(tui.last()![2]!, /^\u203a 2\. worker-2 \|/);
+	// The cursor follows the worker: a row above it folding away does not move it.
+	store.settleRuntimeAttempt({ attemptKey: workers[0]!.attemptKey, outcome: { kind: "exited", exitCode: 0 } });
+	assert.deepEqual(tui.input("r"), { consume: true });
+	assert.match(tui.last()![1]!, /^\u203a 2\. worker-2 \|/, "worker 2 is now the first visible row and still under the cursor");
+	assert.match(tui.last()![3]!, /^  settled \(1\): 1 \| s shows them$/);
+	assert.deepEqual(tui.input(DOWN), { consume: true }); assert.deepEqual(tui.input(DOWN), { consume: true });
+	assert.deepEqual(agentListState().cursor, { kind: "summary" });
+	assert.match(tui.last()![3]!, /^\u203a settled \(1\): 1 \| s shows them$/, "the summary line is a cursor stop");
+	assert.deepEqual(tui.input(ENTER), { consume: true });
+	assert.equal(agentListState().showSettled, true, "Enter on the summary unfolds the settled rows");
+	assert.deepEqual(agentListState().cursor, { kind: "row", number: 1 });
+	assert.match(tui.last()![1]!, /^\u203a 1\. worker-1 \| thinker_split \| settled \(exited 0\)/);
+	assert.deepEqual(tui.input("q"), { consume: true });
+	assert.equal(agentListState().cursor, null, "q unfocuses");
+	assert.match(tui.last()![0]!, /\| keys: Enter opens the running worker or focuses the list/);
+	assert.deepEqual(tui.input("q"), { consume: true });
+	assert.equal(agentListState().open, false, "the next q closes");
+	store.close();
+});
+
+test("the follow view opens the sole running worker on Enter and walks several with the arrows", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "follow-arrows-")); dirs.push(dir);
+	const originalEnv = { ...process.env };
+	process.env.PI_GRAPH_WATCH_INTERVAL_MS = "60";
+	try {
+		const tool = await harnessWith(dir, async () => { throw new Error("no delegate execution expected"); });
+		const graph = commands.get("graph")!;
+		const init = parsed(await tool.execute("init", { op: "init", story: "follow-arrows", graph: "research", task: "Investigate", modelPolicy: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "fixture" } }, undefined, () => {}, {} as ExtensionContext));
+		const runId: string = init.state.runId; const operationId: string = init.next.operations[0].id;
+		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+		registerWorker(store, dir, runId, operationId, "worker-only");
+		const widgets: (string[] | undefined)[] = []; const notices: string[] = []; let handler: ((data: string) => unknown) | null = null;
+		const ctx = { mode: "tui", ui: { getEditorText: () => "", notify: (m: string) => notices.push(m), setWidget: (_k: string, c: string[] | undefined) => widgets.push(c), onTerminalInput: (h: (data: string) => unknown) => { handler = h; return () => {}; } } } as unknown as ExtensionContext;
+		await graph.handler(`watch ${runId} --follow`, ctx);
+		assert.match(widgets.at(-1)![0]!, /keys: Enter opens the running worker or focuses the list/);
+		assert.equal(handler!(DOWN), undefined, "arrows pass through while unfocused");
+		assert.deepEqual(handler!(ENTER), { consume: true });
+		assert.match(widgets.at(-1)![0]!, /^agent 1: worker-only \|/, "Enter alone opens the only running worker");
+		assert.deepEqual(handler!("q"), { consume: true });
+		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\|`));
+		assert.deepEqual(handler!("q"), { consume: true });
+		store.close();
+	} finally { process.env = originalEnv; }
 });

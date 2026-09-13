@@ -85,6 +85,22 @@ interface AgentListSession {
 	cancelling: boolean;
 	/** Settled rows are collapsed into one summary line unless the operator toggles them with s. */
 	showSettled: boolean;
+	/** The focused row while the operator walks the list with the arrows; null when the list is not focused. */
+	cursor: CursorItem | null;
+}
+
+/** What the cursor can rest on: a worker's row, or the folded settled summary (Enter unfolds it). */
+export type CursorItem = { readonly kind: "row"; readonly number: number } | { readonly kind: "summary" };
+
+/** The items in display order the cursor may visit. */
+export function visibleItems(rows: readonly AgentListRow[], showSettled: boolean): CursorItem[] {
+	const items: CursorItem[] = rows.filter((row) => row.running || showSettled).map((row) => ({ kind: "row", number: row.number }));
+	if (!showSettled && rows.some((row) => !row.running)) items.push({ kind: "summary" });
+	return items;
+}
+
+function sameItem(a: CursorItem | null, b: CursorItem): boolean {
+	return a !== null && a.kind === b.kind && (a.kind !== "row" || b.kind !== "row" || a.number === b.number);
 }
 
 const entries: AgentListEntry[] = [];
@@ -195,7 +211,8 @@ export function listRows(store: GraphStore): AgentListRow[] {
 	});
 }
 
-export const LIST_KEYS = "keys: number then Enter opens details, s shows or hides settled, r refresh, q close, Esc cancels the run's workers";
+export const LIST_KEYS = "keys: Enter opens the running worker or focuses the list, up/down move, number then Enter opens by number, s shows or hides settled, r refresh, q close, Esc cancels the run's workers";
+export const FOCUSED_KEYS = "focused: up/down move, Enter opens, q unfocuses, Esc cancels the run's workers";
 
 /** The one line settled workers fold into; their numbers stay valid and still open details. */
 export function renderSettledSummary(rows: readonly AgentListRow[]): string | null {
@@ -215,10 +232,11 @@ export function runningWorkerNames(store: GraphStore, runId: string): string[] {
 	return store.operations(runId, true).filter((operation) => operation.status === "running").map((operation) => agents.find((agent) => agent.id === operation.agent_id)?.name ?? operation.id);
 }
 
-export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null, showSettled = false): string[] {
-	const lines = [`agents (${rows.length}) | ${LIST_KEYS}`];
-	for (const row of rows) if (row.running || showSettled) lines.push(`${row.number}. ${row.agentName} | ${row.node} | ${row.state} | ${row.model} | ${row.activity}`);
-	if (!showSettled) { const summary = renderSettledSummary(rows); if (summary) lines.push(summary); }
+export function renderAgentList(rows: readonly AgentListRow[], pending: string, confirmation: CancelConfirmation | null = null, showSettled = false, cursor: CursorItem | null = null): string[] {
+	const lines = [`agents (${rows.length}) | ${cursor ? FOCUSED_KEYS : LIST_KEYS}`];
+	const mark = (item: CursorItem) => (cursor ? (sameItem(cursor, item) ? "\u203a " : "  ") : "");
+	for (const row of rows) if (row.running || showSettled) lines.push(`${mark({ kind: "row", number: row.number })}${row.number}. ${row.agentName} | ${row.node} | ${row.state} | ${row.model} | ${row.activity}`);
+	if (!showSettled) { const summary = renderSettledSummary(rows); if (summary) lines.push(`${mark({ kind: "summary" })}${summary}`); }
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
 	if (confirmation) lines.push(...renderCancelConfirmation(confirmation));
 	return lines;
@@ -252,13 +270,19 @@ function draw(): void {
 	let content: string[];
 	if (current.selected !== null) {
 		const entry = entries.find((item) => item.number === current.selected);
-		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled); }
+		if (!entry) { current.selected = null; content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled, current.cursor); }
 		else {
 			try { content = renderAgentDetail(attemptDetail(current.store, entry), current.confirming); }
 			catch (error) { content = [`agent ${entry.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | ${DETAIL_KEYS}`, ...(current.confirming ? renderCancelConfirmation(current.confirming) : [])]; }
 		}
 	} else {
-		content = renderAgentList(listRows(current.store), current.pending, current.confirming, current.showSettled);
+		const rows = listRows(current.store);
+		// The cursor follows the worker, not the position: a row that folded away moves the cursor to the summary.
+		if (current.cursor) {
+			const items = visibleItems(rows, current.showSettled);
+			if (!items.some((item) => sameItem(current.cursor, item))) current.cursor = items.find((item) => item.kind === "summary") ?? items[0] ?? null;
+		}
+		content = renderAgentList(rows, current.pending, current.confirming, current.showSettled, current.cursor);
 	}
 	current.ctx.ui.setWidget(AGENT_LIST_WIDGET, content);
 	if (!anyRunning(current.store) && current.timer) { clearInterval(current.timer); current.timer = null; }
@@ -302,11 +326,36 @@ function handleInput(data: string): { consume: true } | undefined {
 	}
 	if (matchesKey(data, "enter")) {
 		if (current.confirming) { confirmCancellation(current); return { consume: true }; }
-		if (!current.pending) return undefined;
-		const number = Number(current.pending);
-		current.pending = "";
-		if (entries.some((entry) => entry.number === number)) current.selected = number;
-		else current.ctx.ui.notify(`no agent ${number} in the list`, "warning");
+		if (current.pending) {
+			const number = Number(current.pending);
+			current.pending = "";
+			if (entries.some((entry) => entry.number === number)) current.selected = number;
+			else current.ctx.ui.notify(`no agent ${number} in the list`, "warning");
+			draw();
+			return { consume: true };
+		}
+		if (current.selected !== null) return { consume: true };
+		// Enter alone (operator decision 2026-09-13): open the only running worker, or focus the list when several
+		// are running so the arrows choose; numbers are labels, not something to type as the session grows.
+		if (current.cursor) {
+			if (current.cursor.kind === "row") current.selected = current.cursor.number;
+			else { current.showSettled = true; const first = listRows(current.store).find((row) => !row.running); current.cursor = first ? { kind: "row", number: first.number } : null; }
+			draw();
+			return { consume: true };
+		}
+		const running = listRows(current.store).filter((row) => row.running);
+		if (running.length === 1) current.selected = running[0]!.number;
+		else if (running.length === 0) current.ctx.ui.notify("no running worker to open; type a settled worker's number to see its details", "info");
+		else current.cursor = { kind: "row", number: running[0]!.number };
+		draw();
+		return { consume: true };
+	}
+	if (matchesKey(data, "up") || matchesKey(data, "down")) {
+		if (!current.cursor || current.selected !== null) return undefined;
+		const items = visibleItems(listRows(current.store), current.showSettled);
+		const index = items.findIndex((item) => sameItem(current.cursor, item));
+		const next = Math.min(items.length - 1, Math.max(0, (index < 0 ? 0 : index) + (matchesKey(data, "down") ? 1 : -1)));
+		current.cursor = items[next] ?? null;
 		draw();
 		return { consume: true };
 	}
@@ -328,6 +377,7 @@ function handleInput(data: string): { consume: true } | undefined {
 		if (current.pending) { current.pending = ""; draw(); return { consume: true }; }
 		if (current.confirming) { abortCancellation(current); return { consume: true }; }
 		if (current.selected !== null) { current.selected = null; draw(); return { consume: true }; }
+		if (current.cursor) { current.cursor = null; draw(); return { consume: true }; }
 		closeAgentList("closed by operator");
 		return { consume: true };
 	}
@@ -367,7 +417,7 @@ function confirmCancellation(current: AgentListSession): void {
 function open(store: GraphStore, ctx: ExtensionContext, intervalMs: number, actions: AgentListActions): void {
 	if (session) return;
 	const unsubscribe = ctx.ui.onTerminalInput(handleInput);
-	session = { ctx, store, intervalMs, actions, timer: null, unsubscribe, selected: null, pending: "", confirming: null, cancelling: false, showSettled: false };
+	session = { ctx, store, intervalMs, actions, timer: null, unsubscribe, selected: null, pending: "", confirming: null, cancelling: false, showSettled: false, cursor: null };
 	ensureTimer();
 	draw();
 }
@@ -395,8 +445,8 @@ export function reopenAgentList(store: GraphStore, ctx: ExtensionContext, interv
 }
 
 /** Read-only view of the session state, for tests and diagnostics. */
-export function agentListState(): { entries: readonly AgentListEntry[]; open: boolean; selected: number | null; pending: string; timerActive: boolean; confirming: CancelConfirmation | null; showSettled: boolean } {
-	return { entries: [...entries], open: session !== null, selected: session?.selected ?? null, pending: session?.pending ?? "", timerActive: session !== null && session.timer !== null, confirming: session?.confirming ?? null, showSettled: session?.showSettled ?? false };
+export function agentListState(): { entries: readonly AgentListEntry[]; open: boolean; selected: number | null; pending: string; timerActive: boolean; confirming: CancelConfirmation | null; showSettled: boolean; cursor: CursorItem | null } {
+	return { entries: [...entries], open: session !== null, selected: session?.selected ?? null, pending: session?.pending ?? "", timerActive: session !== null && session.timer !== null, confirming: session?.confirming ?? null, showSettled: session?.showSettled ?? false, cursor: session?.cursor ?? null };
 }
 
 /** Test-only: forgets every entry and closes the view without notifying. */

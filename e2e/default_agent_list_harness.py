@@ -62,6 +62,7 @@ def main():
                     listOpened=False, detailOpened=False, detailRefreshed=False, backToList=False, appendedSecondRun=False, firstNumberStable=False,
                     secondRunId=None, detailWithoutHerdrTarget=False, collectReply=None, settledDetail=False, closedByOperator=False, reopened=False,
                     followDetailOpened=False, followClosed=False, cancelPromptShown=False, cancelAborted=False, cancelConfirmed=False, cancelledRunStatus=None, settledCollapsed=False, settledToggled=False,
+                    enterOpensSole=False, arrowsSelect=False,
                     fakeSupervisorLogPath=str(log), capturesDir=str(captures), capturesSha256='',
                     secretScanFindings=0, cleanup={}, failureReason=None)
     counter = 0
@@ -273,7 +274,7 @@ def main():
         def screen_with(*needles, timeout=30, reason='expected screen not reached'):
             return wait_for(lambda: (s if all(needle in s for needle in needles) else None) if (s := capture()) else None, timeout, reason)
 
-        screen_with('agents (1) | keys: number then Enter opens details', f'1. {first_name} |', reason='agent list did not open after registration')
+        screen_with('agents (1) | keys: Enter opens the running worker', f'1. {first_name} |', reason='agent list did not open after registration')
         evidence['listOpened'] = True
         choose(1)
         screen_with(f'agent 1: {first_name} | keys: q back to list', 'process running', reason='detail view did not open on 1 then Enter')
@@ -284,6 +285,13 @@ def main():
         key('q')
         screen_with('agents (1) |', reason='q did not return from detail to the list')
         evidence['backToList'] = True
+
+        # Enter with nothing typed opens the only running worker, whatever its number.
+        key('enter')
+        screen_with(f'agent 1: {first_name} |', reason='Enter alone did not open the sole running worker')
+        evidence['enterOpensSole'] = True
+        key('q')
+        screen_with('agents (1) |', reason='q did not return to the list after the Enter-alone check')
 
         # A worker from a second run started in the same session appends as 2 without renumbering 1.
         send('/delegate --policy auto Add a second README sentence')
@@ -310,6 +318,19 @@ def main():
         screen_with('agents (2) |', f'1. {first_name} |', f"2. {second_agent['name']} |", reason='second worker did not append to the list')
         evidence['appendedSecondRun'] = True
         evidence['firstNumberStable'] = True
+
+        # With two running workers Enter focuses the list; the arrows choose and Enter opens the marked row.
+        key('enter')
+        screen_with('| focused: up/down move, Enter opens, q unfocuses', f'\u203a 1. {first_name} |', reason='Enter did not focus the list with the cursor on the first running row')
+        key('down')
+        screen_with(f"\u203a 2. {second_agent['name']} |", reason='down did not move the cursor to the second row')
+        key('enter')
+        screen_with(f"agent 2: {second_agent['name']} |", reason='Enter did not open the row under the cursor')
+        evidence['arrowsSelect'] = True
+        key('q')
+        screen_with('| focused:', reason='q did not return to the focused list')
+        key('q')
+        wait_for(lambda: (s := capture()) and 'agents (2) |' in s and '| focused:' not in s, 15, 'q did not unfocus the list')
 
         # The first worker's Herdr tab disappears; its details still open and no focus command runs.
         herdr('tab', 'close', agent['tab_id'])

@@ -386,11 +386,12 @@ function listActions(graphStore: GraphStore, pi: ExtensionAPI): AgentListActions
 }
 
 /** The follow view: the watch overview redrawn in a widget while the operator holds it open; a number plus Enter opens that worker's details. */
-export function renderFollow(view: WatchView, pending = "", confirmation: CancelConfirmation | null = null): string[] {
-	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | keys: number then Enter opens details, r refresh, q close, Esc cancels the run's workers`];
+export function renderFollow(view: WatchView, pending = "", confirmation: CancelConfirmation | null = null, cursorIndex: number | null = null): string[] {
+	const lines = [`watch ${view.runId} | node=${view.node} | status=${view.status} | ${cursorIndex === null ? "keys: Enter opens the running worker or focuses the list, up/down move, number then Enter opens by number, r refresh, q close, Esc cancels the run's workers" : "focused: up/down move, Enter opens, q unfocuses, Esc cancels the run's workers"}`];
 	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
 	view.agents.forEach((agent, index) => {
-		lines.push(`${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
+		const mark = cursorIndex === null ? "" : cursorIndex === index ? "\u203a " : "  ";
+		lines.push(`${mark}${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
 		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
 	});
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
@@ -433,13 +434,17 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 	let selected: { number: number; attemptKey: string; operationId: string } | null = null;
 	let confirming: CancelConfirmation | null = null;
 	let cancelling = false;
+	let cursorOperation: string | null = null;
+	const cursorIndex = () => (cursorOperation === null ? null : latest.agents.findIndex((agent) => agent.operationId === cursorOperation));
 	const draw = () => {
 		latest = watchRun(graphStore, runId);
+		// The cursor follows the worker; when its operation leaves the running set the cursor moves to the first row.
+		if (cursorOperation !== null && cursorIndex() === -1) cursorOperation = latest.agents[0]?.operationId ?? null;
 		if (selected) {
 			try { ctx.ui.setWidget(FOLLOW_WIDGET, renderAgentDetail(attemptDetail(graphStore, { number: selected.number, attemptKey: selected.attemptKey, runId, operationId: selected.operationId }), confirming)); }
 			catch (error) { ctx.ui.setWidget(FOLLOW_WIDGET, [`agent ${selected.number}: details unavailable (${error instanceof Error ? error.message : String(error)}) | keys: q back to list, r refresh, Esc cancels the run's workers`, ...(confirming ? renderCancelConfirmation(confirming) : [])]); }
 		} else {
-			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending, confirming));
+			ctx.ui.setWidget(FOLLOW_WIDGET, renderFollow(latest, pending, confirming, cursorIndex()));
 		}
 		if (latest.status !== "active" && followSession?.timer) { clearInterval(followSession.timer); followSession.timer = null; }
 	};
@@ -462,14 +467,29 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 			pending += key; draw();
 			return { consume: true };
 		}
+		const openAgent = (index: number) => {
+			const agent = latest.agents[index];
+			const attempt = agent ? graphStore.runtimeAttemptByOperation(agent.operationId) : null;
+			if (!agent || !attempt) ctx.ui.notify(`no worker ${index + 1} in the watch view`, "warning");
+			else selected = { number: index + 1, attemptKey: attempt.attemptKey, operationId: agent.operationId };
+		};
 		if (matchesKey(data, "enter")) {
 			if (confirming) { confirmCancellation(); return { consume: true }; }
-			if (!pending) return undefined;
-			const number = Number(pending); pending = "";
-			const agent = latest.agents[number - 1];
-			const attempt = agent ? graphStore.runtimeAttemptByOperation(agent.operationId) : null;
-			if (!agent || !attempt) ctx.ui.notify(`no worker ${number} in the watch view`, "warning");
-			else selected = { number, attemptKey: attempt.attemptKey, operationId: agent.operationId };
+			if (pending) { const number = Number(pending); pending = ""; openAgent(number - 1); draw(); return { consume: true }; }
+			if (selected) return { consume: true };
+			const index = cursorIndex();
+			if (index !== null && index >= 0) openAgent(index);
+			else if (latest.agents.length === 1) openAgent(0);
+			else if (latest.agents.length === 0) ctx.ui.notify(`run ${runId} has no running worker to open`, "info");
+			else cursorOperation = latest.agents[0]!.operationId;
+			draw();
+			return { consume: true };
+		}
+		if (matchesKey(data, "up") || matchesKey(data, "down")) {
+			const index = cursorIndex();
+			if (index === null || selected) return undefined;
+			const next = Math.min(latest.agents.length - 1, Math.max(0, (index < 0 ? 0 : index) + (matchesKey(data, "down") ? 1 : -1)));
+			cursorOperation = latest.agents[next]?.operationId ?? null;
 			draw();
 			return { consume: true };
 		}
@@ -486,6 +506,7 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 			if (pending) { pending = ""; draw(); return { consume: true }; }
 			if (confirming) { abortCancellation(); return { consume: true }; }
 			if (selected) { selected = null; draw(); return { consume: true }; }
+			if (cursorOperation !== null) { cursorOperation = null; draw(); return { consume: true }; }
 			stopFollow("closed by operator");
 			return { consume: true };
 		}
