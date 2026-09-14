@@ -42,6 +42,39 @@ export class RuntimeContentStore {
 		} finally { closeSync(fd); }
 	}
 
+	/**
+	 * Reads at most `length` bytes starting at `start` while verifying the whole file's digest; the rest streams
+	 * through the hash without being retained. Callers use it for bounded previews of content of any size.
+	 */
+	readSlice(reference: RuntimeContent, start: number, length: number): Buffer {
+		const content = parseRuntimeContent(reference);
+		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0) throw new Error("runtime content slice must be non-negative");
+		const from = Math.min(start, content.bytes);
+		const to = Math.min(from + length, content.bytes);
+		this.directory();
+		const fd = openSync(this.path(content), constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const stat = fstatSync(fd);
+			if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) throw new Error("runtime content must be a private single regular file");
+			if (stat.size !== content.bytes) throw new Error("runtime content digest mismatch");
+			const slice = Buffer.alloc(to - from);
+			const hash = createHash("sha256");
+			const buffer = Buffer.alloc(64 * 1024);
+			let offset = 0;
+			for (;;) {
+				const count = readSync(fd, buffer, 0, buffer.length, null);
+				if (count === 0) break;
+				const chunk = buffer.subarray(0, count);
+				hash.update(chunk);
+				const overlapStart = Math.max(from, offset), overlapEnd = Math.min(to, offset + count);
+				if (overlapStart < overlapEnd) chunk.copy(slice, overlapStart - from, overlapStart - offset, overlapEnd - offset);
+				offset += count;
+			}
+			if (offset !== content.bytes || hash.digest("hex") !== content.sha256) throw new Error("runtime content digest mismatch");
+			return slice;
+		} finally { closeSync(fd); }
+	}
+
 	verify(reference: RuntimeContent): void {
 		this.directory();
 		const path = this.path(reference);

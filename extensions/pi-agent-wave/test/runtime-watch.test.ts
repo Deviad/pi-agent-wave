@@ -327,6 +327,28 @@ test("number selection shows attempt-bound live and retained details", async () 
 	store.close();
 });
 
+test("a retained answer larger than the preview limit still renders as a bounded prefix", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-long-answer-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	const tui = fakeTui();
+	const run = newRun(store, "long-answer");
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-long");
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
+	writeFileSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"), `${streamLine("Still streaming")}\n`, { mode: 0o600 });
+	// 4 KiB of ASCII, then a multi-byte character straddling the 4096-byte boundary, then far more text.
+	const body = `${"x".repeat(4095)}\u00e9${"y\n".repeat(8000)}VERDICT: PASS\n`;
+	const answer = store.retainRuntimeContent(Buffer.from(body));
+	store.settleRuntimeAttempt({ attemptKey: worker.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer, sources: [] }, observation: { sessionId: worker.identity.sessionName, requestId: "1", sessionOrigin: "created", captureStatus: "complete", manifest: null } });
+	select(tui, 1);
+	const view = tui.last()!;
+	assert.match(view[0]!, /^agent 1: worker-long \| keys: /, "the detail view renders instead of the details-unavailable fallback");
+	assert.ok(view.some((line) => line.includes("Still streaming")), view.join("\n"));
+	assert.ok(view.includes(`  (showing the first 4096 of ${answer.bytes} bytes)`), view.join("\n"));
+	const detail = attemptDetail(store, agentListState().entries[0]!);
+	assert.equal(detail.answer, "x".repeat(4095), "a multi-byte character cut at the limit is dropped, not rendered as a replacement character");
+	store.close();
+});
+
 test("settled and superseded entries retain their own details", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "agent-list-superseded-")); dirs.push(dir);
 	const store = new GraphStore({ dbPath: join(dir, "graph.db") });

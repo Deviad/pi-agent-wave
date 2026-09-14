@@ -119,6 +119,11 @@ function readTail(path: string, limit: number): string {
 	} finally { closeSync(fd); }
 }
 
+/** Decodes a byte prefix without emitting a replacement character for a multi-byte sequence cut at the boundary. */
+export function decodePrefix(bytes: Uint8Array): string {
+	return new TextDecoder("utf-8").decode(bytes, { stream: true });
+}
+
 function shortModel(model: string | null): string {
 	return model ? model.slice(model.lastIndexOf("/") + 1) : "?";
 }
@@ -168,8 +173,8 @@ export function attemptDetail(store: GraphStore, entry: AgentListEntry): AgentDe
 	const retained = attempt.candidate?.answer ?? null;
 	if (retained && retained.bytes > 0) {
 		const content = new RuntimeContentStore(store.dbPath);
-		const text = content.read(retained, ANSWER_LIMIT_BYTES).toString("utf8");
-		answer = text;
+		// A prefix, never the whole answer: a long answer must not take the rest of the detail view down with it.
+		answer = decodePrefix(content.readSlice(retained, 0, ANSWER_LIMIT_BYTES));
 		if (retained.bytes > ANSWER_LIMIT_BYTES) answerNote = `(showing the first ${ANSWER_LIMIT_BYTES} of ${retained.bytes} bytes)`;
 	} else if (attempt.processState === "running") {
 		answerNote = "(no answer yet: the worker is still running)";

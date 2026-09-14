@@ -8,6 +8,8 @@ import { GraphStore } from "../store.ts";
 import { Database } from "../sqlite.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { parseResultContract, canonical } from "../lib/runtime-results.ts";
+import { RuntimeContentStore } from "../lib/runtime-content.ts";
+import { decisionBrief } from "../index.ts";
 
 const roots: string[] = [];
 const stores: GraphStore[] = [];
@@ -224,7 +226,7 @@ test("explicit research acceptance completes the operation and advances the grap
 });
 
 test("coding acceptance requires an applied integration when the candidate carries file changes", () => {
-	const { store, run, operation, input } = fixture("build");
+	const { store, run, operation, input } = fixture("research");
 	store.beginRuntimeAttempt(input);
 	const file = store.retainRuntimeContent(Buffer.from("after"));
 	const manifestOf = (changes: unknown[]) => store.retainRuntimeContent(Buffer.from(canonical({ version: 1, attemptKey: input.identity.attemptKey, workspace: "/tmp/workspace", baseRevision: "base-1", snapshotDigest: "a".repeat(64), ownedPaths: ["note.txt"], changes, readOnly: false })));
@@ -479,4 +481,53 @@ test("an exited attempt with no candidate is a transient empty-answer failure th
 	assert.deepEqual([retried.classification, retried.exhausted, retried.operation.transient_attempts, retried.operation.status, retried.state.status], ["worker-empty-answer", false, 1, "pending", "active"]);
 	assert.match(retried.operation.last_error ?? "", /exited without a candidate \(capture incomplete\)/);
 	assert.ok(store.runtimeAttempt(input.identity.attemptKey).supersededAt);
+});
+
+test("readSlice returns a bounded, digest-verified window of content of any size", () => {
+	const { store } = fixture("research");
+	const content = new RuntimeContentStore(store.dbPath);
+	const bytes = Buffer.from(`${"a".repeat(70000)}${"b".repeat(70000)}TAIL`);
+	const reference = store.retainRuntimeContent(bytes);
+	assert.throws(() => content.read(reference, 4096), /exceeds read limit/, "the strict read still refuses oversized content");
+	assert.equal(content.readSlice(reference, 0, 4096).toString("utf8"), "a".repeat(4096));
+	assert.equal(content.readSlice(reference, 69998, 4).toString("utf8"), "aabb", "a window across chunk boundaries is copied intact");
+	assert.equal(content.readSlice(reference, reference.bytes - 4, 4096).toString("utf8"), "TAIL", "a window past the end is clamped");
+	assert.equal(content.readSlice(reference, reference.bytes + 10, 4).length, 0);
+	assert.equal(content.readSlice(reference, 0, 0).length, 0);
+	assert.throws(() => content.readSlice(reference, -1, 4), /non-negative/);
+	writeFileSync(store.runtimeContentPath(reference), Buffer.concat([bytes.subarray(0, 100000), Buffer.from("x"), bytes.subarray(100001)]), { mode: 0o600 });
+	assert.throws(() => content.readSlice(reference, 0, 16), /digest mismatch/, "a slice outside the tampered region still fails verification");
+});
+
+test("the decision brief previews a long answer and takes its verdict from the tail", () => {
+	const { store, run, operation, input } = fixture("research");
+	store.beginRuntimeAttempt(input);
+	const answer = store.retainRuntimeContent(Buffer.from(`${"finding line\n".repeat(3000)}VERDICT: PASS\n`));
+	assert.ok(answer.bytes > 16 * 1024);
+	store.settleRuntimeAttempt({ attemptKey: input.identity.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer, sources: [] } });
+	const brief = decisionBrief(store, run.runId, operation.id, store.runtimeAttempt(input.identity.attemptKey));
+	assert.equal(brief.answerTruncated, true);
+	assert.equal(brief.answerBytes, answer.bytes);
+	assert.equal(Buffer.byteLength(brief.answer as string), 16 * 1024);
+	assert.equal(brief.verdict, "PASS", "the closing VERDICT line is found even though it lies beyond the preview");
+});
+
+test("a verdict-shaped fragment cut at the tail boundary is not reported as a verdict", () => {
+	const { store, run, operation, input } = fixture("research");
+	store.beginRuntimeAttempt(input);
+	// The verdict tail is the last 4096 bytes. Build the answer so that window begins with "VERDICT: PASS" while the
+	// full line reads "some text NOT_VERDICT: PASS", which is not a verdict line.
+	const tailBytes = 4 * 1024;
+	const head = "VERDICT: PASS\n";
+	const window = `${head}${"d".repeat(tailBytes - Buffer.byteLength(head))}`;
+	assert.equal(Buffer.byteLength(window), tailBytes);
+	const body = `${"x".repeat(17000)}\nsome text NOT_${window}`;
+	const answer = store.retainRuntimeContent(Buffer.from(body));
+	assert.ok(answer.bytes > 16 * 1024);
+	assert.equal(Buffer.from(body).subarray(answer.bytes - tailBytes).toString("utf8"), window, "fixture places the fragment at the window start");
+	assert.equal([...body.matchAll(/^\s*VERDICT:\s*([A-Z_]+)\s*$/gm)].length, 0, "the full answer carries no verdict line");
+	store.settleRuntimeAttempt({ attemptKey: input.identity.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer, sources: [] } });
+	const brief = decisionBrief(store, run.runId, operation.id, store.runtimeAttempt(input.identity.attemptKey));
+	assert.equal(brief.answerTruncated, true);
+	assert.equal(brief.verdict, null, "a partial first line in the tail never yields a verdict");
 });

@@ -16,7 +16,7 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
-import { attemptDetail, closeAgentList, isKeyRepeat, noteRegisteredAttempt, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
+import { attemptDetail, closeAgentList, decodePrefix, isKeyRepeat, noteRegisteredAttempt, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
@@ -585,6 +585,7 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 }
 
 const ANSWER_PREVIEW_BYTES = 16 * 1024;
+const VERDICT_TAIL_BYTES = 4 * 1024;
 /** Nodes whose worker prompt ends the answer with a VERDICT line (mirrors RUNTIME_VERDICT_NODES in scripts/delegate_core.py). */
 const VERDICT_NODES: Partial<Record<string, readonly string[]>> = { review: ["PASS", "FAIL"], test: ["GREEN", "NOT_OK"], audit: ["PASS", "FAIL"], source_search: ["DONE", "BLOCKED"] };
 
@@ -597,8 +598,20 @@ export function decisionBrief(graphStore: GraphStore, runId: string, operationId
 	const operation = graphStore.getOperation(operationId);
 	const reference = attempt.candidate?.answer ?? null;
 	let answer: string | null = null;
-	if (reference && reference.bytes > 0) answer = new RuntimeContentStore(graphStore.dbPath).read(reference, ANSWER_PREVIEW_BYTES).toString("utf8");
-	const verdictLines = answer ? [...answer.matchAll(/^\s*VERDICT:\s*([A-Z_]+)\s*$/gm)] : [];
+	let verdictSource: string | null = null;
+	if (reference && reference.bytes > 0) {
+		const content = new RuntimeContentStore(graphStore.dbPath);
+		// The preview is a bounded prefix; the VERDICT line closes the answer, so a truncated answer is searched from its tail.
+		answer = decodePrefix(content.readSlice(reference, 0, ANSWER_PREVIEW_BYTES));
+		if (reference.bytes > ANSWER_PREVIEW_BYTES) {
+			// The tail starts mid-line; its first partial line is dropped so a fragment such as "NOT_VERDICT: PASS" cannot match as a verdict.
+			const tail = content.readSlice(reference, reference.bytes - VERDICT_TAIL_BYTES, VERDICT_TAIL_BYTES).toString("utf8");
+			verdictSource = tail.slice(tail.indexOf("\n") + 1);
+		} else {
+			verdictSource = answer;
+		}
+	}
+	const verdictLines = verdictSource ? [...verdictSource.matchAll(/^\s*VERDICT:\s*([A-Z_]+)\s*$/gm)] : [];
 	const verdict = verdictLines.length ? verdictLines[verdictLines.length - 1]![1]! : null;
 	const expectedVerdicts = VERDICT_NODES[operation.node] ?? null;
 	// The operations graph advances from synthesis only on DONE (graph-core.ts), but the worker prompt asks no
