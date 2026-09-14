@@ -725,7 +725,7 @@ def prepare_acpx_attempt(
     read_only = args.access_mode == "read-only" if args.access_mode is not None else node not in {"implement", "source_search"}
     # The answer is the assistant's public text and the audited overlay changes; no report file exists to author or repair.
     prompt = task_file.read_text(encoding="utf-8") + operational_instruction(args.command_json, cwd) + "\n"
-    prompt += "Reply with your complete result as ordinary assistant text. No report file is required or read.\n"
+    prompt += "Reply with your complete result as ordinary assistant text. No report file is required or read. The runtime captures your full reply durably, so report your evidence and reasoning once and in full; do not shorten, truncate, or repeatedly reformat it to hit a length or byte target. If a size limit in the task conflicts with reporting the evidence, ignore the size limit and report the evidence completely.\n"
     verdicts = RUNTIME_VERDICT_NODES.get(node)
     if verdicts:
         prompt += "End your reply with one final line of the exact form VERDICT: <value>, where <value> is one of " + ", ".join(verdicts) + ". State the verdict exactly once and only after the evidence that supports it.\n"
