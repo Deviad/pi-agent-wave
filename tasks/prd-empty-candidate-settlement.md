@@ -115,6 +115,8 @@ All three live runs used a temporary `DELEGATE_GRAPH_DB` and a temporary Git cor
 
 Gate re-run after the harness fix, from the repository root: **531 tests, 520 passed, 0 failed, 11 opt-in skips** (`node-gate-final.log`).
 
-**Host note.** Both live drivers must run with a stable `TMPDIR`. Under the agent's sandboxed `TMPDIR` the first build run failed at settlement with `ENOENT … .ctx-mode-…` because staging's `mkdtemp` directory is removed when the sandbox call ends. That is an artifact of how the command was invoked, not a product defect; the worker itself had exited 0 with a complete 2602-byte capture.
+**Host note.** Both live drivers must run with a stable `TMPDIR`. Under the agent's sandboxed `TMPDIR` the first build run failed at settlement with `ENOENT … lstat '…/.ctx-mode-W28znN'`, discarding a worker that had exited 0 with a complete 2602-byte capture.
+
+*Corrected 2026-09-16:* this was first recorded here as "staging's `mkdtemp` … an artifact of how the command was invoked, not a product defect". Both halves of that were wrong. The syscall was `lstat`, which is what `realpathSync` reports (`mkdtemp` failures report `syscall: mkdtemp`), and the failing node was `thinker_plan`, a research candidate that never reaches `stageRuntimeAgentFs`. The call was `realpathSync(dirname(dbPath))` in `RuntimeContentStore` (`lib/runtime-content.ts:11`), reproduced exactly. The "not a product defect" claim was asserted without proof and is now the subject of `tasks/prd-settlement-storage-precondition.md`, which treats the bare `ENOENT` and the discarded answer as defects in their own right.
 
 - **Still not run.** No Bun package gates, no `npm pack`/`publish` dry run, no installation rehearsal; none of the four changed files affect packaging. The field run `run_74d142d5-9773-4bbd-888c-03d9b428e849` is still parked at `implement` and was not touched.
