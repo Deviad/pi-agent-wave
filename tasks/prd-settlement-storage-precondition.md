@@ -32,12 +32,19 @@ Why it was reachable: the measurement driver puts its corpus *and* its `graph.db
 
 ## Scope decision, recorded before building
 
-This issue does **not** claim a user-facing dispatch can lose its database. A real run resolves `DELEGATE_GRAPH_DB` or `~/.cache/delegate-graph`, neither of which is volatile; the volatile path arrived through a test driver. That is why the product change below is about **diagnosis and precondition**, not about relocating storage.
+Revised 2026-09-16 after the user challenged the first draft, which scoped this as a harness problem. The first draft was wrong about the exposure.
 
-The prevention goal is therefore split honestly:
+**The database is not the product exposure; the staging scratch is.** A real run resolves `DELEGATE_GRAPH_DB` or `~/.cache/delegate-graph`, neither volatile, so the specific failure the driver hit (database under `tmpdir()`) is harness-only. But the settlement subprocess inherits the supervisor's environment (`delegate_core.py:1711`, `env={**os.environ, …}`), Node's `os.tmpdir()` returns `TMPDIR` verbatim when it is set and falls back to `/tmp` only when it is unset (verified on this host), and `lib/runtime-staging.ts:60` puts its scratch copy of the AgentFS snapshot in `tmpdir()` on every coding and operational settlement. So any launcher that hands Pi a `TMPDIR` with a shorter lifetime than a delegate run — a sandboxed tool wrapper, an IDE or Obsidian Shell Commands launch, a managed terminal tab, a CI runner — controls where that scratch lives. Delegate runs last minutes to hours (the build proof took 450 s); a per-call or per-turn reaper will hit it. The Python half of the same lifecycle already refuses to trust `TMPDIR` (`TMP_ROOT`, `delegate_core.py:31`); the TypeScript half did not. Story 3 is therefore finishing a decision the code already made, not optional hardening.
 
-- Product: a settlement that cannot reach its storage must fail with a message naming what was unreachable and why it matters, so the next occurrence is self-explaining instead of a bare `ENOENT` against an unfamiliar path. A worker's completed answer must not be discarded by a precondition failure that was knowable before the worker ran.
-- Harness: the two live drivers must not place run state anywhere that can be reclaimed while the run is in flight.
+What could not be verified and is not claimed: `ps -E` returns no environment for the running `pi` processes on this host, so no live Pi session was observed carrying a volatile `TMPDIR`. The exposure rests on the code path plus Node's documented behaviour.
+
+`scripts/init.mjs:216` also uses `tmpdir()`, for a routing-validation file that lives for seconds inside a synchronous `init`. Same pattern, negligible risk; fixed for consistency in story 3.
+
+The prevention goal, in priority order:
+
+- Product, hot path: settlement scratch must not depend on an inherited `TMPDIR` (story 3).
+- Product, any storage failure: a settlement that cannot reach its storage must fail with a message naming what was unreachable, before it can strand a completed worker answer (stories 1 and 2).
+- Harness: the live drivers must not place run state anywhere that can be reclaimed mid-run, and must refuse to start rather than spend an authorized provider turn on a root that will vanish (story 4). Refuse, not warn, was the user's choice on 2026-09-16.
 
 ## User story 1 — an unreachable content store names itself
 
@@ -65,6 +72,7 @@ As a maintainer, I want the TypeScript staging scratch to use the same pinned ro
 Acceptance criteria:
 
 - [ ] `stageRuntimeAgentFs` allocates its scratch directory under a root that does not depend on an inherited `TMPDIR`, matching `delegate_core.py`'s `TMP_ROOT` convention, and still removes it on every exit path including failure. Proof: a case in `extensions/pi-agent-wave/test/runtime-staging.test.ts` that runs staging with `TMPDIR` pointed at a deleted directory and asserts staging still succeeds against a real AgentFS snapshot, plus an assertion that no scratch directory survives.
+- [ ] `scripts/init.mjs`'s routing-validation temporary uses the same pinned root. Proof: the existing `initial-config*.test.ts` suites stay green, and a grep gate in the same case as above asserts no shipped `.ts`/`.mjs` under `lib/` or `scripts/` calls `tmpdir()` any more.
 - [ ] The change is confined to scratch allocation: manifests, digests and staged content are byte-identical to before for an unchanged input. Proof: the existing staging and `runtime-settle.test.ts` coding cases stay green with no assertion edited.
 
 ## User story 4 — the live drivers keep run state on stable storage
