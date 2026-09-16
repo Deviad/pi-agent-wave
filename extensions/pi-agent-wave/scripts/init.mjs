@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
-import { resolveAgentDir, resolveCatalogPath, resolveFzfPath, resolveRoutingPath } from "../lib/agent-paths.mjs";
+import { makeScratchDir, resolveAgentDir, resolveCatalogPath, resolveFzfPath, resolveRoutingPath } from "../lib/agent-paths.mjs";
 import { analyzeCatalog, isLocalModel, loadCatalog } from "../lib/catalog.mjs";
 import { parseJsonc } from "../lib/jsonc.mjs";
 import { detectPiFzf, mergeFzf, packageRoot, packageRoutePicker } from "../lib/pi-fzf.mjs";
@@ -213,7 +212,7 @@ function runNode(args, env = {}) {
 }
 
 async function withTempRouting(routingText, run) {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-wave-validate-"));
+	const tempDir = makeScratchDir("pi-agent-wave-validate-");
 	const tempRouting = join(tempDir, "model-routing.jsonc");
 	await writeFile(tempRouting, routingText);
 	try {

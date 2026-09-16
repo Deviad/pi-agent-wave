@@ -148,4 +148,47 @@ print(json.dumps({'hasExportConfig': 'export_config' in resource, 'snapshot': re
 			assert.ok(out.artifacts.includes("after\n"), `the owned write is retained as a staged artifact: ${JSON.stringify(out.artifacts)}`);
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
+
+	test("an incomplete capture retains the prompt worker's own stream, and a clean settlement retains nothing", () => {
+		const root = mkdtempSync(join(tmpdir(), "runtime-py-capture-"));
+		try {
+			const result = python(prelude + `
+os.environ['DELEGATE_GRAPH_DB'] = str(root / 'graph.db')
+args = core.build_parser().parse_args(['start', str(private), 'searcher', '--node', 'search', '--model', model, '--access-mode', 'read-only'])
+resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'capture-fixture'}, 'fixture-worker', model, task, 'search')
+resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher', 'node': 'search'})
+attempt = Path(resource['attempt_dir'])
+# The prompt-mode worker writes its stream where RuntimeOutputFiles puts it, beside the result file.
+output_dir = Path(resource['worker_result']).parent / 'runtime-output'; output_dir.mkdir(mode=0o700, exist_ok=True)
+stream = output_dir / 'worker.stdout.ndjson'
+stream.write_text('{"method":"session/update"}\\n'); stream.chmod(0o600)
+evidence_path = private / 'runtime-settlement-fixture-worker.json'
+
+def write_evidence(status, candidate):
+    evidence_path.write_text(json.dumps({'observation': {'captureStatus': status}, 'candidate': candidate}))
+
+write_evidence('incomplete', None)
+retained = core.retain_incomplete_capture(private, resource, evidence_path)
+write_evidence('complete', {'kind': 'research'})
+clean_target = private / 'runtime-capture-fixture-worker-clean.ndjson'
+clean = core.retain_incomplete_capture(private, resource, evidence_path)
+print(json.dumps({
+  'retained': str(retained) if retained else None,
+  'contents': Path(retained).read_text() if retained else None,
+  'mode': oct(Path(retained).stat().st_mode & 0o777) if retained else None,
+  'inRunDir': bool(retained) and Path(retained).parent == private,
+  'cleanRetained': str(clean) if clean else None,
+  'cleanTargetExists': clean_target.exists(),
+}))
+`, root);
+			assert.equal(result.status, 0, result.stderr);
+			const out = JSON.parse(result.stdout);
+			assert.ok(out.retained, "an incomplete capture with no candidate must retain the worker stream");
+			assert.match(String(out.retained), /runtime-capture-fixture-worker\.ndjson$/);
+			assert.equal(out.inRunDir, true);
+			assert.equal(out.contents, '{"method":"session/update"}\n');
+			assert.equal(out.mode, "0o600");
+			assert.equal(out.cleanRetained, null, "a complete capture carrying a candidate retains nothing");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
 });

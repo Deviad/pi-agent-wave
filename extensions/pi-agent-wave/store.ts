@@ -1359,6 +1359,9 @@ export class GraphStore {
 				const content = new RuntimeContentStore(this.dbPath);
 				const manifest = parseRuntimeStagingManifest(JSON.parse(content.read(manifestReference, 16 * 1024 * 1024).toString("utf8")));
 				if (manifest.attemptKey !== input.attemptKey || manifest.baseRevision !== attempt.candidate.baseRevision) throw new Error("staging manifest conflicts with candidate identity");
+				// Settlement no longer mints such a candidate, but rows written before that change still exist: accepting one
+				// would advance the graph on a worker that produced neither an answer nor a change.
+				if (!attempt.candidate.answer && !manifest.changes.length) throw new Error("empty candidate: the attempt retained no answer and staged no change; reject it, then resume the operation with a retry");
 				if (manifest.changes.length) {
 					const status = this.integrationStatusFor(manifest.workspace, attempt.candidateId);
 					if (!status || status.state !== "applied") throw new Error(`${attempt.candidate.kind} acceptance requires an applied integration (${status?.state ?? "not prepared"})`);

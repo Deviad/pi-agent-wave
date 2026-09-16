@@ -13,14 +13,14 @@
  * review, a quality benchmark, or product activation: the adapter is enabled only in a temporary store.
  */
 import { execFile, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { RuntimeContentStore } from "../../lib/runtime-content.ts";
 import { parseRuntimeStagingManifest } from "../../lib/runtime-staging.ts";
+import { SCRATCH_ROOT, makeScratchDir } from "../../lib/agent-paths.mjs";
 
 const PACKAGE = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const REPO = resolve(PACKAGE, "..", "..");
@@ -38,6 +38,17 @@ const runTimeoutMs = Number.parseInt(option("--run-timeout-ms", String((graph ==
 /** The adapter the model routes to; its credential store is preflighted. */
 const adapter = model.startsWith("openai-codex/") ? "codex" : model.startsWith("claude-code/") ? "claude" : "pi";
 if (!Number.isInteger(repeats) || repeats < 1) throw new Error("--repeats must be a positive integer");
+/**
+ * Run roots live under the pinned scratch root, never an inherited TMPDIR: a run lasts minutes and an authorized
+ * provider turn is spent on it, so a root that can be reclaimed mid-run is refused before any worker starts.
+ */
+const runRootBase = resolve(option("--run-root", SCRATCH_ROOT));
+function assertUsableRunRoot(base: string): void {
+	let stat; try { stat = statSync(base); } catch { throw new Error(`run root ${base} does not exist; refusing to start a live run whose state would have nowhere durable to live`); }
+	if (!stat.isDirectory()) throw new Error(`run root ${base} is not a directory; refusing to start`);
+	try { accessSync(base, constants.W_OK); } catch { throw new Error(`run root ${base} is not writable; refusing to start`); }
+}
+if (mode === "execute") assertUsableRunRoot(runRootBase);
 
 const RESEARCH_TASK = "research: determine where cache invalidation is triggered in this repository, which module owns the cache, and whether invalidation can be skipped. Cite file paths for every claim.";
 const BUILD_TASK = "implement: the admin bulk import in src/import.ts writes rows without invalidating the cache in src/cache.ts. Make bulkImport invalidate the cache for every imported key, keeping its signature and existing behaviour otherwise. Only src/import.ts may change.";
@@ -60,7 +71,7 @@ const VERDICT_NODES: Record<string, readonly string[]> = { review: ["PASS", "FAI
 const FIXED_VERDICTS: Record<string, string> = { thinker_plan: "READY", thinker_split: "READY", implement: "DONE", search: "DONE", thinker_synthesize: "DONE" };
 const plan = {
 	mode, model, adapter, contracts, repeats, graph, task: TASK, slices: SLICE_IDS, workerTurnsPerRun: graph === "build" ? 1 + SLICE_IDS.length + 3 : graph === "operations" ? SLICE_IDS.length + 2 : 1 + SLICE_IDS.length + 1,
-	runTimeoutMs, evidenceDir, spend: "provider-priced; no dollar estimate; usage is not reported by the worker path", activation: "runs in a temporary DELEGATE_GRAPH_DB; the real Pi installation is not modified",
+	runTimeoutMs, evidenceDir, runRoot: runRootBase, spend: "provider-priced; no dollar estimate; usage is not reported by the worker path", activation: "runs in a temporary DELEGATE_GRAPH_DB; the real Pi installation is not modified",
 	acceptance: "runtime-v1 candidates are accepted automatically by the driver; this is not independent review",
 	verdicts: "review, test and audit verdicts are read from the final VERDICT: line of the worker's answer; a FAIL or NOT_OK follows the graph edge back to implementation",
 	integration: graph === "build" ? "a runtime coding candidate with staged changes is applied with op=integrate before op=decide; the launcher never writes the host tree at settlement" : graph === "operations" ? "a runtime operational candidate's staged owned artifacts (checkpoint, results) are placed with op=integrate before op=decide; the checkpoint is observed at settlement" : "none: research candidates carry no file changes",
@@ -88,7 +99,7 @@ const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 const now = () => performance.now();
 interface Timed { readonly kind: string; readonly operationId: string | null; readonly node: string | null; readonly ms: number; readonly detail: Record<string, unknown> }
 interface RunRecord {
-	contract: string; repeat: number; runId: string | null; startedAt: string; finishedAt: string | null; totalMs: number | null; finalStatus: string | null; terminal: boolean;
+	contract: string; repeat: number; runId: string | null; runRoot: string | null; startedAt: string; finishedAt: string | null; totalMs: number | null; finalStatus: string | null; terminal: boolean;
 	dispatches: number; collects: number; completions: number; retries: number; modelFallbacks: number; parked: boolean; failures: string[]; phases: Timed[]; operations: Record<string, unknown>[];
 	privateRunDirs: string[]; progress: { kind: string; at: number; details: Record<string, unknown> }[]; ledgerPath: string | null; error: string | null;
 	verdicts: { operationId: string; node: string; verdict: string | null; source: string; answerExcerpt: string | null }[]; integrations: { operationId: string; state: string; changes: number }[];
@@ -148,7 +159,9 @@ async function loadTool(dbPath: string): Promise<{ execute: (params: Record<stri
 	delete process.env.HERDR_ENV; delete process.env.HERDR_WORKSPACE_ID; delete process.env.HERDR_TAB_ID;
 	const { default: extension } = await import(`../../index.ts?measure=${Date.now()}-${Math.random()}`);
 	let tool: { execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: (update: unknown) => void, ctx: unknown) => Promise<unknown> } | undefined;
-	extension({ registerCommand() {}, registerTool(definition: typeof tool) { tool = definition; }, exec, sendUserMessage() {} });
+	// The extension subscribes to session_shutdown to close its interactive views; the driver has no session, so the
+	// handler is registered and never fired. Without `on` the extension throws before registering its tool.
+	extension({ registerCommand() {}, registerTool(definition: typeof tool) { tool = definition; }, exec, sendUserMessage() {}, on() {} });
 	if (!tool) throw new Error("delegate_graph tool did not register");
 	const registered = tool;
 	return { execute: (params, onUpdate, ctx) => registered.execute("measure", params, undefined, onUpdate, ctx) };
@@ -165,8 +178,9 @@ function parsed(result: unknown): Record<string, any> {
 }
 
 async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRecord> {
-	const record: RunRecord = { contract, repeat, runId: null, startedAt: new Date().toISOString(), finishedAt: null, totalMs: null, finalStatus: null, terminal: false, dispatches: 0, collects: 0, completions: 0, retries: 0, modelFallbacks: 0, parked: false, failures: [], phases: [], operations: [], privateRunDirs: [], progress: [], ledgerPath: null, error: null, verdicts: [], integrations: [], workspace: null, watchSamples: [] };
-	const root = mkdtempSync(join(tmpdir(), `pi-wave-measure-${contract}-`));
+	const record: RunRecord = { contract, repeat, runId: null, runRoot: null, startedAt: new Date().toISOString(), finishedAt: null, totalMs: null, finalStatus: null, terminal: false, dispatches: 0, collects: 0, completions: 0, retries: 0, modelFallbacks: 0, parked: false, failures: [], phases: [], operations: [], privateRunDirs: [], progress: [], ledgerPath: null, error: null, verdicts: [], integrations: [], workspace: null, watchSamples: [] };
+	const root = runRootBase === SCRATCH_ROOT ? makeScratchDir(`pi-wave-measure-${contract}-`) : mkdtempSync(join(runRootBase, `pi-wave-measure-${contract}-`));
+	record.runRoot = root;
 	const repo = join(root, "repo"); mkdirSync(repo); if (graph === "operations") operationsCorpus(repo); else corpus(repo);
 	const slices = graph === "build" ? buildSlices(repo) : RESEARCH_SLICES;
 	const dbPath = join(root, "graph.db");
@@ -280,7 +294,7 @@ for (let repeat = 1; repeat <= repeats; repeat += 1) for (const contract of cont
 const phaseSum = (record: RunRecord, kind: string) => record.phases.filter((phase) => phase.kind === kind).reduce((sum, phase) => sum + phase.ms, 0);
 const summary = {
 	schemaVersion: 1, measuredAt: new Date().toISOString(), plan, hostPiVersion: spawnSync("pi", ["--version"], { encoding: "utf8" }).stdout.trim(), sampleCounts: Object.fromEntries(contracts.map((contract) => [contract, records.filter((record) => record.contract === contract).length])),
-	runs: records.map((record) => ({ contract: record.contract, repeat: record.repeat, runId: record.runId, terminal: record.terminal, finalStatus: record.finalStatus, totalMs: record.totalMs, dispatches: record.dispatches, collects: record.collects, completions: record.completions, retries: record.retries, modelFallbacks: record.modelFallbacks, failures: record.failures, error: record.error, dispatchMs: phaseSum(record, "dispatch"), collectMs: phaseSum(record, "collect"), completionMs: phaseSum(record, "record-completed") + phaseSum(record, "decide"), integrateMs: phaseSum(record, "integrate"), backoffMs: phaseSum(record, "backoff"), verdicts: record.verdicts, integrations: record.integrations, workspaceChanged: record.workspace ? record.workspace.status.trim().length > 0 : null, criticalPathNote: "collect phases of a fan-out overlap; collectMs is the sum, totalMs is elapsed wall time" })),
+	runs: records.map((record) => ({ contract: record.contract, repeat: record.repeat, runId: record.runId, runRoot: record.runRoot, terminal: record.terminal, finalStatus: record.finalStatus, totalMs: record.totalMs, dispatches: record.dispatches, collects: record.collects, completions: record.completions, retries: record.retries, modelFallbacks: record.modelFallbacks, failures: record.failures, error: record.error, dispatchMs: phaseSum(record, "dispatch"), collectMs: phaseSum(record, "collect"), completionMs: phaseSum(record, "record-completed") + phaseSum(record, "decide"), integrateMs: phaseSum(record, "integrate"), backoffMs: phaseSum(record, "backoff"), verdicts: record.verdicts, integrations: record.integrations, workspaceChanged: record.workspace ? record.workspace.status.trim().length > 0 : null, criticalPathNote: "collect phases of a fan-out overlap; collectMs is the sum, totalMs is elapsed wall time" })),
 	cost: "unknown: provider usage is not reported by the worker path and is not estimated",
 };
 writeFileSync(join(evidenceDir, "summary.json"), JSON.stringify(summary, null, 2) + "\n", { mode: 0o600 });
