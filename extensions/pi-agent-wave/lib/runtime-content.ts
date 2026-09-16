@@ -8,7 +8,14 @@ export class RuntimeContentStore {
 	private readonly root: string;
 
 	constructor(dbPath: string) {
-		this.root = join(realpathSync(dirname(dbPath)), "runtime-content");
+		const parent = dirname(dbPath);
+		let resolved: string;
+		try { resolved = realpathSync(parent); } catch (error) {
+			// realpath reports the first missing ancestor, not its argument, so a bare ENOENT names a directory the
+			// reader may never have heard of. Say what storage was being opened and for which database.
+			throw new Error(`runtime content store unreachable: the directory ${parent} of database ${dbPath} cannot be resolved (${error instanceof Error ? error.message : String(error)})`, { cause: error });
+		}
+		this.root = join(resolved, "runtime-content");
 	}
 
 	private directory(): void {

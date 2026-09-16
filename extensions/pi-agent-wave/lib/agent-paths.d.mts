@@ -6,3 +6,6 @@ export declare function resolveAgentDir(explicit?: string): string;
 export declare function resolveRoutingPath(agentDir: string, explicit?: string): string;
 export declare function resolveCatalogPath(agentDir: string, explicit?: string): string;
 export declare function resolveFzfPath(agentDir: string): string;
+
+export declare const SCRATCH_ROOT: "/tmp";
+export declare function makeScratchDir(prefix: string): string;

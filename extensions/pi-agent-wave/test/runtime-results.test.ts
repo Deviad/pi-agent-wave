@@ -321,6 +321,22 @@ test("a staging manifest that cannot be read leaves the brief on the integrate-f
 	assert.match(String(brief.note), /op=integrate/);
 });
 
+test("an unreachable content store names its root and database instead of surfacing a bare ENOENT", () => {
+	// The 2026-09-16 live run reported `ENOENT … lstat '<vanished TMPDIR>'` from this constructor and discarded a
+	// worker that had exited 0 with a complete answer. The failure must say what storage was unreachable.
+	const root = mkdtempSync(join(tmpdir(), "runtime-results-gone-"));
+	const dbPath = join(root, "graph.db");
+	rmSync(root, { recursive: true, force: true });
+	assert.throws(() => new RuntimeContentStore(dbPath), (error: unknown) => {
+		assert.ok(error instanceof Error);
+		assert.match(error.message, /runtime content store/i, error.message);
+		assert.ok(error.message.includes(dbPath), `names the database: ${error.message}`);
+		assert.doesNotMatch(error.message, /^ENOENT/, "the bare syscall text is not the headline");
+		assert.ok(error.cause instanceof Error && /ENOENT/.test(error.cause.message), "the original error is preserved as cause");
+		return true;
+	});
+});
+
 function failedSettlement(attemptKey: string, error: string) {
 	return { attemptKey, outcome: { kind: "failed" as const, exitCode: 1, error } };
 }

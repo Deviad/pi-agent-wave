@@ -190,8 +190,11 @@ Where the package writes:
 | `~/.cache/delegate-graph/failures/<runId>/` | Diagnostics for operations that were never dispatched | With the run |
 | `/tmp/delegate-graph-herdr-<run>-<operation>.*/` | The attempt's private run directory: task, prompt, worker configuration, ACPX and AgentFS homes, capture files, settlement and cleanup records, materialized run evidence, retained failure bundles and raw streams | Attempt directories are removed after a clean settlement; the run directory and its records remain |
 | `<workspace>` | Files placed by `integrate` through the journal, and nothing else | Yours |
+| `/tmp/pi-wave-staging-*/` | Settlement's scratch copy of an AgentFS snapshot while staging | Seconds; removed on every exit path |
 
 All of these are private, mode 600 or 700, and may contain sensitive values. None is packaged.
+
+Scratch and private run directories are pinned under `/tmp` on purpose and never use `TMPDIR`. A launcher (a sandboxed tool wrapper, an IDE, a managed terminal tab, a CI runner) may hand Pi a `TMPDIR` that it reclaims per call or per turn, while a delegate run lasts minutes; one such directory vanished mid-run on 2026-09-16 and discarded a worker that had succeeded. If the content store's directory cannot be reached, settlement now fails before touching the worker result, naming the database and directory (`runtime content store unreachable: …`), so the answer stays on disk for the retry.
 
 ## Pi commands
 

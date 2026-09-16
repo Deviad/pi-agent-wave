@@ -67,6 +67,32 @@ test("partial, empty and failed output settle as recorded outcomes without a fab
 	} finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test("settlement checks its storage before reading the worker result, and fabricates nothing when it is unreachable", () => {
+	const root = mkdtempSync(join(tmpdir(), "runtime-settle-nostore-"));
+	try {
+		const gone = mkdtempSync(join(root, "gone-"));
+		const dbPath = join(gone, "graph.db");
+		rmSync(gone, { recursive: true, force: true });
+		const evidencePath = join(root, "runtime-settlement.json");
+		// A worker result that would otherwise settle as a complete research candidate.
+		const workerResultPath = workerResult(root, "attempt-nostore", "Finding: the answer", "complete");
+		assert.throws(() => settleRuntimeWorker(parseRuntimeSettleConfig({ schemaVersion: 1, attemptKey: "attempt-nostore", workerResultPath, kind: "research", baseDir: root, baseRevision: "none", ownedPaths: [], readOnly: true, snapshotPath: null, agentFsExecutable: "agentfs", evidencePath, dbPath })), (error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /runtime content store/i, error.message);
+			assert.ok(error.message.includes(dbPath), error.message);
+			return true;
+		});
+		assert.equal(existsSync(evidencePath), false, "no evidence is published for a settlement that could not reach storage");
+		assert.deepEqual(readdirSync(root).filter((entry) => entry.startsWith("runtime-settlement.json.tmp-")), [], "no partial evidence temporary is left behind");
+		// The worker's answer is untouched on disk for the retry to re-settle from.
+		assert.equal(readFileSync(join(root, "runtime-output", "public-answer.txt"), "utf8"), "Finding: the answer");
+		// Ordering: with a worker result that cannot even be parsed, only a storage-first settlement reports storage.
+		// Reading the result first would report the parse failure instead and hide the precondition.
+		const unparsable = join(root, "unparsable-result.json"); writeFileSync(unparsable, "{not json", { mode: 0o600 });
+		assert.throws(() => settleRuntimeWorker(parseRuntimeSettleConfig({ schemaVersion: 1, attemptKey: "attempt-nostore", workerResultPath: unparsable, kind: "research", baseDir: root, baseRevision: "none", ownedPaths: [], readOnly: true, snapshotPath: null, agentFsExecutable: "agentfs", evidencePath, dbPath })), /runtime content store/i, "storage is checked before the worker result is read");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("coding settlement stages audited AgentFS changes and acceptance requires the applied integration", () => {
 	const root = mkdtempSync(join(tmpdir(), "runtime-settle-coding-"));
 	const stores: GraphStore[] = [];

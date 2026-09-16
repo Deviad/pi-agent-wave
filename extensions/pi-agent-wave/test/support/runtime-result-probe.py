@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--claude-model", default="claude-code/claude-opus-5")
     parser.add_argument("--evidence-dir", type=Path, default=REPO / "agent-output" / "runtime-result-probe")
     parser.add_argument("--agents", default="pi,codex,claude", help="comma-separated subset of pi, codex, claude to probe (default all three)")
+    parser.add_argument("--run-root", type=Path, default=None, help="base for per-agent run roots (default: the lifecycle's pinned TMP_ROOT, never an inherited TMPDIR)")
     args = parser.parse_args()
     selected = [agent.strip() for agent in args.agents.split(",") if agent.strip()]
     if not selected or any(agent not in ("pi", "codex", "claude") for agent in selected):
@@ -60,10 +61,18 @@ def main():
     models = {agent: model for agent, model in (("pi", args.pi_model), ("codex", args.codex_model), ("claude", args.claude_model)) if agent in selected}
     if not args.codex_model.startswith("openai-codex/") or not args.claude_model.startswith("claude-code/") or args.pi_model.startswith(("openai-codex/", "claude-code/")) or "/" not in args.pi_model:
         parser.error("model providers must select their named ACPX agents")
-    plan = {"mode": "execute" if args.execute else "preflight" if args.preflight else "dry-run", "models": models, "agents": list(models), "promptsPerAgent": 2, "totalPrompts": 2 * len(models), "promptTimeoutSeconds": 120, "maxTurnsPerPrompt": {"text": 1, "source": 2}, "terminal": False, "evidenceDir": str(args.evidence_dir.resolve()), "spend": "provider-priced; no dollar estimate", "activation": "does not enable runtime-v1"}
+    sys.path.insert(0, str(PACKAGE / "scripts"))
+    import delegate_core as core
+    # Run roots hold worker state for minutes while an authorized provider turn is spent on them, so an inherited
+    # TMPDIR that a launcher may reclaim mid-run is never used; the lifecycle's own pinned root is the default.
+    run_root = (args.run_root or core.TMP_ROOT).resolve()
+    plan = {"mode": "execute" if args.execute else "preflight" if args.preflight else "dry-run", "models": models, "agents": list(models), "promptsPerAgent": 2, "totalPrompts": 2 * len(models), "promptTimeoutSeconds": 120, "maxTurnsPerPrompt": {"text": 1, "source": 2}, "terminal": False, "evidenceDir": str(args.evidence_dir.resolve()), "runRoot": str(run_root), "spend": "provider-priced; no dollar estimate", "activation": "does not enable runtime-v1"}
     print(json.dumps(plan, indent=2), flush=True)
     if not args.execute and not args.preflight:
         return 0
+    if args.execute and (not run_root.is_dir() or not os.access(run_root, os.W_OK)):
+        print(json.dumps({"error": f"run root {run_root} is not a writable directory; refusing to start a live run whose state would have nowhere durable to live"}), flush=True)
+        return 2
     blockers = []
     for executable in ["node", "acpx", "agentfs"]:
         if not shutil.which(executable):
@@ -89,18 +98,16 @@ def main():
         print(json.dumps({"prerequisitesAvailable": True, "credentialsPreflighted": False, "workersStarted": 0}))
         return 0
 
-    sys.path.insert(0, str(PACKAGE / "scripts"))
-    import delegate_core as core
     core.ACTIVE_TRANSPORT = "headless"
     evidence = args.evidence_dir.resolve()
     evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
     evidence.chmod(0o700)
     successful = True
     for agent, model in models.items():
-        root = Path(tempfile.mkdtemp(prefix=f"pi-wave-result-{agent}-"))
+        root = Path(tempfile.mkdtemp(prefix=f"pi-wave-result-{agent}-", dir=run_root))
         resource = None
         original_cwd = Path.cwd()
-        result = {"agent": agent, "model": model, "passed": False}
+        result = {"agent": agent, "model": model, "passed": False, "runRoot": str(root)}
         try:
             base = root / "base"
             private = root / "private"

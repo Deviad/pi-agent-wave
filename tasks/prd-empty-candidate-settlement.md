@@ -115,7 +115,7 @@ All three live runs used a temporary `DELEGATE_GRAPH_DB` and a temporary Git cor
 
 Gate re-run after the harness fix, from the repository root: **531 tests, 520 passed, 0 failed, 11 opt-in skips** (`node-gate-final.log`).
 
-**Host note.** Both live drivers must run with a stable `TMPDIR`. Under the agent's sandboxed `TMPDIR` the first build run failed at settlement with `ENOENT … lstat '…/.ctx-mode-W28znN'`, discarding a worker that had exited 0 with a complete 2602-byte capture.
+**Host note.** *(Superseded by `tasks/prd-settlement-storage-precondition.md` on 2026-09-16: shipped code and both drivers no longer read `TMPDIR`, and the full gate plus a live settlement were re-run under the volatile sandbox `TMPDIR` without an override. Kept for the record of what happened.)* Both live drivers had to be run with a stable `TMPDIR`. Under the agent's sandboxed `TMPDIR` the first build run failed at settlement with `ENOENT … lstat '…/.ctx-mode-W28znN'`, discarding a worker that had exited 0 with a complete 2602-byte capture.
 
 *Corrected 2026-09-16:* this was first recorded here as "staging's `mkdtemp` … an artifact of how the command was invoked, not a product defect". Both halves of that were wrong. The syscall was `lstat`, which is what `realpathSync` reports (`mkdtemp` failures report `syscall: mkdtemp`), and the failing node was `thinker_plan`, a research candidate that never reaches `stageRuntimeAgentFs`. The call was `realpathSync(dirname(dbPath))` in `RuntimeContentStore` (`lib/runtime-content.ts:11`), reproduced exactly. The "not a product defect" claim was asserted without proof and is now the subject of `tasks/prd-settlement-storage-precondition.md`, which treats the bare `ENOENT` and the discarded answer as defects in their own right.
 

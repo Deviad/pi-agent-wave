@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, constants, copyFileSync, existsSync, lstatSync, openSync, readSync, realpathSync, rmSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { makeScratchDir } from "./agent-paths.mjs";
 import { DEFAULT_IGNORED_PATHS, auditAgentFsChanges, agentFsAuditErrorMessage } from "./agentfs-sandbox.ts";
 import { RuntimeContentStore } from "./runtime-content.ts";
 import { canonical, parseRuntimeContent, type RuntimeContent } from "./runtime-results.ts";
@@ -57,7 +57,7 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 	if (!input.attemptKey.trim() || !input.baseRevision.trim()) throw new Error("staging requires attempt and base identity");
 	const workspace = realpathSync(input.baseDir);
 	const before = snapshotDigest(input.snapshotPath);
-	const scratch = mkdtempSync(join(tmpdir(), "pi-wave-staging-"));
+	const scratch = makeScratchDir("pi-wave-staging-");
 	try {
 		const workingSnapshot = join(scratch, "snapshot.db");
 		copyFileSync(input.snapshotPath, workingSnapshot);

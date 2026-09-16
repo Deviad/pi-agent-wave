@@ -85,6 +85,9 @@ function observeCheckpoint(content: RuntimeContentStore, changes: readonly { rea
 }
 
 export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlementEvidence {
+	// Storage is a precondition, checked before the worker result is touched: a store that cannot be reached must fail
+	// here, by name, rather than after parsing an answer that a retry will then have to re-settle.
+	const content = new RuntimeContentStore(config.dbPath ?? process.env.DELEGATE_GRAPH_DB ?? DEFAULT_DB_PATH);
 	const result: unknown = JSON.parse(readFileSync(config.workerResultPath, "utf8"));
 	if (!isRecord(result) || result.schemaVersion !== 2 || result.resultContract !== "runtime-v1") throw new Error("runtime settlement requires a schema 2 runtime-v1 worker result");
 	if (result.attemptKey !== config.attemptKey) throw new Error("worker result attempt does not match the settling attempt");
@@ -92,7 +95,6 @@ export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlem
 	const capture = output && isRecord(output.capture) ? output.capture : null;
 	if (!output || !capture || typeof result.outputDir !== "string") throw new Error("worker result lacks runtime output");
 	const outcome = parseRuntimeOutcome(output.outcome);
-	const content = new RuntimeContentStore(config.dbPath ?? process.env.DELEGATE_GRAPH_DB ?? DEFAULT_DB_PATH);
 	const diagnostics = Array.isArray(capture.diagnostics) ? capture.diagnostics.filter((item): item is string => typeof item === "string") : [];
 	const answerBytes = readFileSync(join(result.outputDir, "public-answer.txt"));
 	const answer = answerBytes.length ? content.retain(answerBytes) : null;
