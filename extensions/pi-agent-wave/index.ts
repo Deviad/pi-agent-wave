@@ -6,6 +6,7 @@ import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { summarizeAcpxStream, type AcpxStreamSummary } from "./lib/acpx-render.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
+import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
 import { dirname, join } from "node:path";
 import { renderLog, renderStatus } from "./commands.ts";
 import delegationIdentityExtension from "./delegation-identity.ts";
@@ -623,18 +624,38 @@ export function decisionBrief(graphStore: GraphStore, runId: string, operationId
 	if (operationsSynthesis) decide.verdict = verdict ?? "DONE";
 	if (needsSlices) decide.payload = { slices: [{ id: "<slug>", name: "<short name>", task: "<what one worker does>", ...(operation.node === "thinker_plan" ? { ownedPaths: ["<paths this slice may change; disjoint across slices>"] } : {}) }] };
 	const kind = attempt.candidate?.kind ?? null;
+	const owned = kind === "coding" || kind === "operational" ? stagedChangeCount(graphStore, attempt) : null;
+	const ownedNote = owned === 0 && !reference
+		? "This is an empty candidate: no answer was retained and no file was changed. Decide rejected, then resume the operation with a retry; it cannot be integrated or accepted."
+		: owned === 0
+			? "The candidate carries no file changes, so op=integrate does not apply; read the retained answer and op=decide directly."
+			: "Call op=integrate for this operationId before op=decide accepted.";
 	const note = !attempt.candidate
 		? "No candidate was retained; a failed or interrupted attempt is replaced with op=retry."
 		: needsSlices
 			? "Derive payload.slices from the retained answer; each slice becomes one parallel worker at the next node."
 			: kind === "coding" || kind === "operational"
-				? "Call op=integrate for this operationId before op=decide accepted."
+				? ownedNote
 				: expectedVerdicts && !verdict
 					? "The answer lacks the VERDICT line this node requires; decide rejected with that reason or supply the verdict the answer supports."
 					: operationsSynthesis
 						? "Operations synthesis advances to the audit only with verdict DONE; the worker was not asked for a VERDICT line, so pass DONE when the synthesis is complete and reject otherwise."
 						: "Read the retained answer, then op=decide.";
 	return { answer, answerBytes: reference?.bytes ?? 0, answerTruncated: (reference?.bytes ?? 0) > ANSWER_PREVIEW_BYTES, verdict, decide, note };
+}
+
+/**
+ * How many changes the attempt's observed staging manifest records, or null when that cannot be read.
+ * The brief is advisory, so an unreadable or malformed manifest reports null and leaves the caller on the
+ * integrate-first note rather than failing op=collect.
+ */
+function stagedChangeCount(graphStore: GraphStore, attempt: RuntimeAttempt): number | null {
+	const manifest = attempt.observation?.manifest ?? null;
+	if (!manifest) return null;
+	try {
+		const raw = new RuntimeContentStore(graphStore.dbPath).read(manifest, 16 * 1024 * 1024).toString("utf8");
+		return parseRuntimeStagingManifest(JSON.parse(raw)).changes.length;
+	} catch { return null; }
 }
 
 function settleUnlaunchedOperation(graphStore: GraphStore, runId: string, operation: OperationRow, status: "failed" | "cancelled"): Record<string, unknown> {

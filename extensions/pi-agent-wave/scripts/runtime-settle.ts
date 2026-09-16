@@ -98,25 +98,31 @@ export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlem
 	const answer = answerBytes.length ? content.retain(answerBytes) : null;
 	let manifest: RuntimeContent | null = null;
 	let files: readonly RuntimeContent[] = [];
+	let changes: readonly { readonly path: string }[] = [];
 	let checkpoint: RuntimeCheckpoint | null = null;
 	if (config.kind === "coding" || config.kind === "operational") {
 		if (config.snapshotPath === null) throw new Error(`${config.kind} settlement requires an AgentFS snapshot`);
 		const staged = stageRuntimeAgentFs({ agentFsExecutable: config.agentFsExecutable, snapshotPath: config.snapshotPath, baseDir: config.baseDir, baseRevision: config.baseRevision, attemptKey: config.attemptKey, ownedPaths: config.ownedPaths, readOnly: false }, content);
-		manifest = staged.manifest; files = staged.files;
+		manifest = staged.manifest; files = staged.files; changes = staged.changes;
 		if (config.kind === "operational" && config.checkpointPath) checkpoint = observeCheckpoint(content, staged.changes, config.baseDir, config.checkpointPath);
 	}
+	// The staging manifest exists for every owned-write attempt, so it is never evidence of work on its own: a worker
+	// whose reply was not captured and which changed nothing has no candidate, and settles as the transient empty answer
+	// the store already recovers from. A deletion counts as a change even though it stages no file content.
+	const candidate: RuntimeCandidate | null = config.kind === "coding" && manifest && (answer || changes.length)
+		? parseRuntimeCandidate({ kind: "coding", answer, artifacts: [manifest, ...files], baseRevision: config.baseRevision })
+		: config.kind === "operational" && manifest && answer
+			? parseRuntimeCandidate({ kind: "operational", answer, artifacts: [manifest, ...files], baseRevision: config.baseRevision, checkpoint })
+			: config.kind === "research" && answer ? parseRuntimeCandidate({ kind: "research", answer, sources: [] }) : null;
 	const observation = parseRuntimeObservation({
 		sessionId: typeof capture.sessionId === "string" ? capture.sessionId : typeof output.sessionId === "string" ? output.sessionId : "",
 		requestId: typeof capture.requestId === "string" ? capture.requestId : null,
 		sessionOrigin: capture.sessionOrigin ?? null,
 		captureStatus: capture.captureStatus,
-		manifest,
+		// An observation may only reference content a candidate retains (store.ts settleRuntimeAttempt); the manifest
+		// bytes stay in the content store either way, and an empty attempt is diagnosed from its retained capture stream.
+		manifest: candidate ? manifest : null,
 	});
-	const candidate: RuntimeCandidate | null = config.kind === "coding" && manifest
-		? parseRuntimeCandidate({ kind: "coding", answer, artifacts: [manifest, ...files], baseRevision: config.baseRevision })
-		: config.kind === "operational" && manifest && answer
-			? parseRuntimeCandidate({ kind: "operational", answer, artifacts: [manifest, ...files], baseRevision: config.baseRevision, checkpoint })
-			: config.kind === "research" && answer ? parseRuntimeCandidate({ kind: "research", answer, sources: [] }) : null;
 	const evidence: RuntimeSettlementEvidence = { schemaVersion: 1, resultContract: "runtime-v1", attemptKey: config.attemptKey, outcome, candidate, observation, answer, stagedFiles: files.length, diagnostics };
 	publishEvidence(config.evidencePath, evidence);
 	return evidence;

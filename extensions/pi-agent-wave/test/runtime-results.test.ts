@@ -253,6 +253,74 @@ test("a coding candidate without file changes is accepted without an integration
 	assert.equal(store.getOperation(operation.id).status, "completed");
 });
 
+/** The manifest shape a settled owned-write attempt observes: `changes` empty means the worker altered nothing. */
+function stagingManifest(store: GraphStore, attemptKey: string, changes: unknown[]) {
+	return store.retainRuntimeContent(Buffer.from(canonical({ version: 1, attemptKey, workspace: "/tmp/workspace", baseRevision: "base-1", snapshotDigest: "a".repeat(64), ownedPaths: ["agent-output/note.md"], changes, readOnly: false })));
+}
+
+/** Walks a build run past the plan node so the next attempt sits at `implement`, where coding candidates arrive. */
+function atImplementNode() {
+	const root = mkdtempSync(join(tmpdir(), "runtime-results-implement-"));
+	roots.push(root);
+	const store = new GraphStore({ dbPath: join(root, "graph.db"), random: () => 0.5 });
+	stores.push(store);
+	const route = (role: string, capabilityFloor: string) => ({ role, tier: "exact" as const, chain: ["openai-codex/gpt-5.6-sol"], thinking: "high", session: true, capabilityFloor, selectionSource: "model", promoted: false, promotionReason: null });
+	const run = store.initRun("runtime", "build", "Implement", {
+		input: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "Pinned test input" },
+		routes: [route("thinker", "planning"), route("implementer", "implementation")],
+	}, undefined, "runtime-v1");
+	const operation = store.next(run.runId).operations[0]!;
+	const input = { identity: createHeadlessAcpxAttemptIdentity({ runId: run.runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: "openai-codex/gpt-5.6-sol", agent: "codex" }), sessionId: "session-1", requestId: "request-1", policyDigest: store.policy(run.runId).digest };
+	store.beginRuntimeAttempt(input);
+	const plan = store.retainRuntimeContent(Buffer.from("Plan: one slice"));
+	store.settleRuntimeAttempt({ attemptKey: input.identity.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer: plan, sources: [] } });
+	store.decideRuntimeCandidate({ attemptKey: input.identity.attemptKey, decision: "accepted", reason: "plan reviewed", payload: { slices: [{ id: "s1", name: "s1", task: "Implement", ownedPaths: ["agent-output/note.md"] }] } });
+	const implement = store.next(run.runId).operations[0]!;
+	assert.equal(implement.node, "implement");
+	const identity = createHeadlessAcpxAttemptIdentity({ runId: run.runId, operationId: implement.id, role: "implementer", modelAttempt: 0, transientAttempt: 0, selectedModel: "openai-codex/gpt-5.6-sol", agent: "codex" });
+	store.beginRuntimeAttempt({ identity, sessionId: "session-2", requestId: "request-2", policyDigest: store.policy(run.runId).digest });
+	return { store, run, operation: implement, attemptKey: identity.attemptKey };
+}
+
+test("a coding candidate with neither an answer nor a change is refused acceptance and rejected into the retry path", () => {
+	// The field shape of run_74d142d5 (2026-09-16): capture dropped the reply, the overlay held no owned write,
+	// and the only artifact was the staging manifest itself, so acceptance would have advanced the graph on nothing.
+	const { store, run, operation, attemptKey } = atImplementNode();
+	const manifest = stagingManifest(store, attemptKey, []);
+	store.settleRuntimeAttempt({ attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "coding", answer: null, artifacts: [manifest], baseRevision: "base-1" }, observation: { sessionId: "s", requestId: "1", sessionOrigin: "loaded", captureStatus: "incomplete", manifest } });
+	assert.throws(() => store.decideRuntimeCandidate({ attemptKey, decision: "accepted", reason: "looks fine" }), /empty candidate/);
+	assert.equal(store.getOperation(operation.id).status, "running");
+	const rejected = store.decideRuntimeCandidate({ attemptKey, decision: "rejected", reason: "no answer and no change" });
+	assert.equal(rejected.attempt.acceptance, "rejected");
+	assert.equal(store.getState(run.runId).status, "awaiting_user");
+});
+
+test("the decision brief names the decision path the store will accept for each owned-write shape", () => {
+	const shapes = [
+		{ name: "changes", changes: [{ path: "agent-output/note.md", after: { sha256: "b".repeat(64), bytes: 12 }, mode: 0o644 }], answer: "Implemented", note: /op=integrate/ },
+		{ name: "no changes", changes: [], answer: "Plan: slices", note: /no file changes/ },
+		{ name: "nothing at all", changes: [], answer: "", note: /empty candidate/ },
+	] as const;
+	for (const shape of shapes) {
+		const { store, run, operation, attemptKey } = atImplementNode();
+		const manifest = stagingManifest(store, attemptKey, [...shape.changes]);
+		const answer = shape.answer ? store.retainRuntimeContent(Buffer.from(shape.answer)) : null;
+		store.settleRuntimeAttempt({ attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "coding", answer, artifacts: [manifest], baseRevision: "base-1" }, observation: { sessionId: "s", requestId: "1", sessionOrigin: "loaded", captureStatus: "complete", manifest } });
+		const brief = decisionBrief(store, run.runId, operation.id, store.runtimeAttempt(attemptKey));
+		assert.match(String(brief.note), shape.note, `${shape.name}: ${String(brief.note)}`);
+	}
+});
+
+test("a staging manifest that cannot be read leaves the brief on the integrate-first note instead of throwing", () => {
+	const { store, run, operation, attemptKey } = atImplementNode();
+	const manifest = stagingManifest(store, attemptKey, []);
+	const answer = store.retainRuntimeContent(Buffer.from("Implemented the slice"));
+	store.settleRuntimeAttempt({ attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "coding", answer, artifacts: [manifest], baseRevision: "base-1" }, observation: { sessionId: "s", requestId: "1", sessionOrigin: "loaded", captureStatus: "complete", manifest } });
+	writeFileSync(store.runtimeContentPath(manifest), Buffer.alloc(manifest.bytes, 0x7a), { mode: 0o600 });
+	const brief = decisionBrief(store, run.runId, operation.id, store.runtimeAttempt(attemptKey));
+	assert.match(String(brief.note), /op=integrate/);
+});
+
 function failedSettlement(attemptKey: string, error: string) {
 	return { attemptKey, outcome: { kind: "failed" as const, exitCode: 1, error } };
 }

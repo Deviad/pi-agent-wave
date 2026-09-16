@@ -107,6 +107,47 @@ test("coding settlement stages audited AgentFS changes and acceptance requires t
 	} finally { for (const store of stores) store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
+for (const scenario of [
+	{ name: "no owned write and no captured answer", write: false, answer: "", candidate: null, stagedFiles: 0 },
+	{ name: "an owned write whose answer was not captured", write: true, answer: "", candidate: "coding", stagedFiles: 1 },
+] as const) test(`a coding attempt with ${scenario.name} settles as candidate ${scenario.candidate ?? "null"}`, () => {
+	const root = mkdtempSync(join(tmpdir(), "runtime-settle-empty-"));
+	const stores: GraphStore[] = [];
+	try {
+		const base = join(root, "base"); mkdirSync(base);
+		const home = join(root, "home"); mkdirSync(home, { mode: 0o700 });
+		const env = { ...process.env, HOME: home, AGENTFS_HOME: home };
+		const git = (...args: string[]) => execFileSync("git", ["-C", base, ...args], { env, encoding: "utf8", stdio: "pipe" }).trim();
+		git("init"); writeFileSync(join(base, "note.txt"), "before"); git("add", "note.txt");
+		git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "base");
+		const baseRevision = git("rev-parse", "HEAD");
+		const store = new GraphStore({ dbPath: join(home, "graph.db") }); stores.push(store);
+		const run = store.initRun("settle", "build", "Implement", { input: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "test" }, routes: [{ role: "thinker", tier: "exact", chain: ["openai-codex/gpt-5.6-sol"], thinking: "high", session: true, capabilityFloor: "planning", selectionSource: "model", promoted: false, promotionReason: null }] }, undefined, "runtime-v1");
+		const operation = store.next(run.runId).operations[0]!;
+		const identity = createHeadlessAcpxAttemptIdentity({ runId: run.runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: "openai-codex/gpt-5.6-sol", agent: "codex" });
+		store.beginRuntimeAttempt({ identity, sessionId: "dg-session", requestId: null, policyDigest: store.policy(run.runId).digest });
+		execFileSync("agentfs", ["init", "--base", base, "candidate"], { cwd: root, env, stdio: "pipe" });
+		const source = join(root, ".agentfs", "candidate.db"); const snapshotPath = join(root, "closed.db");
+		if (scenario.write) execFileSync("agentfs", ["fs", source, "write", "/note.txt", "after"], { cwd: root, env, stdio: "pipe" });
+		execFileSync("python3", ["-c", "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); t=sqlite3.connect(sys.argv[2]); s.backup(t); t.execute('PRAGMA journal_mode=DELETE'); t.close(); s.close()", source, snapshotPath]);
+		const evidencePath = join(root, "runtime-settlement.json");
+		const evidence = settleRuntimeWorker(parseRuntimeSettleConfig({ schemaVersion: 1, attemptKey: identity.attemptKey, workerResultPath: workerResult(root, identity.attemptKey, scenario.answer, "incomplete"), kind: "coding", baseDir: base, baseRevision, ownedPaths: ["note.txt"], readOnly: false, snapshotPath, agentFsExecutable: "agentfs", evidencePath, dbPath: store.dbPath }));
+		assert.equal(evidence.candidate?.kind ?? null, scenario.candidate);
+		assert.equal(evidence.stagedFiles, scenario.stagedFiles);
+		assert.equal(evidence.observation.captureStatus, "incomplete", "the observation still records what the capture did");
+		// An observation may only reference content a retained candidate carries, so an empty attempt observes no manifest.
+		assert.equal(Boolean(evidence.observation.manifest), scenario.candidate !== null);
+		store.settleRuntimeAttempt({ attemptKey: identity.attemptKey, outcome: evidence.outcome, candidate: evidence.candidate ?? undefined, observation: evidence.observation });
+		if (scenario.candidate === null) {
+			const retried = store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id });
+			assert.equal(retried.classification, "worker-empty-answer", "an empty coding settlement reaches the existing transient recovery");
+			assert.equal(retried.operation.status, "pending");
+		} else {
+			assert.equal(store.runtimeAttempt(identity.attemptKey).candidate?.kind, "coding");
+		}
+	} finally { for (const store of stores) store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 for (const checkpoint of ["linkSync", "writeFileSync"] as const) test(`SIGKILL at ${checkpoint} between retention and evidence leaves no partial record and replays to the same settlement`, () => {
 	const root = mkdtempSync(join(tmpdir(), "runtime-settle-crash-"));
 	const store = new GraphStore({ dbPath: join(root, "graph.db") });

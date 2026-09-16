@@ -1632,6 +1632,10 @@ def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_
 
     The attempt directory is removed after a clean settlement, which left the 2026-09-12 operations smoke 3 with an
     exited, candidate-less synthesis attempt (`output-outside-prompt`) and nothing to diagnose it from.
+
+    A prompt worker's stream is written by RuntimeOutputFiles beside its result file, not at the attempt-directory
+    path the worker configuration names; that path only carries a `close` run. Both are searched, nearest first,
+    which is why run_74d142d5 (2026-09-16) retained nothing for exactly the failure this function exists to explain.
     """
     try:
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -1641,8 +1645,11 @@ def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_
     status = observation.get("captureStatus") if isinstance(observation, dict) else None
     if status == "complete" and evidence.get("candidate") is not None:
         return None
-    source = Path(str(resource.get("attempt_dir", ""))) / "worker.stdout.ndjson"
-    if not source.is_file():
+    worker_result = str(resource.get("worker_result", ""))
+    sources = [Path(worker_result).parent / "runtime-output" / "worker.stdout.ndjson"] if worker_result else []
+    sources.append(Path(str(resource.get("attempt_dir", ""))) / "worker.stdout.ndjson")
+    source = next((path for path in sources if path.is_file()), None)
+    if source is None:
         return None
     retained = run_dir / f"runtime-capture-{slugify(str(resource['agent']))}.ndjson"
     write_private_bytes(retained, source.read_bytes())
