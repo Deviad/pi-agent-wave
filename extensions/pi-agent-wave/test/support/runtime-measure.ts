@@ -148,7 +148,9 @@ async function loadTool(dbPath: string): Promise<{ execute: (params: Record<stri
 	delete process.env.HERDR_ENV; delete process.env.HERDR_WORKSPACE_ID; delete process.env.HERDR_TAB_ID;
 	const { default: extension } = await import(`../../index.ts?measure=${Date.now()}-${Math.random()}`);
 	let tool: { execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: (update: unknown) => void, ctx: unknown) => Promise<unknown> } | undefined;
-	extension({ registerCommand() {}, registerTool(definition: typeof tool) { tool = definition; }, exec, sendUserMessage() {} });
+	// The extension subscribes to session_shutdown to close its interactive views; the driver has no session, so the
+	// handler is registered and never fired. Without `on` the extension throws before registering its tool.
+	extension({ registerCommand() {}, registerTool(definition: typeof tool) { tool = definition; }, exec, sendUserMessage() {}, on() {} });
 	if (!tool) throw new Error("delegate_graph tool did not register");
 	const registered = tool;
 	return { execute: (params, onUpdate, ctx) => registered.execute("measure", params, undefined, onUpdate, ctx) };
