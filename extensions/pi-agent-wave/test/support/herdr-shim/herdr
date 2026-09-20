@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""A Herdr CLI stub that really tracks one workspace's tabs, for tests that must read real CLI behaviour.
+
+The cleanup absence audit shells out to `herdr`, so a test that replaces the Python `run()` helper
+silently bypasses the very check that makes a failing `herdr` call a failure: `run()` is what turns a
+non-zero exit into a `DelegateError`. This stub is an executable on `PATH` instead, so `run()` stays the
+shipped one and the exit codes are real.
+
+State lives in `$FAKE_HERDR_STATE` as JSON: `tab_id`, `tab_open`, `close_fails`, and every argv it was
+called with, so a test can assert the exact call order and that a close really happened.
+
+Usage: PATH=<this dir>:$PATH FAKE_HERDR_STATE=<file> <caller>
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+state_path = Path(os.environ["FAKE_HERDR_STATE"])
+state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {"tab_id": "", "tab_open": True, "close_fails": False, "calls": []}
+argv = sys.argv[1:]
+state["calls"].append(argv)
+
+
+def save() -> None:
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+if argv[:2] == ["tab", "list"]:
+    save()
+    workspace = argv[3] if len(argv) > 3 else ""
+    tabs = [{"tab_id": state["tab_id"], "workspace_id": workspace}] if state["tab_open"] else []
+    print(json.dumps({"tabs": tabs}))
+    sys.exit(0)
+
+if argv[:2] == ["tab", "close"]:
+    if state["close_fails"]:
+        save()
+        print("herdr: tab is busy", file=sys.stderr)
+        sys.exit(1)
+    state["tab_open"] = False
+    save()
+    print(json.dumps({"closed": argv[2]}))
+    sys.exit(0)
+
+if argv[:2] in (["pane", "get"], ["agent", "get"]):
+    save()
+    if state["tab_open"]:
+        print(json.dumps({"result": {"id": argv[2]}}))
+        sys.exit(0)
+    sys.exit(1)
+
+# Anything else is not a call this stub models, and saying so is better than inventing an answer.
+save()
+print(f"herdr-shim: unmodelled invocation {argv!r}", file=sys.stderr)
+sys.exit(1)

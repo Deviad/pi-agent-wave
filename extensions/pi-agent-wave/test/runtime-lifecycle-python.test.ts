@@ -250,4 +250,67 @@ print(json.dumps({
 			assert.equal(out.cleanRetained, null, "a complete capture carrying a candidate retains nothing");
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
+
+	test("a settled Herdr worker's tab is closed before the absence audit, and a close that fails is still reported", () => {
+		const root = mkdtempSync(join(tmpdir(), "runtime-py-herdr-settle-"));
+		try {
+			const result = python(prelude + `
+core.ACTIVE_TRANSPORT = 'herdr'
+os.environ['HERDR_WORKSPACE_ID'] = 'workspace-fixture'
+os.environ['HERDR_TAB_ID'] = 'caller-tab-fixture'
+# The shipped run() helper stays in place: the Herdr CLI is an executable on PATH here, so a failing
+# close reaches it as a genuine non-zero exit instead of being simulated inside this process.
+herdr_shim = Path(sys.argv[1]).parent / 'test' / 'support' / 'herdr-shim'
+os.environ['PATH'] = str(herdr_shim) + os.pathsep + os.environ['PATH']
+model = 'openai-codex/gpt-5.6-sol'
+
+def case(name, close_fails):
+    base = root / f'base-{name}'; base.mkdir()
+    private = root / f'private-{name}'; private.mkdir(mode=0o700)
+    task = private / 'task.md'; task.write_text('Fixture task; no model is dispatched.'); task.chmod(0o600)
+    os.environ['DELEGATE_GRAPH_DB'] = str(root / f'graph-{name}.db')
+    os.chdir(base)
+    args = core.build_parser().parse_args(['start', str(private), 'searcher', '--node', 'search', '--model', model, '--access-mode', 'read-only'])
+    resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'settled-tab-fixture'}, 'fixture-worker', model, task, 'search')
+    resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher', 'node': 'search', 'tab': 'tab-fixture', 'pane': 'pane-fixture', 'worker_pid': None, 'execution': 'acpx-agentfs'})
+    core.write_state(private, {'caller_tab': 'caller-tab-fixture', 'transport': 'herdr', 'closed_tabs': [], 'resources': [resource], 'run_label': 'settled-tab-fixture'})
+    attempt = Path(resource['attempt_dir'])
+    output_dir = attempt / 'runtime-output'; output_dir.mkdir(mode=0o700)
+    answer = output_dir / 'public-answer.txt'; answer.write_text('Retained answer text'); answer.chmod(0o600)
+    worker_result = {'schemaVersion': 2, 'resultContract': 'runtime-v1', 'agent': 'codex', 'selectedModel': model, 'sessionName': resource['acpx_session'], 'attemptKey': resource['acpx_attempt_key'], 'outputDir': str(output_dir),
+      'output': {'schemaVersion': 1, 'attemptKey': resource['acpx_attempt_key'], 'sessionId': resource['acpx_session'], 'outcome': {'kind': 'exited', 'exitCode': 0},
+                 'capture': {'requestId': '3', 'sessionId': 'acp-created', 'sessionOrigin': 'created', 'captureStatus': 'complete', 'responseCompleteness': 'unverified', 'inputBytes': 1, 'answerBytes': 20, 'publicChunks': 1, 'ignoredEvents': 0, 'peakBufferedBytes': 1, 'diagnostics': []}, 'stderrTruncated': False}}
+    Path(resource['worker_result']).write_text(json.dumps(worker_result))
+    herdr_state = root / f'herdr-{name}.json'
+    herdr_state.write_text(json.dumps({'tab_id': 'tab-fixture', 'tab_open': True, 'close_fails': close_fails, 'calls': []}))
+    os.environ['FAKE_HERDR_STATE'] = str(herdr_state)
+    core.observe_presentation_identity = lambda r: {'presentationVerified': True, 'identityMatches': True, 'transport': 'herdr', 'herdrVisible': True}
+    core.close_acpx_attempt = lambda r: {'closed': True, 'noSession': True}
+    core.release_agentfs_session = lambda r: []
+    core.abort_acpx_attempt = lambda r, **k: []
+    audit = core.settle_runtime_attempt(private, resource)
+    herdr = json.loads(herdr_state.read_text())
+    evidence = audit.get('cleanupEvidencePath')
+    return {'failures': audit['postSettlementFailures'], 'cleanupEvidence': evidence, 'cleanupEvidenceExists': bool(evidence) and Path(evidence).exists(),
+            'herdrCalls': herdr['calls'], 'tabStillOpen': herdr['tab_open'], 'valid': audit['valid'],
+            'closedTabs': core.read_state(private).get('closed_tabs'), 'attemptDirRemained': attempt.exists()}
+
+print(json.dumps({'settled': case('settled', False), 'closeFails': case('close-fails', True)}))
+`, root);
+			assert.equal(result.status, 0, result.stderr);
+			const out = JSON.parse(result.stdout);
+			const settled = out.settled;
+			assert.deepEqual(settled.herdrCalls, [["tab", "close", "tab-fixture"], ["tab", "list", "--workspace", "workspace-fixture"], ["pane", "get", "pane-fixture"], ["agent", "get", "fixture-worker"]], `the tab must be closed before the audit enumerates the workspace: ${JSON.stringify(settled.herdrCalls)}`);
+			assert.equal(settled.tabStillOpen, false, "a happily settled worker must not leave its tab open");
+			assert.deepEqual(settled.failures, [], "and it must report no post-settlement failure");
+			assert.equal(settled.cleanupEvidenceExists, true, "the absence audit must pass and write its evidence");
+			assert.deepEqual(settled.closedTabs, ["tab-fixture"], "the close is recorded in run state, so a repeated close is a no-op");
+			assert.equal(settled.attemptDirRemained, false);
+			const closeFails = out.closeFails;
+			assert.match(String(closeFails.failures.join("\n")), /tab is busy/, `a close that fails must be reported: ${JSON.stringify(closeFails)}`);
+			assert.match(String(closeFails.failures.join("\n")), /tabAbsent/, "and the audit that follows must still name the tab it could not verify absent");
+			assert.equal(closeFails.cleanupEvidence, null, "no absence evidence may be written while the tab survives");
+			assert.equal(closeFails.tabStillOpen, true, "the fixture's failing close must not be mistaken for a closed tab");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
 });

@@ -1864,6 +1864,15 @@ def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str,
     if not post_settlement_failures:
         shutil.rmtree(Path(str(resource["attempt_dir"])), ignore_errors=True)
         shutil.rmtree(Path(str(resource["acpx_home"])), ignore_errors=True)
+    # A settled Herdr worker keeps its tab until something closes it, and the absence audit below refuses
+    # to pass while that tab is listed. The close is therefore part of settling rather than a remedy for a
+    # failed wait, so it happens here: after the worker settled and its ACPX session closed, before the
+    # audit. Its own failure is recorded and the audit still runs, so "the tab could not be closed" is
+    # distinguishable from "the audit was never reached".
+    try:
+        close_settled_tab(run_dir, resource)
+    except DelegateError as error:
+        post_settlement_failures.append(str(error))
     cleanup_evidence: Path | None = None
     try:
         post_settlement_failures.extend(release_agentfs_session(resource))
