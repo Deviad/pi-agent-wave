@@ -1,4 +1,4 @@
-import { describe, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -13,6 +13,22 @@ import { packageRoot } from "./support/repoRoot.ts";
 
 function python(script: string, args: string[] = []) {
 	return spawnSync("python3", [script, ...args], { cwd: packageRoot, encoding: "utf8", timeout: 120_000 });
+}
+
+/**
+ * Scratch roots the drivers created, removed after every test. Collected rather than removed inline so a
+ * failing assertion above the removal cannot leak a directory - which is how six of these accumulated.
+ */
+const driverRoots: string[] = [];
+afterEach(() => { for (const root of driverRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+/** Runs a driver and takes ownership of the scratch root it reports. */
+function driver(name: string, args: string[] = []): Record<string, any> {
+	const run = python(join(packageRoot, "test/support", name), args);
+	assert.equal(run.status, 0, run.stderr);
+	const result = JSON.parse(run.stdout) as Record<string, any>;
+	if (typeof result.root === "string") driverRoots.push(result.root);
+	return result;
 }
 
 describe("pane reading", () => {
@@ -40,9 +56,7 @@ describe("pane reading", () => {
 
 describe("headless live stream endpoint", () => {
 	test("publishes the running worker's output on a token-gated loopback endpoint that dies with the supervisor", () => {
-		const run = python(join(packageRoot, "test/support/stream-endpoint-driver.py"));
-		assert.equal(run.status, 0, run.stderr);
-		const result = JSON.parse(run.stdout);
+		const result = driver("stream-endpoint-driver.py");
 
 		// One resolver, one backend per platform, pinned for every supported platform.
 		assert.deepEqual(result.backends, { Darwin: "loopback-tcp", Linux: "loopback-tcp", Windows: "loopback-tcp" });
@@ -77,7 +91,6 @@ describe("headless live stream endpoint", () => {
 
 		// The channel retains nothing of its own: no replay file, no transcript, only the capture path's files.
 		assert.deepEqual(result.filesAfterExit, ["fixture-worker.sh", "gate", "status.json", "stderr", "stdout"], "the channel leaves no artifact behind");
-		rmSync(String(result.root), { recursive: true, force: true });
 	});
 
 	test("a subscriber that stops reading loses its view rather than stalling the worker", () => {
@@ -86,13 +99,10 @@ describe("headless live stream endpoint", () => {
 		// backpressured the worker's PTY: the capture file froze mid-run and the worker never finished.
 		// Verified as a real regression guard by reintroducing the blocking socket, which wedges the worker
 		// for the full budget; with the non-blocking publish the same worker finishes in well under a second.
-		const run = python(join(packageRoot, "test/support/stream-backpressure-driver.py"));
-		assert.equal(run.status, 0, run.stderr);
-		const result = JSON.parse(run.stdout);
+		const result = driver("stream-backpressure-driver.py");
 		assert.equal(result.workerFinished, true, `the worker must finish while a subscriber stalls (${result.elapsedSeconds}s of ${result.budgetSeconds}s)`);
 		assert.ok(result.elapsedSeconds < 30, `and must not merely scrape in under the budget: took ${result.elapsedSeconds}s`);
 		assert.ok(result.captureBytes > 1_000_000, `the capture must hold the worker's full output, got ${result.captureBytes} bytes`);
-		rmSync(String(result.root), { recursive: true, force: true });
 	});
 
 	test("an unbindable loopback is a named blocker before dispatch, not a worker that cannot be watched", () => {
