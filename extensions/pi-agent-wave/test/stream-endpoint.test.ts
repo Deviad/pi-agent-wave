@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { packageRoot } from "./support/repoRoot.ts";
@@ -53,6 +53,13 @@ describe("headless live stream endpoint", () => {
 		assert.equal(result.endpoint.host, "127.0.0.1");
 		assert.ok(Number(result.endpoint.port) > 0, `an ephemeral port was assigned: ${result.endpoint.port}`);
 		assert.equal(result.tokenAppeared, true);
+		// The descriptor is read by anyone polling for it, so it must never be observable half-written.
+		// The counter below is best-effort - the write is fast enough that a poll often misses the window -
+		// so atomicity is pinned by asserting how the file is published, which is deterministic.
+		assert.equal(result.descriptorInvalidReads, 0, "no poll saw a half-written descriptor");
+		assert.match(readFileSync(join(packageRoot, "scripts", "headless_supervisor.py"), "utf8"), /publish_private_file\(endpoint,/, "the endpoint descriptor is published by an atomic rename");
+		assert.equal(/endpoint\.write_text\(/.test(readFileSync(join(packageRoot, "scripts", "headless_supervisor.py"), "utf8")), false, "and never by truncate-then-write");
+		assert.match(readFileSync(join(packageRoot, "scripts", "stream_endpoint.py"), "utf8"), /publish_private_file\(token_path,/, "the bearer token is published the same way");
 		assert.equal(result.tokenMode, "0o600");
 
 		// A connection without the token is refused and is given no worker output at all.

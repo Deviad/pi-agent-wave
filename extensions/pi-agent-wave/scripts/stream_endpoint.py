@@ -15,6 +15,7 @@ and a FIFO would be POSIX-only and would hang any directory scan that touched it
 from __future__ import annotations
 
 import errno
+import os
 import platform
 import secrets
 import socket
@@ -32,6 +33,23 @@ STREAM_HOST = "127.0.0.1"
 # capture is the record, this channel is the view.
 STREAM_BACKLOG_LINES = 200
 TOKEN_BYTES = 32
+
+
+def publish_private_file(path: Path, content: str) -> None:
+    """Writes a private file atomically: a reader that polls for the path must never see it half-written.
+
+    `Path.write_text` truncates and then writes, so a poller that keys on existence can read an empty or
+    partial file. The result file of a runtime attempt had the same defect and was fixed the same way.
+    """
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(handle, content.encode("utf-8"))
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+    os.replace(temporary, path)
+    path.chmod(0o600)
 
 
 def resolve_stream_backend(system: str | None = None) -> str:
@@ -77,8 +95,7 @@ class StreamPublisher:
         self._server.bind((host, 0))
         self._server.listen(8)
         self.host, self.port = self._server.getsockname()[:2]
-        token_path.write_text(f"{self._token}\n", encoding="utf-8")
-        token_path.chmod(0o600)
+        publish_private_file(token_path, f"{self._token}\n")
         self._token_path = token_path
         self._accepting = threading.Thread(target=self._accept_loop, daemon=True)
         self._accepting.start()

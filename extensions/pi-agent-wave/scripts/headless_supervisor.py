@@ -15,7 +15,7 @@ import threading
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from stream_endpoint import StreamPublisher, probe_stream_endpoint, resolve_stream_backend
+from stream_endpoint import StreamPublisher, probe_stream_endpoint, publish_private_file, resolve_stream_backend
 
 
 def drain(stream, target, publisher=None) -> None:
@@ -59,8 +59,8 @@ def main() -> None:
         publisher = StreamPublisher(Path(args.stream_token))
         if args.stream_endpoint:
             endpoint = Path(args.stream_endpoint)
-            endpoint.write_text(json.dumps({"schemaVersion": 1, "backend": resolve_stream_backend(), "host": publisher.host, "port": publisher.port}, sort_keys=True) + "\n", encoding="utf-8")
-            endpoint.chmod(0o600)
+            # Atomic: a subscriber polls for this descriptor, and a truncated read would fail it.
+            publish_private_file(endpoint, json.dumps({"schemaVersion": 1, "backend": resolve_stream_backend(), "host": publisher.host, "port": publisher.port}, sort_keys=True) + "\n")
     with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
         script = shutil.which("script")
         if script is None:

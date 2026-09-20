@@ -80,7 +80,25 @@ report: dict[str, object] = {
     "endpointAppeared": wait_for(endpoint_path),
 }
 report["tokenMode"] = oct(token_path.stat().st_mode & 0o777) if token_path.exists() else None
-endpoint = json.loads(endpoint_path.read_text(encoding="utf-8")) if endpoint_path.exists() else {}
+# Poll the descriptor as tightly as the platform allows and record every read that did not parse. A
+# descriptor published by truncate-then-write is readable while it is still empty, which is exactly what a
+# subscriber keying on existence would hit.
+invalid_reads = 0
+attempts = 0
+while not endpoint_path.exists() and attempts < 20_000:
+    attempts += 1
+endpoint: dict = {}
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    try:
+        parsed = json.loads(endpoint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        invalid_reads += 1
+        continue
+    if parsed:
+        endpoint = parsed
+        break
+report["descriptorInvalidReads"] = invalid_reads
 report["endpoint"] = endpoint
 token = token_path.read_text(encoding="utf-8").strip() if token_path.exists() else ""
 

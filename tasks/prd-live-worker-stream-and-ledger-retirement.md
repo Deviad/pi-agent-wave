@@ -407,6 +407,16 @@ Two things this run proves that no fixture could:
   any exit including a signal, the fixture worker's wait is bounded, the tests kill the process group
   reported in the driver's record, and each test removes the driver's scratch root. Repeated runs of the
   three driver-based suites now leave 0 orphans, 0 scratch directories and 0 run directories.
+- **The stream endpoint descriptor was published non-atomically.** `headless_supervisor.py` wrote it with
+  `write_text`, which truncates and then writes, so a reader keying on the file's existence could parse it
+  while it was still empty. Found by chasing an intermittent failure in "a subscriber that stops reading
+  loses its view", whose driver polls for that descriptor: it failed roughly one full-suite run in three
+  with a JSON decode error at 190 ms. The same defect class as the runtime result file fixed earlier, and it
+  now feeds a view that polls the descriptor every redraw. The descriptor and the bearer token are both
+  published by an atomic rename of a fully written, fsynced mode-600 sibling. The poll counter stayed at
+  zero even with the defect reintroduced - the write is too fast for a poll to catch it reliably - so
+  atomicity is pinned deterministically by asserting how the file is published, and that assertion was
+  verified to fail with the defect present.
 - **The failure bundle read the wrong stream path.** `write_failure_diagnostics` read
   `attempt_dir/worker.stdout.ndjson`, but a prompt worker writes its stream beside its result file, which
   is the asymmetry `retain_incomplete_capture` already documents and works around. The bundle's
