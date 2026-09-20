@@ -252,6 +252,35 @@ other, so that the record does not carry silent gaps.
       `test/acpx-collect-convergence.test.ts` asserts the second response names the same existing bundle
       as the first. Both READMEs record the rename.
 
+## 3b. Review findings fixed after implementation (2026-09-20)
+
+An adversarial self-review of the implemented change found three defects, each proven against a real
+worker or a real hanging executable before and after the fix. No Astra reviewer was configured or
+reachable on this host, so this was a single-reviewer pass.
+
+- **Critical - a stalled subscriber wedged the worker.** `StreamPublisher.publish` used a blocking
+  `sendall` while holding its lock, on the same thread that drains the worker's stdout. A subscriber that
+  authenticated and then stopped reading filled the socket buffer, held the drain thread, backpressured
+  the PTY and stalled the run: measured with a real worker, the capture file froze at 556,629 bytes and
+  had not advanced 36 s later. Publishing is now non-blocking and a subscriber that cannot keep up is
+  dropped. The same worker now finishes in under a second with a stalled subscriber attached.
+  Guard: "a subscriber that stops reading loses its view rather than stalling the worker", verified as a
+  real regression test by reintroducing the blocking socket (worker wedged for the full 60 s budget)
+  and removing it again (0.5 s).
+- **Critical - a hung `herdr` froze the Pi terminal.** `readPane` ran `spawnSync` with no timeout on the
+  UI thread, once per worker per redraw (default 2 s). Against a stub `herdr` that sleeps, the call never
+  returned in 45 s. It now carries a 1 s timeout and reports an unreadable pane as absent, returning in
+  1001 ms. Guard: "a hung pane read gives up instead of freezing the view it runs on".
+- **High - worker output could steer the reported diagnostic path.** `retainedDiagnosticFromOutcome`
+  matched `retained worker diagnostics:` anywhere in the settled error, whose leading portion is the
+  worker's own stderr. A worker printing that prefix won the match ahead of the supervisor's line
+  (demonstrated: the parse returned `/etc/hosts`). It now reads only the final line and only accepts a
+  path inside the store's evidence home. Guard: "a worker's own output cannot steer the diagnostic path
+  a repeated collect reports", covering the leading-decoy, outside-home and traversal cases.
+
+Checked and found sound: the ledger command rejects unsupported outcomes and claim statuses, and a
+non-numeric aggregate fails the insert with no partial entry left behind.
+
 ## 4. Functional Requirements
 
 - FR-1: A retained capture must be bounded by the diagnostic windows already used for failure bundles.

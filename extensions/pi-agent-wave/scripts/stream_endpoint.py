@@ -104,38 +104,54 @@ class StreamPublisher:
                 connection.sendall(b"unauthorized\n")
                 connection.close()
                 return
-            connection.settimeout(None)
+            # Never blocking from here on: this socket is about to be written from the drain thread.
+            connection.setblocking(False)
             with self._lock:
                 if self._closed:
                     connection.close()
                     return
-                for line in self._backlog:
-                    connection.sendall(line.encode("utf-8"))
+                backlog = "".join(self._backlog)
                 self._subscribers.append(connection)
+            if backlog:
+                self._send(connection, backlog.encode("utf-8"))
         except OSError:
             try:
                 connection.close()
             except OSError:
                 pass
 
+    def _send(self, connection: socket.socket, data: bytes) -> bool:
+        """One non-blocking write. False means the subscriber is gone or cannot keep up.
+
+        A subscriber is never allowed to slow the worker down, so a socket whose buffer is full is
+        dropped rather than waited for: a blocking `sendall` here holds the drain thread, which stops
+        the capture file and backpressures the worker's PTY until the reader resumes. A viewer that
+        stalls must lose its view, not stall the run.
+        """
+        try:
+            connection.sendall(data)
+            return True
+        except (BlockingIOError, OSError):
+            return False
+
     def publish(self, chunk: str) -> None:
-        """Sends one chunk of worker output to every subscriber; a dead subscriber is dropped, never raised."""
+        """Offers one chunk of worker output to every subscriber, without ever waiting for one."""
         if not chunk:
             return
         data = chunk.encode("utf-8")
         with self._lock:
             self._backlog.append(chunk)
-            live: list[socket.socket] = []
-            for connection in self._subscribers:
-                try:
-                    connection.sendall(data)
-                    live.append(connection)
-                except OSError:
-                    try:
-                        connection.close()
-                    except OSError:
-                        pass
-            self._subscribers = live
+            subscribers = list(self._subscribers)
+        dropped = [connection for connection in subscribers if not self._send(connection, data)]
+        if not dropped:
+            return
+        with self._lock:
+            self._subscribers = [connection for connection in self._subscribers if connection not in dropped]
+        for connection in dropped:
+            try:
+                connection.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         """Ends the channel with the supervisor: the listener closes, subscribers drop, the token is removed."""

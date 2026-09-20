@@ -7,7 +7,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, st
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { renderLog, renderStatus } from "./commands.ts";
 import delegationIdentityExtension from "./delegation-identity.ts";
 import { supervisorContract } from "./contract.ts";
@@ -241,12 +241,23 @@ function retainRunRecord(graphStore: GraphStore, runId: string, path: string): s
 	return graphStore.retainRunEvidence(runId, basename(path), readFileSync(path));
 }
 
-/** The retained bundle a settled outcome already names, so a repeated report points at the same file. */
-function retainedDiagnosticFromOutcome(attempt: RuntimeAttempt): string | null {
+/**
+ * The retained bundle a settled outcome already names, so a repeated report points at the same file.
+ *
+ * Only the final line is read, and only when it resolves inside the store's own evidence home. The rest of
+ * that error is the worker's stderr, which this process does not control: a worker that printed
+ * `retained worker diagnostics: /etc/hosts` would otherwise have its line matched ahead of ours and steer
+ * the reported path. Worker output is data here, never an instruction about which file to name.
+ */
+export function retainedDiagnosticFromOutcome(graphStore: GraphStore, attempt: RuntimeAttempt): string | null {
 	const error = attempt.outcome && "error" in attempt.outcome ? attempt.outcome.error : null;
 	if (typeof error !== "string") return null;
-	const named = /retained (?:worker )?diagnostics: (.+)$/m.exec(error)?.[1]?.trim();
-	return named && existsSync(named) ? named : null;
+	const named = /^retained (?:worker )?diagnostics: (.+)$/.exec(error.split("\n").at(-1)?.trim() ?? "")?.[1]?.trim();
+	if (!named) return null;
+	const home = join(dirname(graphStore.dbPath), "evidence");
+	const resolved = resolve(named);
+	if (resolved !== home && !resolved.startsWith(`${home}/`)) return null;
+	return existsSync(resolved) ? resolved : null;
 }
 
 /** Newest retained failure diagnostic bundle in one private run directory, if the launcher kept one. */
@@ -646,7 +657,7 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 	// A repeated collect settles nothing and so learns no path of its own, but the attempt it reports is the
 	// same one: the retained diagnostic named in the settled outcome is read back rather than dropped, so the
 	// second response points at the same bundle as the first.
-	if (!diagnosticsPath) diagnosticsPath = retainedDiagnosticFromOutcome(attempt) ?? undefined;
+	if (!diagnosticsPath) diagnosticsPath = retainedDiagnosticFromOutcome(graphStore, attempt) ?? undefined;
 	progress("runtime_attempt_settled", { runId, operationId, agentName: agent.name, attemptKey, processState: attempt.processState, candidate: attempt.candidate?.kind ?? null, acceptance: attempt.acceptance, postSettlementFailures: postSettlementFailures.length, configurationSelfWrites: configurationSelfWrites.length });
 	return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: attempt.candidate?.kind ?? null, ...decisionBrief(graphStore, runId, operationId, attempt), settlementEvidencePath: settlementEvidencePath ?? null, cleanupEvidencePath: cleanupEvidencePath ?? null, captureRetainedPath: captureRetainedPath ?? null, diagnosticsPath: diagnosticsPath ?? null, postSettlementFailures, configurationSelfWrites, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
 }

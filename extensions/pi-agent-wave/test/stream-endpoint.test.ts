@@ -1,6 +1,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { packageRoot } from "./support/repoRoot.ts";
 
@@ -12,6 +14,29 @@ import { packageRoot } from "./support/repoRoot.ts";
 function python(script: string, args: string[] = []) {
 	return spawnSync("python3", [script, ...args], { cwd: packageRoot, encoding: "utf8", timeout: 120_000 });
 }
+
+describe("pane reading", () => {
+	test("a hung pane read gives up instead of freezing the view it runs on", () => {
+		// readPane runs synchronously on the UI thread, once per worker per redraw, so an unbounded
+		// spawnSync freezes the whole Pi terminal for as long as `herdr` hangs. Proven against a real
+		// hanging executable: without the timeout this call never returned.
+		const stub = mkdtempSync(join(tmpdir(), "hung-herdr-"));
+		try {
+			writeFileSync(join(stub, "herdr"), "#!/bin/sh\nsleep 300\n", { mode: 0o700 });
+			const probe = spawnSync(process.execPath, ["--experimental-strip-types", "-e", `
+				import { readPane } from ${JSON.stringify(join(packageRoot, "lib", "pane-read.ts"))};
+				const started = Date.now();
+				const value = readPane("wA:p1", 5);
+				process.stdout.write(JSON.stringify({ elapsedMs: Date.now() - started, value }));
+			`], { encoding: "utf8", timeout: 30_000, env: { ...process.env, PATH: `${stub}:${process.env.PATH}` } });
+			assert.equal(probe.signal, null, "the probe itself must not be the thing that timed out");
+			assert.equal(probe.status, 0, probe.stderr);
+			const observed = JSON.parse(probe.stdout);
+			assert.equal(observed.value, null, "a pane that cannot be read in time reads as absent");
+			assert.ok(observed.elapsedMs < 5_000, `the read must give up quickly, took ${observed.elapsedMs}ms`);
+		} finally { rmSync(stub, { recursive: true, force: true }); }
+	});
+});
 
 describe("headless live stream endpoint", () => {
 	test("publishes the running worker's output on a token-gated loopback endpoint that dies with the supervisor", () => {
@@ -45,6 +70,20 @@ describe("headless live stream endpoint", () => {
 
 		// The channel retains nothing of its own: no replay file, no transcript, only the capture path's files.
 		assert.deepEqual(result.filesAfterExit, ["fixture-worker.sh", "gate", "status.json", "stderr", "stdout"], "the channel leaves no artifact behind");
+	});
+
+	test("a subscriber that stops reading loses its view rather than stalling the worker", () => {
+		// The first implementation published with a blocking sendall on the drain thread, so a subscriber
+		// that authenticated and stopped reading filled the socket buffer, held the drain thread and
+		// backpressured the worker's PTY: the capture file froze mid-run and the worker never finished.
+		// Verified as a real regression guard by reintroducing the blocking socket, which wedges the worker
+		// for the full budget; with the non-blocking publish the same worker finishes in well under a second.
+		const run = python(join(packageRoot, "test/support/stream-backpressure-driver.py"));
+		assert.equal(run.status, 0, run.stderr);
+		const result = JSON.parse(run.stdout);
+		assert.equal(result.workerFinished, true, `the worker must finish while a subscriber stalls (${result.elapsedSeconds}s of ${result.budgetSeconds}s)`);
+		assert.ok(result.elapsedSeconds < 30, `and must not merely scrape in under the budget: took ${result.elapsedSeconds}s`);
+		assert.ok(result.captureBytes > 1_000_000, `the capture must hold the worker's full output, got ${result.captureBytes} bytes`);
 	});
 
 	test("an unbindable loopback is a named blocker before dispatch, not a worker that cannot be watched", () => {
