@@ -1,6 +1,6 @@
 # Orphaned wait convergence: a torn-down Herdr attempt must be collectable and cancellable
 
-**Status:** Implemented (2026-09-20), branch `issue-orphaned-wait-convergence`. Attempts: 1. Every acceptance criterion below names the proof that was run.
+**Status:** Implemented (2026-09-20), branch `issue-orphaned-wait-convergence`, merged as `5002631`; story 4 below repairs a regression that merge shipped, on branch `issue-liveness-probe-target`. Attempts: 2. Every acceptance criterion below names the proof that was run.
 
 ## Problem
 
@@ -53,6 +53,29 @@ Acceptance criteria:
 
 - [x] `cancelRegisteredAttempt` gains a first branch: if `acpx_cancel_script` is a non-empty string but the file does not exist, it returns without executing anything (teardown already converged); the existing "script exists but fails" path stays an error. Presence is checked on the filesystem (`existsSync`, injectable for tests), not inferred from an exit code: rehearsed `spawn` of a missing path with `shell:false` (what `pi.exec` uses) emits ENOENT and `execCommand` resolves `code: 1`, not 127. Proof: `test/acpx-focus-cancellation.test.ts` gains "cancel converges when the launcher is already gone" asserting `cancelRegisteredAgent` resolves and the executor was not called, plus "cancel still fails when the launcher exists and exits non-zero" pinning the unchanged path.
 - [x] `op=cancel` on such an attempt records `cancelled` and the run leaves `active`. Proof: `test/acpx-collect-convergence.test.ts` "cancel converges on a torn-down attempt and closes the run" (`operation.status === "cancelled"`, `state.status === "cancelled"`).
+
+## User story 4 — the liveness probe must ask a question Herdr can answer
+
+As the supervisor, I want the Herdr liveness probe to target the worker's pane, so a healthy worker is not torn down five seconds after dispatch.
+
+Story 1 shipped `herdr agent get <agent_name>`. That query never resolves: captured 2026-09-20 against a running Herdr,
+
+```
+herdr agent get wR:p3                        -> result.agent = {agent: "dg_run-e5b0_thinker_8d06cc93", agent_status: "working", pane_id: "wR:p3"}
+herdr agent get dg_run-e5b0_thinker_8d06cc93 -> {"error":{"code":"agent_not_found"}}     # the same worker, alive
+herdr agent get wR:t3                        -> {"error":{"code":"agent_not_found"}}     # tab refs do not resolve either
+```
+
+so every Herdr worker was reported missing at the first probe and aborted. Observed on `run_daaa5712` (node `thinker_plan`): dispatched 07:51:25, settled `failed` 07:51:41 with "Herdr worker no longer registered before result", empty `stderrTail`, empty `recentEvents`, `workerResult {}` — the worker never produced anything.
+
+Why story 1's tests passed anyway: every case fed a fake `run` whose answer was written to match the branch under test, and no case asserted *which target* the probe passes. The rule this broke is the one in `AGENTS.md` about proving against the real thing when it is installed and runnable: `herdr` was running the whole time and one command would have shown it.
+
+Acceptance criteria:
+
+- [x] `herdr_agent_registered` takes the pane id and queries `herdr agent get <pane>`; the caller passes `resource["pane"]` and skips the probe when no pane is recorded. An unreadable answer still keeps the wait going, and the reported agent name is deliberately not compared, because Herdr's own screen detection may relabel a live pane. Proof: `test/herdr-worker-liveness.test.ts` case 2 asserts the exact argv `["herdr","agent","get","wZ:p9"]`, and new case 5 ("a live pane keeps the wait going even though the agent name would not resolve") feeds the real pair of shapes above and asserts no teardown.
+- [x] Mutation bind: restoring `herdr_agent_registered(agent_name)` fails cases 2 and 5 (`# pass 3 # fail 2`); reverted.
+- [x] Whole suite green after the fix: 546 tests, 535 pass, 0 fail, 11 skipped; `npx tsc -p tsconfig.json` exit 0.
+- [ ] Proven against the live run: `op=retry` on `run_daaa5712` `op_0e4981c3` produces a worker that survives past the probe interval and returns an answer. (Checked off once observed.)
 
 ## Verification gate
 

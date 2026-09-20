@@ -1084,9 +1084,20 @@ def wait_for_worker_exit(resource: dict[str, Any], timeout_ms: int | None = None
     return observation
 
 
-def herdr_agent_registered(agent_name: str) -> bool:
-    """False only when Herdr positively reports the agent unknown; any other answer keeps the wait going."""
-    probe = run(["herdr", "agent", "get", agent_name], check=False)
+def herdr_agent_registered(pane_id: str) -> bool:
+    """Whether Herdr still has an agent on the worker's pane.
+
+    The probe takes the PANE id, not the reported agent name: `herdr agent get` resolves
+    pane refs only, and answers `agent_not_found` for a name that is alive and `working`
+    in `herdr agent list`. Querying by name killed every worker about five seconds after
+    dispatch (run_daaa5712, 2026-09-20).
+
+    False only when Herdr positively reports no agent on that pane; an unreadable answer
+    is not evidence of absence and keeps the wait going, because WAIT_TIMEOUT_MS and the
+    attempt-directory check already bound it. The reported agent name is deliberately not
+    compared: Herdr's own screen detection may relabel a live pane.
+    """
+    probe = run(["herdr", "agent", "get", pane_id], check=False)
     try:
         return json_path(probe.stdout or probe.stderr, "error", "code") != "agent_not_found"
     except (ValueError, KeyError, TypeError):
@@ -1111,10 +1122,13 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
                 # disappearing (abort_acpx_attempt removes it) or Herdr forgetting the agent.
                 if str(attempt_dir) and not attempt_dir.exists():
                     raise DelegateError(f"Herdr worker attempt directory removed before result: {attempt_dir}")
-                if time.monotonic() >= next_liveness_probe:
+                pane_id = str(resource.get("pane", ""))
+                if pane_id and time.monotonic() >= next_liveness_probe:
                     next_liveness_probe = time.monotonic() + HERDR_LIVENESS_INTERVAL_S
-                    if not herdr_agent_registered(agent_name):
-                        raise DelegateError(f"Herdr worker no longer registered before result: {agent_name}")
+                    if not herdr_agent_registered(pane_id):
+                        raise DelegateError(
+                            f"Herdr worker no longer registered before result: {agent_name} on pane {pane_id}"
+                        )
             time.sleep(0.1)
         if not result_path.exists():
             raise DelegateError(f"ACPX worker result timed out: {result_path}")
