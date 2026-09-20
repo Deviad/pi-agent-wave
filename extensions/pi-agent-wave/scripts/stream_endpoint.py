@@ -29,9 +29,11 @@ LOOPBACK_TCP = "loopback-tcp"
 SUPPORTED_PLATFORMS = ("Darwin", "Linux", "Windows")
 
 STREAM_HOST = "127.0.0.1"
-# What a subscriber joining late is shown before live lines start. A window, never a replay: the file
-# capture is the record, this channel is the view.
-STREAM_BACKLOG_LINES = 200
+# What a subscriber joining late is shown before live output starts: the most recent pieces the worker
+# published, bounded in number and in size, so a fast worker cannot grow the channel's memory through it.
+# A window, never a replay: the file capture is the record, this channel is the view.
+STREAM_BACKLOG_CHUNKS = 200
+STREAM_BACKLOG_BYTES = 64 * 1024
 TOKEN_BYTES = 32
 
 
@@ -84,9 +86,12 @@ class StreamPublisher:
     binding question arises and the worker needs no change. The listener dies with the supervisor.
     """
 
-    def __init__(self, token_path: Path, host: str = STREAM_HOST, backlog_lines: int = STREAM_BACKLOG_LINES) -> None:
+    def __init__(self, token_path: Path, host: str = STREAM_HOST, backlog_chunks: int = STREAM_BACKLOG_CHUNKS, backlog_bytes: int = STREAM_BACKLOG_BYTES) -> None:
         self._token = secrets.token_hex(TOKEN_BYTES)
-        self._backlog: deque[str] = deque(maxlen=backlog_lines)
+        self._backlog: deque[str] = deque()
+        self._backlog_chunks = backlog_chunks
+        self._backlog_bytes = backlog_bytes
+        self._backlog_size = 0
         self._subscribers: list[socket.socket] = []
         self._lock = threading.Lock()
         self._closed = False
@@ -158,6 +163,11 @@ class StreamPublisher:
         data = chunk.encode("utf-8")
         with self._lock:
             self._backlog.append(chunk)
+            self._backlog_size += len(chunk)
+            # Both bounds trim from the oldest end, so the window stays what a late subscriber needs: the most
+            # recent output, not the beginning of the worker's life.
+            while self._backlog and (len(self._backlog) > self._backlog_chunks or self._backlog_size > self._backlog_bytes):
+                self._backlog_size -= len(self._backlog.popleft())
             subscribers = list(self._subscribers)
         dropped = [connection for connection in subscribers if not self._send(connection, data)]
         if not dropped:

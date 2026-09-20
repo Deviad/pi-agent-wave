@@ -105,6 +105,28 @@ describe("headless live stream endpoint", () => {
 		assert.ok(result.captureBytes > 1_000_000, `the capture must hold the worker's full output, got ${result.captureBytes} bytes`);
 	});
 
+	test("output with no newline reaches the capture and the channel while the worker is still running", () => {
+		// `read(size)` waited for 8 KB or EOF, and `readline` waits for a line ending, so a worker that prints
+		// without one reached neither sink. The launcher prints and then waits for a gate file, so both
+		// observations below are made while the worker provably cannot have exited.
+		const result = driver("partial-line-driver.py");
+		assert.equal(result.captureMarkerSeenWhileGated, true, "the capture must advance as the worker writes, not at a line ending");
+		assert.equal(result.gateStillClosedWhenSeen, true, "and that must be observed while the worker cannot have exited");
+		assert.equal(result.channelWhileRunning, "partial output with no newline", "the live channel publishes the unterminated remainder too");
+		assert.equal(result.tailInChannel, "tail line\n", "and the line that follows arrives as a line");
+		assert.equal(result.exitCode, 0);
+		const drain = result.drain;
+		assert.ok(drain.parts >= 2, `a long unterminated run is published as it arrives, not held until exit: ${JSON.stringify(drain)}`);
+		assert.ok(drain.maxPartBytes <= drain.chunkLimit, `no published part may exceed one read: ${JSON.stringify(drain)}`);
+		assert.equal(drain.carryWithheld, true, "a trailing carriage return waits for the next read rather than becoming a line ending of its own");
+		assert.equal(drain.captureMatchesNormalized, true, "the capture keeps one newline where the PTY's CRLF straddled two reads");
+		assert.equal(drain.partsConcatenationMatchesCapture, true, "and the channel's parts concatenate to the bytes the capture holds");
+		const window = result.window;
+		assert.ok(window.windowBytes <= window.cap + window.chunkBytes, `a late subscriber's window must stay bounded: ${JSON.stringify(window)}`);
+		assert.equal(window.hasNewest, true, "the window keeps the most recent output");
+		assert.equal(window.hasOldest, false, "and drops the oldest rather than growing with the worker");
+	});
+
 	test("an unbindable loopback is a named blocker before dispatch, not a worker that cannot be watched", () => {
 		// EPERM on a fresh loopback bind is what the restricted host in tasks/prd-runtime-owned-results.md
 		// returns, so the probe is forced to meet exactly that error rather than a fabricated one.

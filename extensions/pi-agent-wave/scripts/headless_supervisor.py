@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 from pathlib import Path
 import platform
@@ -17,21 +18,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from stream_endpoint import StreamPublisher, probe_stream_endpoint, publish_private_file, resolve_stream_backend
 
+READ_CHUNK_BYTES = 8192
+
 
 def drain(stream, target, publisher=None) -> None:
-    """Copies the worker's output line by line, so the file and the live channel both advance as it runs.
+    """Copies the worker's output as it arrives, so both sinks advance while the worker runs.
 
-    A fixed-size `read` blocks until the buffer fills or the process exits, which made both sinks arrive
-    only at the end; a stream nobody can read until the worker is gone is a capture, not a live view.
+    `read(size)` waits until that many characters have accumulated, so both sinks used to arrive in 8 KB
+    steps and a quiet worker's output only once it exited; `readline` fixed that but waits for a line ending,
+    so output with no newline reached neither sink. Reading whatever is available serves both sinks as the
+    worker writes, and the channel keeps a bounded window of what it was offered.
     """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def emit(text: str) -> None:
+        # The PTY reports a line ending as `\r\n`. Normalizing it here keeps the capture's byte shape what
+        # the universal-newline text mode produced before this change.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        target.write(text)
+        target.flush()
+        if publisher is not None:
+            publisher.publish(text)
+
     try:
-        for line in iter(stream.readline, ""):
-            if not line:
+        raw = stream.buffer
+        carry = ""
+        while True:
+            chunk = raw.read1(READ_CHUNK_BYTES)
+            if not chunk:
                 break
-            target.write(line)
-            target.flush()
-            if publisher is not None:
-                publisher.publish(line)
+            text = carry + decoder.decode(chunk)
+            carry = ""
+            # A `\r` ending a read may be the first half of the `\r\n` the PTY writes, so it waits for the
+            # next read rather than being normalized into a line ending of its own.
+            if text.endswith("\r"):
+                text, carry = text[:-1], "\r"
+            if text:
+                emit(text)
+        tail = carry + decoder.decode(b"", final=True)
+        if tail:
+            emit(tail)
     finally:
         stream.close()
 
