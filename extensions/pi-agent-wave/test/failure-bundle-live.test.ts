@@ -21,6 +21,7 @@ interface BundleReport {
 	readonly postSettlementFailures: readonly string[];
 	readonly diagnosticsPath: string | null;
 	readonly captureRetainedPath: string | null;
+	readonly root: string;
 	readonly runDir: string;
 	readonly attemptDir: string;
 	readonly eventWindow: number;
@@ -72,7 +73,7 @@ describe("candidate-less failure bundle, live", () => {
 		assert.equal(report.captureLastSeq, report.eventsEmitted - 1, "the tail ends at the worker's final event");
 		assert.equal(report.captureFirstSeq, report.eventsEmitted - report.eventWindow, "and starts one window back");
 
-		rmSync(report.runDir, { recursive: true, force: true });
+		rmSync(report.root, { recursive: true, force: true });
 	});
 
 	test("the store retains that bundle and tail durably, and the settle reports where they went", () => {
@@ -94,7 +95,11 @@ describe("candidate-less failure bundle, live", () => {
 				assert.equal(statSync(retained).mode & 0o777, 0o600, "retained evidence stays private");
 			}
 			assert.equal(basename(String(result.diagnosticsPath)), "failure-op-candidate-less.json", "the record keeps its name");
-		} finally { store.close(); }
+		} finally {
+			store.close();
+			// The driver's scratch root is the test's to remove; the settle above only removed the run directory.
+			rmSync(report.root, { recursive: true, force: true });
+		}
 	});
 
 	test("a post-settlement failure replaces the candidate-less reason in the bundle that reports it", () => {
@@ -106,6 +111,6 @@ describe("candidate-less failure bundle, live", () => {
 		assert.equal(report.bundleReason, "attempt aborted before cleanup", "the abort bundle is the one left at that path");
 		assert.equal(report.bundleCaptureStatus, "empty", "and the candidate-less evidence is still inside it");
 		assert.equal(report.bundleRecentEventCount, 20, "with the worker's recent events intact");
-		rmSync(report.runDir, { recursive: true, force: true });
+		rmSync(report.root, { recursive: true, force: true });
 	});
 });

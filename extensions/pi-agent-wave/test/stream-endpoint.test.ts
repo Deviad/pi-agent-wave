@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { packageRoot } from "./support/repoRoot.ts";
@@ -70,6 +70,7 @@ describe("headless live stream endpoint", () => {
 
 		// The channel retains nothing of its own: no replay file, no transcript, only the capture path's files.
 		assert.deepEqual(result.filesAfterExit, ["fixture-worker.sh", "gate", "status.json", "stderr", "stdout"], "the channel leaves no artifact behind");
+		rmSync(String(result.root), { recursive: true, force: true });
 	});
 
 	test("a subscriber that stops reading loses its view rather than stalling the worker", () => {
@@ -84,6 +85,7 @@ describe("headless live stream endpoint", () => {
 		assert.equal(result.workerFinished, true, `the worker must finish while a subscriber stalls (${result.elapsedSeconds}s of ${result.budgetSeconds}s)`);
 		assert.ok(result.elapsedSeconds < 30, `and must not merely scrape in under the budget: took ${result.elapsedSeconds}s`);
 		assert.ok(result.captureBytes > 1_000_000, `the capture must hold the worker's full output, got ${result.captureBytes} bytes`);
+		rmSync(String(result.root), { recursive: true, force: true });
 	});
 
 	test("an unbindable loopback is a named blocker before dispatch, not a worker that cannot be watched", () => {

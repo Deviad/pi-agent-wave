@@ -8,8 +8,10 @@ fixture, because a live provider turn is not something a test may spend.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -21,6 +23,8 @@ PACKAGE = Path(__file__).resolve().parents[2]
 SCRIPTS = PACKAGE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 from delegate_core import launch_headless_worker
+
+GATE_TICKS = 600  # 60 s at 0.1 s: bounded, so a leaked worker cannot linger indefinitely.
 
 root = Path(tempfile.mkdtemp(prefix="live-view-driver-"))
 run_dir = root / "run"
@@ -39,7 +43,7 @@ launcher.write_text(
     "#!/bin/sh\n"
     "printf 'LIVE VIEW LINE ONE\\n'\n"
     "printf '\\033[31mCOLOURED LIVE LINE\\033[0m\\n'\n"
-    f"while [ ! -f '{gate}' ]; do sleep 0.05; done\n"
+    f"i=0\nwhile [ $i -lt {GATE_TICKS} ]; do [ -f '{gate}' ] && break; sleep 0.1; i=$((i+1)); done\n"
     "printf 'LIVE VIEW LINE TWO\\n'\n"
     "exit 0\n",
     encoding="utf-8",
@@ -68,8 +72,29 @@ while time.monotonic() < deadline:
         break
     time.sleep(0.02)
 
+def _stop_worker(*_ignored: object) -> None:
+    """Stops the supervisor and everything it leads.
+
+    `launch_headless_worker` starts the supervisor in its own session, so it is a process-group leader and a
+    plain kill would leave its PTY child and the worker behind. This runs on any exit, including a signal.
+    """
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
+atexit.register(_stop_worker)
+for _signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_signal, lambda *_args: sys.exit(0))
+
 print(json.dumps({
     "schemaVersion": 1,
+    "root": str(root),
     "runDir": str(run_dir),
     "attemptDir": str(attempt_dir),
     "cancelScript": str(cancel),

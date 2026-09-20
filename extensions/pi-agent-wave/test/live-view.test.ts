@@ -17,22 +17,33 @@ import { packageRoot } from "./support/repoRoot.ts";
  */
 
 const dirs: string[] = [];
-const workers: ChildProcess[] = [];
+const drivers: ChildProcess[] = [];
+/** The supervisor of each started worker, which leads its own process group and must be killed as one. */
+const supervisorGroups: number[] = [];
 afterEach(() => {
 	resetLiveViewsForTests();
-	for (const worker of workers.splice(0)) worker.kill("SIGKILL");
+	// The driver starts the supervisor with `start_new_session`, so it survives killing the driver: only a
+	// process-group kill reaches it and its PTY child and worker. Without this the suite leaks a supervisor,
+	// a `script` PTY and a worker per test, none of which ever exit.
+	for (const pid of supervisorGroups.splice(0)) {
+		try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+	}
+	for (const driver of drivers.splice(0)) {
+		driver.kill("SIGTERM");
+		setTimeout(() => driver.kill("SIGKILL"), 200).unref?.();
+	}
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 const ROLES = ["thinker", "implementer", "reviewer", "tester", "auditor", "searcher"];
 const MODEL = "openai-codex/gpt-5.6-sol";
 
-interface StartedWorker { runDir: string; attemptDir: string; cancelScript: string; attemptKey: string }
+interface StartedWorker { root: string; runDir: string; attemptDir: string; cancelScript: string; attemptKey: string }
 
 /** Starts the real supervisor and a real worker, and reports where it put them. */
 async function startLiveWorker(): Promise<StartedWorker> {
 	const driver = spawn("python3", [join(packageRoot, "test/support/live-view-driver.py")], { stdio: ["ignore", "pipe", "pipe"] });
-	workers.push(driver);
+	drivers.push(driver);
 	let stderr = "";
 	driver.stderr!.setEncoding("utf8");
 	driver.stderr!.on("data", (chunk: string) => { stderr += chunk; });
@@ -46,7 +57,10 @@ async function startLiveWorker(): Promise<StartedWorker> {
 			const line = text.split("\n").find((item) => item.trim().startsWith("{"));
 			if (!line) return;
 			try {
-				const parsed = JSON.parse(line) as StartedWorker;
+				const parsed = JSON.parse(line) as StartedWorker & { workerPid?: number };
+				if (typeof parsed.workerPid === "number") supervisorGroups.push(parsed.workerPid);
+				// The driver's own scratch root is the test's to remove: it outlives the driver by design.
+				dirs.push(parsed.root);
 				clearTimeout(timer);
 				resolve(parsed);
 			} catch { /* partial line: the next chunk completes it */ }

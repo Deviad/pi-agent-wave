@@ -10,8 +10,10 @@ candidate" is a shape no live provider turn can be asked for reliably.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -96,6 +98,23 @@ resource["worker_launcher"] = str(launcher)
 
 # The real supervisor, the real process group, the real exit code.
 worker_pid = core.launch_headless_worker(resource, {**os.environ})
+
+
+def _stop_worker() -> None:
+    """Stops the supervisor and everything it leads, however this driver exits.
+
+    The supervisor starts in its own session, so a plain kill would leave its PTY child and worker behind.
+    """
+    try:
+        os.killpg(os.getpgid(worker_pid), signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.waitpid(worker_pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
 resource["worker_pid"] = worker_pid
 result_path = Path(str(resource["worker_result"]))
 deadline = time.monotonic() + 30
@@ -131,6 +150,7 @@ report: dict[str, object] = {
     "diagnosticsPath": audit.get("diagnosticsPath"),
     "captureRetainedPath": audit.get("captureRetainedPath"),
     "settlementEvidencePath": audit.get("settlementEvidencePath"),
+    "root": str(root),
     "runDir": str(private),
     "attemptDir": str(attempt_dir),
     "eventWindow": core.FAILURE_DIAGNOSTIC_EVENT_LIMIT,
@@ -160,13 +180,5 @@ if isinstance(capture_path, str) and Path(capture_path).is_file():
     report["captureFirstSeq"] = json.loads(lines[0])["seq"] if lines else None
     report["captureLastSeq"] = json.loads(lines[-1])["seq"] if lines else None
 
-try:
-    os.kill(worker_pid, 9)
-except OSError:
-    pass
-try:
-    os.waitpid(worker_pid, 0)
-except OSError:
-    pass
-
 print(json.dumps(report, sort_keys=True))
+atexit.register(_stop_worker)

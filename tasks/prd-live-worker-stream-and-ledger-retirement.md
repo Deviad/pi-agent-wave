@@ -345,8 +345,9 @@ dispatched through the production tool headless. Exit 0, terminal, 156,150 ms, 4
 4 completions, 0 retries, 0 model fallbacks, 0 failures; operations `thinker_split` READY,
 `search` DONE, `search` DONE, `thinker_synthesize` DONE. Evidence:
 `agent-output/runtime-measure-2026-09-20/` (`summary.md`, `summary.json`, `run-runtime-v1-1.json`,
-`ledger-runtime-v1-1.json`); run root kept deliberately at `/tmp/pi-wave-measure-runtime-v1-Zm2a74`
-with `evidence/run_7d35cc20-.../` holding 4 settlement and 4 cleanup records.
+`ledger-runtime-v1-1.json`); the run's own evidence moved to
+`agent-output/runtime-measure-2026-09-20/evidence-run_7d35cc20-.../`, holding 4 settlement and 4 cleanup
+records.
 
 Two things this run proves that no fixture could:
 
@@ -397,6 +398,15 @@ Two things this run proves that no fixture could:
 
 ### Fixed during this increment
 
+- **This increment's own test drivers leaked processes and scratch directories.** The live-view and
+  failure-bundle drivers start the supervisor with `launch_headless_worker`, which puts it in its own
+  session, so the test killing the Python driver left the supervisor, its `script` PTY child and the
+  fixture worker running - and the live-view fixture waited for a gate nobody would create, so they never
+  exited. Found by the cleanup pass, not by a test: 21 orphaned processes and 22 scratch directories had
+  accumulated across runs. Fixed at both ends: the drivers stop their supervisor's whole process group on
+  any exit including a signal, the fixture worker's wait is bounded, the tests kill the process group
+  reported in the driver's record, and each test removes the driver's scratch root. Repeated runs of the
+  three driver-based suites now leave 0 orphans, 0 scratch directories and 0 run directories.
 - **The failure bundle read the wrong stream path.** `write_failure_diagnostics` read
   `attempt_dir/worker.stdout.ndjson`, but a prompt worker writes its stream beside its result file, which
   is the asymmetry `retain_incomplete_capture` already documents and works around. The bundle's
@@ -424,8 +434,10 @@ were created with the role-bearing labels. `--transport herdr` was added to the 
 this, including a per-sample direct `herdr pane read` recorded beside the view's own reading, so agreement
 is checkable rather than assumed: **4 of 4 comparisons match exactly**, the view's rendered line being
 byte-identical to the pane's own last line (for example `"Let me be"` and then a longer sentence from the
-answer). All run directories were removed afterwards. Evidence: `/tmp/dg-herdr-proof-evidence/` and the
-run root `/tmp/pi-wave-measure-runtime-v1-S4EGVz/`.
+answer). All run directories were removed afterwards. Evidence:
+`agent-output/runtime-measure-2026-09-20-herdr/` (run record, ledger, summary) and
+`agent-output/runtime-measure-2026-09-20-herdr/evidence-run_232f30e2-.../` (the run's 4 settlement
+records).
 
 The Herdr run is also what surfaced the open High finding in section 3d: its four operations each settled
 with a post-settlement cleanup failure, and its tabs outlived the run.
@@ -438,6 +450,17 @@ a candidate", carrying the worker's stderr and its 20 most recent events. `test/
 then drives the store's retention over those artifacts: both land under `evidence/<runId>/`, byte-exact and
 mode 600, and the run directory is removed. The unpatched variant is recorded too, because it shows the
 abort path replacing the candidate-less reason.
+
+### Leftover cleanup (2026-09-20)
+
+Requested by the operator. Removed: the 91 stale `/tmp/delegate-graph-*` run directories left by earlier
+sessions (oldest 2026-09-16; none mounted, none referenced by a live process), this increment's 21 orphaned
+processes and 22 scratch directories, and the 9 leftover Delegate Graph worker tabs that had accumulated in
+wP, wR and wS - including two from `run_74d142d5` (2026-09-16) and one from the `run_5132c864` write slice,
+which is independent corroboration of the open Herdr tab finding above. The three temporary measurement
+roots were preserved before removal: their evidence now lives under
+`agent-output/runtime-measure-2026-09-20*/evidence-<runId>/`. Nothing else was touched: no operator tab
+outside the Delegate Graph pattern, no non-worker workspace, and no directory another process referenced.
 
 ## 4. Functional Requirements
 
