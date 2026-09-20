@@ -9,12 +9,13 @@ import { GraphStore } from "../store.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { setPaneReaderForTests, type PaneReader } from "../lib/pane-read.ts";
 import { renderFollow, renderWatch, watchRun } from "../index.ts";
-import { AGENT_LIST_WIDGET, NO_TERMINAL_NOTE, agentListState, attemptDetail, noteRegisteredAttempt, resetAgentListForTests, type AgentListActions, type CancelRunReport } from "../agent-list.ts";
+import { AGENT_LIST_WIDGET, agentListState, attemptDetail, noteRegisteredAttempt, refreshAgentListLiveViews, resetAgentListForTests, type AgentListActions, type CancelRunReport } from "../agent-list.ts";
+import { LIVE_VIEW_UNAVAILABLE, resetLiveViewsForTests } from "../lib/live-stream.ts";
 import { cancelRunWorkers } from "../index.ts";
 import { renderStatus } from "../commands.ts";
 
 const dirs: string[] = [];
-afterEach(() => { resetAgentListForTests(); setPaneReaderForTests(null); panes.clear(); cancelRequests.length = 0; paneReads.length = 0; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { resetAgentListForTests(); resetLiveViewsForTests(); setPaneReaderForTests(null); panes.clear(); cancelRequests.length = 0; paneReads.length = 0; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 /** What each pane is showing; a pane absent from the map reads as unavailable, the way an unknown pane id does. */
 const panes = new Map<string, string>();
@@ -25,6 +26,11 @@ const stubPaneReader: PaneReader = (paneId, lines) => {
 	return text === undefined ? null : text.split("\n").slice(-lines).join("\n");
 };
 function parsed(result: unknown): Record<string, any> { return JSON.parse((result as { content: { text: string }[] }).content[0].text); }
+/** The live view is read asynchronously; a test asserts after it settles rather than racing it. */
+async function until(check: () => boolean, ms = 3_000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (Date.now() < deadline) { if (check()) return; await new Promise((resolve) => setTimeout(resolve, 20)); }
+}
 const ROLES = ["thinker", "implementer", "reviewer", "tester", "auditor", "searcher"];
 
 const commands = new Map<string, Record<string, any>>();
@@ -269,7 +275,10 @@ test("agent list opens on registered dispatch only", async () => {
 		assert.equal(agentListState().open, true);
 		assert.deepEqual(agentListState().entries.map((e) => [e.number, e.attemptKey]), [[1, planned.attemptKey]]);
 		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: Enter opens the running worker or focuses the list, up\/down move, number then Enter opens by number, s shows or hides settled, r refresh, q close, Esc cancels the run's workers$/);
-		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no terminal\)$/, "a headless worker has no terminal to read, and the row says so instead of naming a stream");
+		// A headless worker registers no pane, so the row's activity comes from its published stream; this
+		// fixture publishes none, so the row says so rather than naming a capture file.
+		await until(() => tui.last()?.[1]?.includes("no live stream") ?? false);
+		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no live stream:/, "a worker that publishes nothing says so in its row");
 	} finally { process.env = originalEnv; }
 });
 
@@ -873,7 +882,7 @@ test("a cancellation in flight cannot be aborted, confirmed twice, or closed ove
 	store.close();
 });
 
-test("a worker with no terminal says so, and no display path reads the worker's stream file", async () => {
+test("a worker that publishes no stream says so, and no display path reads the worker's stream file", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "agent-list-no-terminal-")); dirs.push(dir);
 	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
 	setPaneReaderForTests(stubPaneReader);
@@ -882,14 +891,17 @@ test("a worker with no terminal says so, and no display path reads the worker's 
 	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-headless");
 	assert.equal(worker.paneId, null, "a headless worker registers no pane");
 	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
-	// A stream file full of renderable events: the view must still report no terminal rather than read it.
+	// A stream file full of renderable events: the view must never read it, whatever it cannot show.
 	writeFileSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"), `${streamLine("FILE ONLY: never displayed")}\n`, { mode: 0o600 });
+	await refreshAgentListLiveViews(store);
 	select(tui, 1);
 	const view = tui.last()!;
-	assert.ok(view.includes(`  ${NO_TERMINAL_NOTE}`), view.join("\n"));
+	assert.ok(view.includes(`  ${LIVE_VIEW_UNAVAILABLE}`), view.join("\n"));
+	assert.ok(view.includes("  (no answer yet: the worker is still running)"), view.join("\n"));
 	assert.equal(view.join("\n").includes("FILE ONLY"), false, "the stream file is never displayed");
-	assert.deepEqual(paneReads, [], "a worker with no pane is not read at all");
+	assert.deepEqual(paneReads, [], "a worker with no pane is not read as a terminal");
 	assert.equal(watchRun(store, run.runId).agents[0]!.paneId, null, "the watch view reports the absent terminal too");
+	assert.match(renderWatch(watchRun(store, run.runId)), /no live output yet/, "and the watch view says the same rather than showing a file");
 	store.close();
 });
 

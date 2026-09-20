@@ -4,6 +4,7 @@ import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, type RuntimeAttempt, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { liveViewFor, refreshLiveView, streamRunDirectory } from "./lib/live-stream.ts";
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
@@ -354,10 +355,22 @@ const WATCH_PANE_LINES = 5;
 
 export interface WatchView { readonly runId: string; readonly status: string; readonly node: string; readonly agents: readonly WatchedAgent[] }
 
+/** Reads every running worker's live view into the cache: the pane when there is one, else the published stream. */
+export async function refreshWatchLiveViews(graphStore: GraphStore, runId: string): Promise<void> {
+	for (const operation of graphStore.operations(runId, true)) {
+		if (operation.status !== "running") continue;
+		const agent = graphStore.agents(runId).find((candidate) => candidate.id === operation.agent_id);
+		if (agent?.herdr_pane_id) continue;
+		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
+		if (!attempt) continue;
+		await refreshLiveView(attempt.attemptKey, streamRunDirectory(agent?.acpx_cancel_script), WATCH_PANE_LINES);
+	}
+}
+
 /**
- * A read-only view of what each running worker is doing right now, read from the worker's own terminal. It
- * shells out to `herdr pane read`, decides nothing, and is consulted by no gate. A worker whose transport has
- * no terminal has no live view; the view says so rather than falling back to the capture file.
+ * A read-only view of what each running worker is doing right now: its terminal when the transport has one
+ * (`herdr pane read`), otherwise the stream its supervisor publishes. It decides nothing and is consulted by
+ * no gate. No branch reads the attempt's capture file, and a worker that publishes nothing says so.
  */
 export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 	const state = graphStore.getState(runId);
@@ -368,7 +381,7 @@ export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 		const agent = agents.find((candidate) => candidate.id === operation.agent_id);
 		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
 		const paneId = agent?.herdr_pane_id ?? null;
-		const rendered = paneLines(paneId, WATCH_PANE_LINES);
+		const rendered = paneId ? paneLines(paneId, WATCH_PANE_LINES) : liveViewFor(attempt?.attemptKey ?? "")?.lines ?? null;
 		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt?.processState ?? null, acceptance: attempt?.acceptance ?? null, paneId, lastActivity: rendered?.at(-1) ?? null, recent: rendered ?? [] });
 	}
 	return { runId, status: state.status, node: state.currentNode, agents: rows };
@@ -378,7 +391,7 @@ export function renderWatch(view: WatchView): string {
 	const lines = [`run ${view.runId} | node=${view.node} | status=${view.status}`];
 	if (!view.agents.length) lines.push("(no running workers)");
 	for (const agent of view.agents) {
-		lines.push(`${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | ${agent.lastActivity ?? (agent.paneId ? "(no output yet)" : "(no terminal)")}`);
+		lines.push(`${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | ${agent.lastActivity ?? (agent.paneId ? "(no output yet)" : "(no live output yet)")}`);
 		for (const recent of agent.recent.slice(0, -1)) lines.push(`    ${recent}`);
 	}
 	return lines.join("\n");
@@ -423,7 +436,7 @@ export function renderFollow(view: WatchView, pending = "", confirmation: Cancel
 	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
 	view.agents.forEach((agent, index) => {
 		const mark = cursorIndex === null ? "" : cursorIndex === index ? "\u203a " : "  ";
-		lines.push(`${mark}${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | ${agent.lastActivity ?? (agent.paneId ? "(no output yet)" : "(no terminal)")}`);
+		lines.push(`${mark}${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | ${agent.lastActivity ?? (agent.paneId ? "(no output yet)" : "(no live output yet)")}`);
 		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
 	});
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
@@ -551,7 +564,9 @@ export function startFollow(pi: ExtensionAPI, ctx: ExtensionContext, graphStore:
 		if (key === "r") { draw(); return { consume: true }; }
 		return undefined;
 	});
-	const timer = setInterval(draw, intervalMs);
+	// Refresh the live views, then redraw: the renderers stay synchronous, so a worker, a socket or a
+	// `herdr` process can never block the terminal while the operator holds the view open.
+	const timer = setInterval(() => { void refreshWatchLiveViews(graphStore, runId).then(() => { if (followSession?.timer) draw(); }); }, intervalMs);
 	timer.unref?.();
 	followSession = { runId, timer, unsubscribe, ctx };
 	draw();
@@ -879,6 +894,9 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					return textResult(renderStatus(graphStore, runId));
 				}
 				if (params.op === "watch") {
+					// One-shot operators read this immediately, so read the live views first: the renderer
+					// itself stays synchronous and this is the only place the tool waits.
+					await refreshWatchLiveViews(graphStore, runId);
 					const view = watchRun(graphStore, runId);
 					progress("watch", { runId, status: view.status, node: view.node, agents: view.agents.map((agent) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, lastActivity: agent.lastActivity })) });
 					return textResult(view);
@@ -1088,6 +1106,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						startFollow(pi, ctx, graphStore, runId, watchIntervalMs());
 						return;
 					}
+					await refreshWatchLiveViews(graphStore, runId);
 					ctx.ui.notify(renderWatch(watchRun(graphStore, runId)), "info");
 					return;
 				}

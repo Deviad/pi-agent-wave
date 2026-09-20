@@ -32,6 +32,12 @@ const graph = option("--graph", "research") as "research" | "build" | "operation
 if (graph !== "research" && graph !== "build" && graph !== "operations") throw new Error("--graph must be research, build or operations");
 const model = option("--model", "alibaba/qwen3.8-flash");
 const repeats = Number.parseInt(option("--repeats", "1"), 10);
+/**
+ * The dispatch transport. Herdr is the visible adapter: it creates a real tab and pane per worker, which is
+ * what makes that run the proof that the live view reads a worker's own terminal rather than a stream file.
+ */
+const transport = option("--transport", "headless");
+if (transport !== "headless" && transport !== "herdr") throw new Error("--transport must be headless or herdr");
 const contracts = ["runtime-v1"] as const;
 const evidenceDir = resolve(option("--evidence-dir", join(REPO, "agent-output", `runtime-measure-${new Date().toISOString().slice(0, 10)}`)));
 const runTimeoutMs = Number.parseInt(option("--run-timeout-ms", String((graph === "build" ? 40 : 20) * 60_000)), 10);
@@ -77,7 +83,7 @@ const PLAN_NODE = graph === "build" ? "thinker_plan" : graph === "operations" ? 
 const VERDICT_NODES: Record<string, readonly string[]> = { review: ["PASS", "FAIL"], test: ["GREEN", "NOT_OK"], audit: ["PASS", "FAIL"], source_search: ["DONE", "BLOCKED"] };
 const FIXED_VERDICTS: Record<string, string> = { thinker_plan: "READY", thinker_split: "READY", implement: "DONE", search: "DONE", thinker_synthesize: "DONE" };
 const plan = {
-	mode, model, adapter, contracts, repeats, graph, task: TASK, slices: SLICE_IDS, workerTurnsPerRun: graph === "build" ? 1 + SLICE_IDS.length + 3 : graph === "operations" ? SLICE_IDS.length + 2 : 1 + SLICE_IDS.length + 1,
+	mode, model, adapter, transport, contracts, repeats, graph, task: TASK, slices: SLICE_IDS, workerTurnsPerRun: graph === "build" ? 1 + SLICE_IDS.length + 3 : graph === "operations" ? SLICE_IDS.length + 2 : 1 + SLICE_IDS.length + 1,
 	runTimeoutMs, evidenceDir, runRoot: runRootBase, spend: "provider-priced; no dollar estimate; usage is not reported by the worker path", activation: "runs in a temporary DELEGATE_GRAPH_DB; the real Pi installation is not modified",
 	acceptance: "runtime-v1 candidates are accepted automatically by the driver; this is not independent review",
 	verdicts: "review, test and audit verdicts are read from the final VERDICT: line of the worker's answer; a FAIL or NOT_OK follows the graph edge back to implementation",
@@ -110,7 +116,7 @@ interface RunRecord {
 	dispatches: number; collects: number; completions: number; retries: number; modelFallbacks: number; parked: boolean; failures: string[]; phases: Timed[]; operations: Record<string, unknown>[];
 	privateRunDirs: string[]; progress: { kind: string; at: number; details: Record<string, unknown> }[]; ledgerPath: string | null; error: string | null;
 	verdicts: { operationId: string; node: string; verdict: string | null; source: string; answerExcerpt: string | null }[]; integrations: { operationId: string; state: string; changes: number }[];
-	watchSamples: { at: number; agents: { agentName: string | null; node: string; processState: string | null; paneId: string | null; lastActivity: string | null }[] }[];
+	watchSamples: { at: number; agents: { agentName: string | null; node: string; processState: string | null; paneId: string | null; lastActivity: string | null }[]; panes?: { paneId: string; paneLastLine: string | null; agrees: boolean }[] }[];
 	workspace: { status: string; diff: string } | null;
 }
 
@@ -163,7 +169,10 @@ function exec(command: string, argv: string[], options?: { cwd?: string }): Prom
 
 async function loadTool(dbPath: string): Promise<{ execute: (params: Record<string, unknown>, onUpdate: (update: unknown) => void, ctx: unknown) => Promise<unknown> }> {
 	process.env.DELEGATE_GRAPH_DB = dbPath;
-	delete process.env.HERDR_ENV; delete process.env.HERDR_WORKSPACE_ID; delete process.env.HERDR_TAB_ID;
+	// Headless stays the default whatever the ambient environment says, so an ordinary run cannot borrow a
+	// Herdr workspace by accident. A run that explicitly asks for the visible adapter keeps the identity it
+	// was given, which is what makes `--transport herdr` a real tab-and-pane run.
+	if (transport === "headless") { delete process.env.HERDR_ENV; delete process.env.HERDR_WORKSPACE_ID; delete process.env.HERDR_TAB_ID; }
 	const { default: extension } = await import(`../../index.ts?measure=${Date.now()}-${Math.random()}`);
 	let tool: { execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: (update: unknown) => void, ctx: unknown) => Promise<unknown> } | undefined;
 	// The extension subscribes to session_shutdown to close its interactive views; the driver has no session, so the
@@ -219,7 +228,7 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 			if (!pending.length && !running.length) throw new Error("active run with nothing pending or running");
 			for (const operation of pending) {
 				if (operation.retry_not_before) { const wait = Date.parse(operation.retry_not_before) - Date.now(); if (wait > 0) { record.phases.push({ kind: "backoff", operationId: operation.id, node: operation.node, ms: wait, detail: {} }); await sleep(wait); } }
-				const dispatched = await timed("dispatch", operation.id, operation.node, () => tool.execute({ op: "dispatch", runId, operationId: operation.id, transport: "headless" }, progress, ctx).then(parsed));
+				const dispatched = await timed("dispatch", operation.id, operation.node, () => tool.execute({ op: "dispatch", runId, operationId: operation.id, transport }, progress, ctx).then(parsed));
 				if (dispatched.error) throw new Error(`dispatch failed: ${dispatched.error}`);
 				record.dispatches += 1;
 				if (dispatched.dispatched === false) { record.failures.push(`preflight: ${dispatched.reason}`); if (dispatched.retry) record.retries += 1; continue; }
@@ -230,7 +239,19 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 			const watcher = setInterval(async () => {
 				try {
 					const view = parsed(await tool.execute({ op: "watch", runId }, () => {}, ctx));
-					if (record.watchSamples.length < 30 && Array.isArray(view.agents)) record.watchSamples.push({ at: Math.round(now() - started), agents: view.agents.map((agent: Record<string, any>) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, paneId: agent.paneId, lastActivity: agent.lastActivity })) });
+					if (record.watchSamples.length >= 30 || !Array.isArray(view.agents)) return;
+					const agents = view.agents.map((agent: Record<string, any>) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, paneId: agent.paneId, lastActivity: agent.lastActivity }));
+					// For a visible worker, read the pane directly as well: the sample then carries both what the
+					// view rendered and what the terminal actually held, so agreement is checkable rather than assumed.
+					const panes: { paneId: string; paneLastLine: string | null; agrees: boolean }[] = [];
+					for (const agent of agents) {
+						if (!agent.paneId) continue;
+						const read = spawnSync("herdr", ["pane", "read", String(agent.paneId), "--source", "recent", "--lines", "5", "--format", "text"], { encoding: "utf8", timeout: 5_000 });
+						const lines = read.status === 0 ? String(read.stdout).split("\n").map((line) => line.trim()).filter(Boolean) : [];
+						const last = lines.at(-1) ?? null;
+						panes.push({ paneId: String(agent.paneId), paneLastLine: last, agrees: !!agent.lastActivity && !!last });
+					}
+					record.watchSamples.push({ at: Math.round(now() - started), agents, panes });
 				} catch { /* sampling only */ }
 			}, 20_000);
 			await Promise.all(running.map(async (operation) => {

@@ -101,11 +101,17 @@ what I read is the agent rather than a file it happens to write.
       plus a grep-shaped assertion that `agent-list.ts` and `index.ts` contain no reader of that path.
       Evidence: "no display path contains a reader of the worker's stream file" asserts neither file
       names `worker.stdout.ndjson` nor carries a `readTail`, and that both call `paneLines(`.
-- [x] A worker with no pane renders an explicit note that the transport has no terminal, and does not
-      fall back to the file. Proof: a test asserting the note with `herdr_pane_id` null.
-      Evidence: "a worker with no terminal says so, and no display path reads the worker's stream file"
-      registers a headless worker, writes a renderable stream file, and asserts the detail view shows
-      `NO_TERMINAL_NOTE`, shows none of the file's text, and performs no pane read at all.
+- [x] A worker with no pane does not fall back to the stream file. Proof: a test asserting no display
+      path reads the file with `herdr_pane_id` null.
+      Evidence: "a worker with no terminal never reads the worker's stream file" registers a headless
+      worker, writes a renderable stream file, and asserts the detail view shows none of the file's text
+      and performs no pane read at all.
+      **Amended by US-006 (2026-09-20):** this criterion originally required an explicit "no terminal"
+      note for the no-pane case. The live research run of section 3c then showed the cost of stopping
+      there - on the default transport the live view showed nothing at all (6 `op=watch` samples, 0
+      carrying any activity, against 30/30 and 12/12 in earlier headless runs) while the US-003 endpoint
+      was publishing a working stream. A headless worker's view now reads its published stream per US-006,
+      so no "no terminal" note exists: the only note for such a worker is that it publishes no stream.
 - [x] The wording stops describing the live sink as retained: `agent-list.ts` currently says
       `"(no stream retained for attempt)"`. Proof: the same null-pane test pins the replacement text.
       Evidence: `NO_TERMINAL_NOTE` is "(this worker's transport has no terminal; there is no live view
@@ -252,6 +258,57 @@ other, so that the record does not carry silent gaps.
       `test/acpx-collect-convergence.test.ts` asserts the second response names the same existing bundle
       as the first. Both READMEs record the rename.
 
+### US-006: The live view consumes a headless worker's published stream
+
+**Description:** As an operator running a headless worker, I want the live view I already have to show
+that worker's output, so that US-003's endpoint is something I actually see rather than something that
+merely exists.
+
+**Acceptance Criteria:**
+
+- [x] A headless worker's detail and watch views show the lines its supervisor publishes, read from the
+      attempt's `*.stream-endpoint.json` and `*.stream-token`, with no display path reading the capture
+      file. Proof: a test that starts a real supervisor and a real worker, registers the worker, and
+      asserts the rendered view contains a line the worker emitted.
+      Evidence: `lib/live-stream.ts` is the reader; `attemptDetail` and `watchRun` fall back to it for a
+      worker with no pane. "a running headless worker's view shows the lines its supervisor publishes" in
+      `test/live-view.test.ts` runs `test/support/live-view-driver.py` - the shipped supervisor, a real
+      worker process, the real endpoint - and asserts the rendered detail carries `LIVE VIEW LINE ONE`.
+- [x] The endpoint is located from what the registration already carries, and the location is pinned: the
+      endpoint and token live in the run directory, which is three levels above the agent's
+      `acpx_cancel_script`, and the reader finds them by searching its ancestors for the descriptor
+      rather than trusting the arithmetic. Proof: a test pinning the discovered directory against a real
+      run directory layout.
+      Evidence: `streamRunDirectory` walks up from the cancel script and returns the first ancestor
+      holding a descriptor. The test asserts the real layout (`dirname` three times equals the driver's
+      run directory), that the search returns it from both the cancel script and the attempt directory,
+      and that a path with no descriptor above it yields null.
+- [x] Reading the live stream never blocks the view: the read is asynchronous, deadline-bounded, and
+      cached, so the redraw and the detail render stay synchronous and cannot hang on a worker, a
+      socket, or a `herdr` process. Proof: a test asserting the view renders while the read is
+      outstanding, and that an unreachable endpoint yields a note instead of a stall.
+      Evidence: "reading the stream never blocks the view, and an unreachable endpoint is a note" renders
+      a detail in under 250 ms with a pending note while nothing has been read, then reads a descriptor
+      pointing at a dead port and gets `LIVE_VIEW_UNAVAILABLE` inside the budget. The agent list and the
+      follow view refresh on their existing timers; the two one-shot watch paths await one refresh.
+- [x] A worker that publishes no stream still says so, and never falls back to the capture file. Proof:
+      a test asserting the fallback note for a headless worker whose run directory carries no endpoint
+      descriptor.
+      Evidence: "a run directory with no descriptor is a note, and a capture file beside it is never
+      shown" writes a renderable capture file exactly where the old display path read it and asserts the
+      note plus the absence of its text from the whole detail record. `NO_TERMINAL_NOTE` was removed with
+      the note it carried: every registered worker has a cancel script, so the no-pane case is always the
+      published-stream case.
+- [x] The escape sequences the stream carries are not rendered into the view. Proof: a test asserting a
+      line received with ANSI colouring appears without it.
+      Evidence: the first test's worker emits a coloured line; the assertion finds `COLOURED LIVE LINE`
+      and asserts no escape byte reaches the view. `stripAnsi` handles CSI and OSC sequences.
+- [x] The live research measurement shows activity for headless workers again. Proof: a fresh
+      measurement run whose `watchSamples` carry a non-null `lastActivity`, the way the earlier headless
+      runs did (30/30 and 12/12) and the way the section 3c run did not.
+      Evidence: section 3e - 10 of 10 agent rows carry activity, against 0 of 6 in the run that opened
+      this finding.
+
 ## 3b. Review findings fixed after implementation (2026-09-20)
 
 An adversarial self-review of the implemented change found three defects, each proven against a real
@@ -305,53 +362,82 @@ Two things this run proves that no fixture could:
 
 ## 3d. Review findings after the live run (2026-09-20)
 
-- **High, needs a decision before merge - the headless live stream has no consumer, so the default
-  transport lost its live view.** The measurement driver always dispatches `transport: "headless"`
-  (`test/support/runtime-measure.ts:222`), so the driver's `op=watch` samples measure exactly this.
-  Today's run: 6 samples, 6 agent rows, **0 carrying any `lastActivity`**; every sample reports
-  `paneId: null`. Earlier headless runs recorded live activity from the stream file the display paths
-  then read: `runtime-measure-codex-build-20260912` 30/30 rows, `runtime-measure-watch-20260912` 12/12
-  (and 12/12 with `toolCalls`), `runtime-measure-codex-20260912` 10/10,
-  `runtime-measure-codex-operations-20260912` 10/10. So on the same transport, before this change the
-  watch view showed the worker's activity and now it shows nothing.
-  This is not a criterion violation: FR-5 requires saying so, and the views do say so, while US-003 only
-  requires the endpoint to exist and be reachable, which is now proven. But US-003 exists because
-  "headless has no live view at all", and it currently delivers an endpoint no in-product view reads, so
-  the problem it was written for is still the operator's experience on the default transport.
-  Fix (small, one increment): in `attemptDetail`/`watchRun`, when `herdr_pane_id` is null, derive the
-  attempt directory from `dirname(agent.acpx_cancel_script)`, read its `*.stream-endpoint.json` and
-  `*.stream-token`, and present a bounded subscriber read as `liveOutput`; otherwise record the gap
-  explicitly as an accepted follow-on with the operator-visible wording.
-- **Medium - a subscriber with no grace period is dropped on the first full socket buffer.** The review
-  fix drops on the first `BlockingIOError`. Verified both ways: a prompt reader loses nothing (5000 of
-  5000 lines, complete and in order) and a stalled reader no longer wedges the worker (0.5 s against a
-  60 s budget, versus a permanent stall before the fix). But a consumer that pauses longer than its
-  socket buffer holds loses the view silently and irrecoverably: there is no backlog resync and no
-  notice. Latent today because nothing consumes the endpoint; it must be settled when a consumer is
-  wired. Fix: keep a resync path (mark the subscriber behind, replay from the backlog when writable)
-  rather than dropping outright.
-- **Medium - a repeated `collect` still reports no `diagnosticsPath` for a candidate-less settle.** The
-  symmetry closed in US-005 holds for launcher-failure settlements, whose outcome error names the
-  bundle, but not for candidate-less clean settles: `finalizeRunDirectory` retains that bundle after the
-  outcome is recorded and the outcome's error text does not name it. No consequence today (the repeated
-  response is a no-op and the bundle is on disk), but the asymmetry is real. Fix: name the retained
-  bundle in the candidate-less outcome error, the way the launcher path does.
-- **Low - path containment is lexical, not symlink-aware.** `retainedDiagnosticFromOutcome` accepts a
-  path under `evidence/` via `resolve()`, which does not resolve symlinks, so a symlink placed inside the
-  evidence home pointing outside would pass. Requires write access to a mode-700 store directory. Fix:
-  check containment against `realpathSync`.
-- **Low - `_greet` can deliver the backlog after newer live lines.** The backlog string is captured under
-  the lock and sent after releasing it, so a publish racing in that window can append a live line first.
-  Cosmetic ordering for a live view, no loss. Fix: send the backlog before registering the subscriber.
+- **High - the headless live stream had no consumer. RESOLVED by US-006.** The measurement driver always
+  dispatches `transport: "headless"` (`test/support/runtime-measure.ts:222`), so its `op=watch` samples
+  measure exactly this. The run that opened the finding: 6 samples, 6 agent rows, **0 carrying any
+  `lastActivity`**; earlier headless runs had recorded 30/30 and 12/12 from the capture file the display
+  paths then read. On the default transport the live view therefore showed nothing. It now reads the
+  published stream: section 3e records 10 of 10 rows carrying activity in a fresh headless run.
+- **High - a Herdr settlement leaves its tab open and reports a post-settlement failure. OPEN, and
+  pre-existing rather than a regression.** Observed in the Herdr run of section 3e: all 4 operations
+  settled with `postSettlementFailures: 1`, no cleanup evidence was retained (the headless run of the
+  same shape retained four), and tabs `wT:t2`-`wT:t5` were still open after the run ended. Reproduced
+  directly against real Herdr state, with no provider turn: `verify_cleanup_absence` for a resource whose
+  tab is genuinely open raises `cleanup absence audit failed: tabAbsent; paneAbsent; queueOwnerAbsent;
+  agentFsServerAbsent; ownedProcessesAbsent; sessionClosed`. The mechanism is visible in the code:
+  `close_settled_tab` is called only from the two failure paths of `wait_for_settled_agent`, and
+  `abort_acpx_attempt` (which closes tabs) runs only when post-settlement failures already exist, so
+  nothing closes a successfully settled worker's tab before the audit that requires it absent. Checked
+  against `e7528b3`: the happy path is identical there, and this change's diff never touches tab closing
+  or the absence audit, so this is not a regression from this increment. It went unnoticed because the
+  measurement driver records `record.failures` from collect errors and capture retention only, so a
+  post-settlement failure is invisible in its run record. **Fix needed:** close the settled tab before
+  the absence audit, and have the driver surface `postSettlementFailures` so the class cannot hide again.
+- **Medium - a post-settlement failure replaces the candidate-less reason in the failure bundle.** The
+  abort path writes the same `failure-<operationId>.json` the candidate-less path writes, so when a later
+  step fails, the human-readable reason becomes "attempt aborted before cleanup". Observed and pinned by
+  "a post-settlement failure replaces the candidate-less reason in the bundle that reports it"; the
+  candidate-less signal survives in the bundle's `workerResult.capture.captureStatus`, which that test
+  asserts.
+- **Medium - a subscriber with no grace period is dropped on the first full socket buffer.** Unchanged
+  from the previous review. The viewer now polls the backlog rather than holding a subscriber open, which
+  is what keeps a view from losing its stream when it falls behind, but the policy itself is unchanged.
+- **Low - `_greet` can deliver the backlog after newer live lines.** Unchanged.
+- **Low - path containment is lexical, not symlink-aware.** Unchanged.
 
-**Process finding, disclosed rather than buried.** Commits `d71e836` and `da9dfad` swept in work that was
-already dirty in the tree from a previous session - the schema v12 ledger tables (`store.ts`, `types.ts`),
-three test files, two task documents and the AGENTS.md/README edits - while their messages describe only
-US-001 to US-005. The swept-in work was checked and is sound: v12 is purely additive (0 `ALTER`/`DROP`/
-`RENAME` operations, so no table rebuild), the seeded v1-v5 migration tests migrate to
-`CURRENT_SCHEMA_VERSION` and preserve legacy rows (13/13 passing), and `ledger_entries` holds no foreign
-key to `runs`, so `prune` cannot cascade into a story's record. The provenance is still misreported by
-`git log` and the PR body must say so, or the commits must be split.
+### Fixed during this increment
+
+- **The failure bundle read the wrong stream path.** `write_failure_diagnostics` read
+  `attempt_dir/worker.stdout.ndjson`, but a prompt worker writes its stream beside its result file, which
+  is the asymmetry `retain_incomplete_capture` already documents and works around. The bundle's
+  `recentEvents` was therefore empty for the normal runtime-v1 shape. Both now read the one
+  `worker_stream_source` search: the live exercise went from 0 to 20 recent events on the same input.
+- **The agent list repainted only after its asynchronous read.** Registration now draws from what is known
+  and then enriches, so a newly registered worker appears immediately instead of one interval later.
+
+## 3e. Live proof of the fix, both transports (2026-09-20)
+
+**Headless, after US-006.** Authorized research run at the working tree, 1 repeat, `alibaba/qwen3.8-flash`,
+`--transport headless` (the default): exit 0, terminal, 211,752 ms, 4 dispatches, 4 completions, 0 retries,
+0 fallbacks, 0 failures. `op=watch` sampled 9 times, 10 agent rows, **10 carrying a non-null
+`lastActivity`** - real worker output such as "So the cache is a memo of `rows`. Invalidation on save is
+needed because if you ...". The run that opened the finding recorded 0 of 6 on the same transport. All run
+directories were removed and 8 evidence records retained. Evidence:
+`agent-output/runtime-measure-2026-09-20-headless-liveview/`. Mid-run, the reader was also pointed at the
+live attempt directory by hand and returned the 12 lines the view would render.
+
+**Herdr, the visible adapter.** Authorized research run with `--transport herdr` in a throwaway workspace
+(created for this proof and closed afterwards; the operator's own workspaces were untouched): exit 0,
+terminal, 164,725 ms, 4 dispatches, 4 completions, 0 retries, 0 failures, all four operations completed
+with verdicts (`thinker_split` READY, `search` DONE, `search` DONE, `thinker_synthesize` DONE). Real tabs
+were created with the role-bearing labels. `--transport herdr` was added to the measurement driver for
+this, including a per-sample direct `herdr pane read` recorded beside the view's own reading, so agreement
+is checkable rather than assumed: **4 of 4 comparisons match exactly**, the view's rendered line being
+byte-identical to the pane's own last line (for example `"Let me be"` and then a longer sentence from the
+answer). All run directories were removed afterwards. Evidence: `/tmp/dg-herdr-proof-evidence/` and the
+run root `/tmp/pi-wave-measure-runtime-v1-S4EGVz/`.
+
+The Herdr run is also what surfaced the open High finding in section 3d: its four operations each settled
+with a post-settlement cleanup failure, and its tabs outlived the run.
+
+**The candidate-less failure bundle, exercised live.** `test/support/failure-bundle-driver.py` starts the
+real supervisor and a real worker that exits cleanly having captured nothing, then calls the shipped
+`settle_runtime_attempt`. On 120 emitted events the settled attempt retained a 20-event tail (seq 100-119,
+mode 600) and a `failure-op-candidate-less.json` bundle (mode 600) whose reason is "attempt settled without
+a candidate", carrying the worker's stderr and its 20 most recent events. `test/failure-bundle-live.test.ts`
+then drives the store's retention over those artifacts: both land under `evidence/<runId>/`, byte-exact and
+mode 600, and the run directory is removed. The unpatched variant is recorded too, because it shows the
+abort path replacing the candidate-less reason.
 
 ## 4. Functional Requirements
 
@@ -368,6 +454,10 @@ key to `runs`, so `prune` cannot cascade into a story's record. The provenance i
 - FR-11: The endpoint must retain nothing; it must be a stream with no replay.
 - FR-12: The story's execution record must have exactly one writer: the store.
 - FR-13: No `legacy-v1` report or file-ledger machinery may be reintroduced into the package.
+
+- FR-19: A headless worker's live view must read the stream its supervisor publishes, not the capture file.
+- FR-20: The live view must never block on the stream: the read is async, deadline-bounded and cached.
+- FR-21: A worker that publishes nothing must say so rather than showing a capture file in its place.
 
 ## 5. Non-Goals
 

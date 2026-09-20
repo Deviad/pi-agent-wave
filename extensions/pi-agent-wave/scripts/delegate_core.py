@@ -1467,6 +1467,19 @@ def read_settlement_evidence(evidence_path: Path) -> dict[str, Any] | None:
     return evidence if isinstance(evidence, dict) else None
 
 
+def worker_stream_source(resource: dict[str, Any]) -> Path | None:
+    """The worker's own stream, wherever this mode put it, or None when it wrote none.
+
+    A prompt worker's stream is written by RuntimeOutputFiles beside its result file, not at the
+    attempt-directory path the worker configuration names; that path only carries a `close` run. Nearest
+    first, so both the retained capture and the failure bundle read the same real stream.
+    """
+    worker_result = str(resource.get("worker_result", ""))
+    sources = [Path(worker_result).parent / "runtime-output" / "worker.stdout.ndjson"] if worker_result else []
+    sources.append(Path(str(resource.get("attempt_dir", ""))) / "worker.stdout.ndjson")
+    return next((path for path in sources if path.is_file()), None)
+
+
 def _stream_tail(path: Path, limit: int) -> str:
     """The final `limit` stream lines, each truncated to the diagnostic event window and redacted.
 
@@ -1550,7 +1563,7 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
         "workerExit": resource.get("worker_exit"),
         "changedConfiguration": changed_configuration,
         "stderrTail": _read_text_tail(attempt_dir / "worker.stderr.txt", FAILURE_DIAGNOSTIC_STDERR_BYTES),
-        "recentEvents": _recent_worker_events(attempt_dir / "worker.stdout.ndjson", FAILURE_DIAGNOSTIC_EVENT_LIMIT),
+        "recentEvents": _recent_worker_events(worker_stream_source(resource) or attempt_dir / "worker.stdout.ndjson", FAILURE_DIAGNOSTIC_EVENT_LIMIT),
     }
     path = run_dir / f"failure-{suffix}.json"
     write_private(path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")
@@ -1758,10 +1771,7 @@ def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_
     status = observation.get("captureStatus") if isinstance(observation, dict) else None
     if status == "complete" and evidence.get("candidate") is not None:
         return None
-    worker_result = str(resource.get("worker_result", ""))
-    sources = [Path(worker_result).parent / "runtime-output" / "worker.stdout.ndjson"] if worker_result else []
-    sources.append(Path(str(resource.get("attempt_dir", ""))) / "worker.stdout.ndjson")
-    source = next((path for path in sources if path.is_file()), None)
+    source = worker_stream_source(resource)
     if source is None:
         return None
     retained = run_dir / f"runtime-capture-{slugify(str(resource['agent']))}.ndjson"
