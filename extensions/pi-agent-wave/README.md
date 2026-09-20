@@ -31,10 +31,10 @@ This document is the reference for installing, configuring, and operating the pa
 | ACPX | `0.13.2` | Worker execution for Pi, Codex, and Claude |
 | Turso AgentFS | `0.6.4` | One copy-on-write sandbox per attempt |
 | pi-acp | `0.0.31` | Air's ACP bridge to Pi |
-| JetBrains Air | `262.579.44` rehearsed; `262.834.44` confirmed by the maintainer | Drives Pi through `pi-acp` in headless mode; Herdr is not required |
+| JetBrains Air | `262.834.44` rehearsed 2026-09-20; `262.579.44` rehearsed 2026-09-01 | Drives Pi through `pi-acp` in headless mode; Herdr is not required |
 | Herdr | any current release | Optional visible worker tabs |
 
-ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them. JetBrains Air is proven by the installed-application rehearsal recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md` (Air `262.579.44`) and confirmed again by the maintainer on Air `262.834.44` (2026-09-16), which the automated rehearsal has not driven. The architecture, including the per-attempt execution path and what a run retains, is documented in the repository root README.
+ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them. JetBrains Air is proven by installed-application rehearsals recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md`: `262.579.44` on 2026-09-01 and `262.834.44` on 2026-09-20, the later one covering start, delegation with real workers, progress and status, cancellation, recovery through retry exhaustion and an operator abort, a build run to a passing audit, and a second Air task reading the first task's run. The architecture, including the per-attempt execution path and what a run retains, is documented in the repository root README.
 
 ## Install
 

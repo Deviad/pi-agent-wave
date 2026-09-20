@@ -293,9 +293,9 @@ Pi extensions run with your user account's full system access. Review the source
 | ACPX | `0.13.2` |
 | AgentFS | `0.6.4` |
 | pi-acp | `0.0.31` |
-| JetBrains Air | `262.579.44` in the recorded rehearsal; `262.834.44` confirmed by the maintainer |
+| JetBrains Air | `262.834.44` rehearsed 2026-09-20; `262.579.44` rehearsed 2026-09-01 |
 
-JetBrains Air support is proven by the installed-application rehearsal recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md`: Air starts and owns Pi as its ACP agent through `pi-acp` `0.0.31`, with no Herdr process, workspace, tab, pane or environment variable required and no Herdr resource created. That rehearsal drove Air `262.579.44`; the maintainer has since confirmed the same working setup, with the persistent `Pi Wave` entry in Air's global `acp.json`, on Air `262.834.44` (2026-09-16). The newer build has not been driven by the automated rehearsal, so the claim for it rests on the maintainer's own run. ACP clients that expose no Pi slash commands drive the identical flows through the `delegate_graph` tool.
+JetBrains Air support is proven by installed-application rehearsals recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md`: Air starts and owns Pi as its ACP agent through `pi-acp` `0.0.31`, with no Herdr process, workspace, tab, pane or environment variable required and no Herdr resource created. The 2026-09-20 rehearsal ran on Air `262.834.44` with Pi `0.85.1` and covered a research run to terminal, a mid-flight cancellation, a recovery through retry exhaustion and an operator abort, a build run to `review PASS` → `test GREEN` → `audit PASS` with both implement operations integrated, and a **second Air task** reading the first task's run; its evidence is `agent-output/air-headless-orchestration/air-e2e.json` with the graph it was read from under `air-e2e-artifacts/v3-20260920/retained/`. ACP clients that expose no Pi slash commands drive the identical flows through the `delegate_graph` tool.
 
 ## For contributors
 

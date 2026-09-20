@@ -18,6 +18,11 @@ DEFAULT_CONFIG = Path.home() / "Library" / "Application Support" / "JetBrains" /
 STATE = Path("/private/tmp/pi-agent-wave-air-e2e-state.json")
 AGENT_NAME = "Pi Wave Headless E2E"
 NPX = Path("/Users/spotted/.nvm/versions/node/v22.16.0/bin/npx")
+# The frozen route every rehearsal worker takes. Overridable because which provider actually works is an
+# environment fact, not a property of this fixture: the 2026-09-20 rerun found `openai-codex` and
+# `anthropic` answering `pi auth check` as ready while their turns failed, and the maintainer's own
+# routing uses this one.
+DEFAULT_MODEL = "alibaba/deepseek-v4.1-flash"
 
 
 def sha(path: Path) -> str:
@@ -30,7 +35,7 @@ def private_write(path: Path, value: object) -> None:
     path.chmod(0o600)
 
 
-def stage(config_path: Path, state_path: Path, install: bool) -> dict[str, object]:
+def stage(config_path: Path, state_path: Path, install: bool, model: str = DEFAULT_MODEL) -> dict[str, object]:
     if not config_path.exists():
         raise RuntimeError(f"Air ACP config missing: {config_path}")
     before = config_path.read_bytes()
@@ -46,7 +51,7 @@ def stage(config_path: Path, state_path: Path, install: bool) -> dict[str, objec
         (agent_dir / "auth.json").symlink_to(source_auth)
     routing = {
         "default_tier": "strong",
-        "tiers": {"strong": {"models": ["openai-codex/gpt-5.6-sol"], "thinking": "low", "session": True}},
+        "tiers": {"strong": {"models": [model], "thinking": "low", "session": True}},
         "roles": {role: {"tier": "strong"} for role in ["thinker", "implementer", "reviewer", "tester", "auditor", "searcher"]},
     }
     (agent_dir / "model-routing.jsonc").write_text(json.dumps(routing), encoding="utf-8")
@@ -82,6 +87,7 @@ def stage(config_path: Path, state_path: Path, install: bool) -> dict[str, objec
         "workspace": str(workspace),
         "agentDir": str(agent_dir),
         "installed": install,
+        "model": model,
     }
     private_write(state_path, state)
     return state
@@ -103,8 +109,9 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--state", type=Path, default=STATE)
     parser.add_argument("--install", action="store_true")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="the frozen route every rehearsal worker takes")
     args = parser.parse_args()
-    result = stage(args.config, args.state, args.install) if args.action == "stage" else restore(args.state)
+    result = stage(args.config, args.state, args.install, args.model) if args.action == "stage" else restore(args.state)
     print(json.dumps(result, sort_keys=True))
 
 
