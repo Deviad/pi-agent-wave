@@ -69,6 +69,65 @@ flowchart LR
 
 The **research** graph is `thinker_split → search (fan-out) → thinker_synthesize`, and the **operations** graph is `source_search (fan-out) → thinker_synthesize → audit`. Every graph ends at a terminal node once its last gate passes.
 
+### Where a worker actually runs
+
+The supervisor never executes a worker in its own process. `op=dispatch` builds one private run directory, materializes the task together with the evidence the worker may read, and hands off through a transport: `scripts/delegate.ts` picks `headless_delegate.py` or `herdr_delegate.py`, and those build the attempt and start it. A headless attempt runs under `headless_supervisor.py`, a supervisor process that owns the worker's PTY, its capture files and its live stream; a Herdr attempt gets a tab and a pane instead. Either way the worker itself is started as `agentfs run --session <attempt-key> … node --experimental-strip-types scripts/acpx-worker.ts`, so the copy-on-write overlay exists before ACPX starts and the agent CLI never runs outside it.
+
+```mermaid
+flowchart TB
+    pi["Pi supervisor session<br/>extension host · delegate_graph tool"]
+    store[("GraphStore · SQLite schema v12<br/>runs · graphs · agents · operations · events<br/>runtime_attempts · runtime_decisions<br/>ledger_entries · ledger_claims · ledger_aggregates")]
+
+    subgraph DISPATCH["One dispatch"]
+        transport["scripts/delegate.ts<br/>headless_delegate.py · herdr_delegate.py"]
+        sup["headless_supervisor.py<br/>owns the PTY, the capture files, the live stream"]
+        pane["Herdr tab and pane<br/>the worker's own rendered output"]
+    end
+
+    subgraph ATTEMPT["One attempt"]
+        overlay["agentfs run --session attempt-key<br/>copy-on-write overlay over your workspace"]
+        acpx["scripts/acpx-worker.ts → ACPX → agent CLI<br/>Pi · Codex · Claude"]
+    end
+
+    view["/graph watch · --follow · the agent list"]
+
+    pi -->|"next operation, then decisions"| store
+    pi -->|"op=dispatch"| transport
+    transport --> sup
+    transport -->|"creates the tab"| pane
+    sup -->|"the launcher argv, under a private PTY"| overlay
+    overlay --> acpx
+    acpx -->|"staged owned paths"| overlay
+    pane -.->|"herdr pane read"| view
+    sup -.->|"loopback stream, bearer token"| view
+    sup -->|"status, settlement and cleanup evidence"| pi
+```
+
+A running worker is therefore watchable two ways, and both read the worker's own output rather than a summary of it: a Herdr pane is read directly, and a headless worker's supervisor publishes what the worker writes to a loopback listener the view polls. Neither path is a gate. Nothing is retained by the channel itself, and the capture files a view never reads are what settlement retains as evidence.
+
+### What a run keeps, and what it tears down
+
+```mermaid
+flowchart LR
+    worker["worker exited"] --> retain["retain first<br/>answer + audited changes<br/>content-addressed, mode 600"]
+    retain --> record["settlement record<br/>published atomically"]
+    record --> close["session closed<br/>provider boundary verified"]
+    close --> audit["cleanup audit<br/>tab · pane · mount · server · database · links<br/>owned processes · attempt directory"]
+    audit --> remove["private run directory removed"]
+    audit -.->|"any failure after the record is a post-settlement failure: reported, never used to discard the candidate"| reported(["postSettlementFailures"])
+```
+
+Retention comes first, so nothing after it can cost the work: the answer and the audited changes are immutable content before a session is closed, a credential link is removed, or a sandbox is torn down. The graph then advances only on an explicit, reasoned decision, and an attempt that failed or produced no candidate is replaced through `op=retry`, which spends a three-attempt same-model transient budget before moving along the frozen chain.
+
+| Path | Holds | Lifetime |
+| --- | --- | --- |
+| `~/.local/share/delegate-graph/delegate-graph.db` | runs, graphs, agents, operations, events, runtime attempts and decisions, and the `ledger_*` story record | until `/graph prune`; the `ledger_*` rows are never pruned |
+| `runtime-content/` beside the database | content-addressed copies of retained answers and audited changes | not reclaimed by `/graph prune` |
+| `evidence/<runId>/`, `failures/<runId>/` | one run's settlement and cleanup evidence, diagnostics, capture stream and failure bundles | reclaimed by `/graph prune` with the run |
+| `/tmp/delegate-graph-…-<run>-<operation>.*` | one operation's private run directory | removed as soon as that operation settles |
+
+`DELEGATE_GRAPH_DB` moves the database and everything beside it; `PI_CODING_AGENT_DIR`, `PI_MODEL_ROUTING` and `PI_MODEL_CATALOG` relocate the Pi-side configuration the package reads. Every attempt's private directory and every retained file is created mode 600 under an owned directory, and a run that reaches a terminal state is the unit `/graph prune` reclaims.
+
 ### Result contract
 
 Every run uses one result contract, frozen at creation.
@@ -129,7 +188,7 @@ Pi's home defaults to `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` or pass `--agent-
 
 No enablement step exists: a worker runs on the adapter its frozen model selects. Put a Pi-adapter model behind every Codex or Claude entry in `~/.pi/agent/model-routing.jsonc` so an exhausted quota falls over to another provider.
 
-Pi and Codex are proven on every graph (Codex: `agent-output/runtime-measure-codex-20260912/`, `runtime-measure-codex-build-20260912/`, `runtime-measure-codex-operations-20260912/`); Claude has passed its probe (`agent-output/runtime-result-probe-run4-20260912/claude.json`) but not a graph run. Runs and their retained evidence live under `~/.cache/delegate-graph/`; see [environment and storage](extensions/pi-agent-wave/README.md#environment-and-storage).
+Pi and Codex are proven on every graph (Codex: `agent-output/runtime-measure-codex-20260912/`, `runtime-measure-codex-build-20260912/`, `runtime-measure-codex-operations-20260912/`); Claude has passed its probe (`agent-output/runtime-result-probe-run4-20260912/claude.json`) but not a graph run. Runs and their retained evidence live under `~/.local/share/delegate-graph/`; see [environment and storage](extensions/pi-agent-wave/README.md#environment-and-storage).
 
 ## 3. Add Pi to JetBrains Air
 
@@ -220,7 +279,7 @@ After npm publication:
 pi remove npm:@dpugliese/pi-agent-wave
 ```
 
-Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs under `~/.cache/delegate-graph/`.
+Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs under `~/.local/share/delegate-graph/`.
 
 ## Security
 
@@ -234,8 +293,9 @@ Pi extensions run with your user account's full system access. Review the source
 | ACPX | `0.13.2` |
 | AgentFS | `0.6.4` |
 | pi-acp | `0.0.31` |
+| JetBrains Air | `262.579.44` in the recorded rehearsal |
 
-JetBrains Air support is claimed only to the extent proven by the installed-application rehearsal in `tasks/prd-air-controlled-editor-independent-orchestration.md`.
+JetBrains Air support is proven by the installed-application rehearsal recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md`: Air starts and owns Pi as its ACP agent through `pi-acp` `0.0.31`, with no Herdr process, workspace, tab, pane or environment variable required and no Herdr resource created. The maintainer has confirmed the same working setup in their own Air installation (2026-09-20). ACP clients that expose no Pi slash commands drive the identical flows through the `delegate_graph` tool.
 
 ## For contributors
 

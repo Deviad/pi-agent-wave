@@ -6,7 +6,7 @@ import { buildAgentFsInvocation, expectedAgentFsDb } from "../lib/agentfs-sandbo
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../sqlite.ts";
-import { GraphStore } from "../store.ts";
+import { CURRENT_SCHEMA_VERSION, GraphStore } from "../store.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { parseRuntimeCandidate } from "../lib/runtime-results.ts";
 import { parseRuntimeSettleConfig, settleRuntimeWorker } from "../scripts/runtime-settle.ts";
@@ -69,7 +69,7 @@ test("a v9 database with the contract and report columns migrates to v10 without
 				CREATE TRIGGER runs_result_contract_graph
 				BEFORE INSERT ON runs WHEN NEW.result_contract='runtime-v1' AND NEW.graph_name NOT IN ('build','research')
 				BEGIN SELECT RAISE(ABORT, 'unsupported graph result contract'); END;
-				DELETE FROM schema_version WHERE version IN (9, 10, 11);
+				DELETE FROM schema_version WHERE version >= 9;
 			`);
 			assert.equal(db.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 8);
 		} finally { db.close(); }
@@ -77,7 +77,7 @@ test("a v9 database with the contract and report columns migrates to v10 without
 		try {
 			const check = new Database(join(root, "graph.db"));
 			try {
-				assert.equal(check.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+				assert.equal(check.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 				assert.equal(check.query("SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('runs_result_contract_graph','runs_result_contract_immutable')").get(), undefined);
 				assert.deepEqual(check.query<{ name: string }>("PRAGMA table_info(runs)").all().map((column) => column.name).filter((name) => name === "result_contract"), []);
 				assert.deepEqual(check.query<{ name: string }>("PRAGMA table_info(operations)").all().map((column) => column.name).filter((name) => name === "report_path"), []);

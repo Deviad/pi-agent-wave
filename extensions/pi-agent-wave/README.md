@@ -31,9 +31,10 @@ This document is the reference for installing, configuring, and operating the pa
 | ACPX | `0.13.2` | Worker execution for Pi, Codex, and Claude |
 | Turso AgentFS | `0.6.4` | One copy-on-write sandbox per attempt |
 | pi-acp | `0.0.31` | Air's ACP bridge to Pi |
+| JetBrains Air | `262.579.44` in the recorded rehearsal | Drives Pi through `pi-acp` in headless mode; Herdr is not required |
 | Herdr | any current release | Optional visible worker tabs |
 
-ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them.
+ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them. JetBrains Air is proven by the installed-application rehearsal recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md` and confirmed again by the maintainer in their own Air installation (2026-09-20); the architecture, including the per-attempt execution path and what a run retains, is documented in the repository root README.
 
 ## Install
 
@@ -172,7 +173,7 @@ Apply moves conflicting loose extensions to `migration-backups/pi-agent-wave/`, 
 | --- | --- | --- |
 | `PI_CODING_AGENT_DIR` | extension, scripts | Pi agent directory; default `~/.pi/agent` |
 | `PI_MODEL_ROUTING`, `PI_MODEL_CATALOG` | resolver, doctor, picker | Explicit `model-routing.jsonc` and `models.json` paths |
-| `DELEGATE_GRAPH_DB` | extension, settlement | Graph database path; default `~/.cache/delegate-graph/delegate-graph.db`. Tests and the measurement driver point it at a temporary file |
+| `DELEGATE_GRAPH_DB` | extension, settlement | Graph database path; default `~/.local/share/delegate-graph/delegate-graph.db`. Tests and the measurement driver point it at a temporary file |
 | `PI_CLAUDE_OAUTH_TOKEN_FILE` | launcher, doctor, matrix | Mode-600 raw Claude token for `claude-code/*` workers |
 | `CODEX_HOME` | launcher, doctor | Codex credential and configuration home; default `~/.codex` |
 | `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` | extension, launcher | Set by Herdr in a workspace shell; complete identity selects the Herdr transport under `auto` |
@@ -186,12 +187,29 @@ Where the package writes:
 
 | Location | Contents | Lifetime |
 | --- | --- | --- |
-| `~/.cache/delegate-graph/delegate-graph.db` | Runs, operations, agents, events, runtime attempts, decisions, integrations, adapter evidence rows | Until `/graph prune` |
-| `~/.cache/delegate-graph/runtime-content/` | Content-addressed retained answers, staged files and manifests | With the run |
-| `~/.cache/delegate-graph/failures/<runId>/` | Diagnostics for operations that were never dispatched | With the run |
-| `/tmp/delegate-graph-herdr-<run>-<operation>.*/` | The attempt's private run directory: task, prompt, worker configuration, ACPX and AgentFS homes, capture files, settlement and cleanup records, materialized run evidence, retained failure bundles and raw streams | Attempt directories are removed after a clean settlement; the run directory and its records remain |
+| `~/.local/share/delegate-graph/delegate-graph.db` | Runs, operations, agents, events, runtime attempts, decisions, integrations, adapter evidence rows | Until `/graph prune` |
+| `~/.local/share/delegate-graph/delegate-graph.db` (`ledger_*` tables) | The story's execution record: entries, claims with their evidence state, and aggregates exactly as recorded | Permanently; `prune` deletes runs and never these |
+| `~/.local/share/delegate-graph/runtime-content/` | Content-addressed retained answers, staged files and manifests | With the run |
+| `~/.local/share/delegate-graph/failures/<runId>/` | `unlaunched-<operationId>.json` diagnostics for operations that were never dispatched | Until `/graph prune` reclaims it with the run |
+| `~/.local/share/delegate-graph/evidence/<runId>/` | The records `collect` retains before removing the run directory: settlement evidence, cleanup evidence, the capture stream, and a failure bundle found during collection | Until `/graph prune` reclaims it with the run; the reported paths resolve while the run exists |
+| `/tmp/delegate-graph-herdr-<run>-<operation>.*/` | The operation's transient working directory: task, prompt, worker configuration, ACPX and AgentFS homes, capture files, settlement and cleanup records, materialized run evidence | Removed when the operation settles; `/graph prune` also reclaims the directory of a run whose operation never got that far |
 | `<workspace>` | Files placed by `integrate` through the journal, and nothing else | Yours |
-| `/tmp/pi-wave-staging-*/` | Settlement's scratch copy of an AgentFS snapshot while staging | Seconds; removed on every exit path |
+| `/tmp/pi-wave-staging-<pid>-*/` | Settlement's scratch copy of an AgentFS snapshot while staging | Seconds; removed on every exit path |
+
+Before 2026-09-20 this home was `~/.cache/delegate-graph/`. The default moved because the store is
+the single source of truth for a story's execution record while `prune` cascades, so a reclamable
+location made the trail deletable as if it were scratch. A database created before the move is left
+where it is: point `DELEGATE_GRAPH_DB` at the old path to keep reading it.
+
+**Story ledger.** Schema v12 puts a story's execution record in the store, in three tables:
+`ledger_entries` (sequence, topic, run, tier, model, outcome), `ledger_claims` (each claim with its
+evidence and an explicit `verified` / `unverified` / `unverified-recall` state), and
+`ledger_aggregates` (each figure as recorded). Two properties are deliberate. The tables hold no
+foreign key to `runs`, so `prune` can delete a settled run without deleting the record of what it
+did. And a recorded aggregate is not trusted: reading a story back recomputes
+`percentage` from `numerator` and `denominator` and reports `AGGREGATE_MISMATCH` when the two
+disagree, which is the check the retired file-ledger audit performed. This is not `/graph ledger`,
+which renders one run from the store's operational facts and is consulted by no gate.
 
 All of these are private, mode 600 or 700, and may contain sensitive values. None is packaged.
 
@@ -235,12 +253,12 @@ Capability floors may promote a role to a stronger tier. The frozen policy recor
 | --- | --- |
 | `/graph agents` | Reopens the session's numbered agent list. It opens by itself when the first worker of the session registers and appends later workers with stable numbers, across runs and retries. Enter alone opens the only running worker; with several running it focuses the list (the header says `focused`, the marked row is the cursor), up and down move over the visible rows including the folded summary, Enter opens the marked row and `q` unfocuses. A number followed by Enter opens that attempt directly. The details show: run and status, node, role, transport, model, task, process state (running, settled with its outcome, or superseded) and acceptance, the rendered tail of the retained stream, and the retained answer after settlement, bounded; missing output or answer is stated. Settled or superseded workers fold into one line, `settled (N): 1, 3 | s shows them`, so only running workers are listed; `s` shows or hides them, their numbers never change and still open details. `r` refreshes; `q` clears a pending number, returns from details to the list, and closes the list. Escape asks to cancel every running worker of the run in view (the selected worker's run, otherwise the most recently registered one): the prompt names the workers, Enter confirms, `q` or Escape aborts. A confirmed cancellation stops each worker through its structured cancel script, settles its attempt as cancelled, and records the run cancelled; a worker that cannot be confirmed stopped is named in the notice and in the operation's error. Keys reach the list only while the editor is empty. Selection never runs a Herdr focus or cancel command, so a worker whose tab is gone stays inspectable. TUI only; the redraw timer runs only while a listed worker is running and the view is open |
 | `/graph status <runId> [--follow]` | Graph state, pending work, blockers, registered workers, and for runtime runs each attempt's process, acceptance, capture, and session state. With `--follow` (before or after the run id) it is an alias of `/graph watch <runId> --follow` |
-| `/graph watch <runId> [--follow]` | One line per running worker: agent, node, process state, tool-call count, and the last thing it did, rendered from its live ACPX stream; the most recent rendered lines follow. Without `--follow` it prints once. With `--follow` it stays on screen as a widget above the editor, redraws every two seconds while the run is active, and takes keys while the editor is empty: Enter opens the only running worker or focuses the list for the arrows, a number then Enter opens that worker directly (the same view as the agent list, bound to the attempt, so a vanished Herdr tab changes nothing), `r` redraws; `q` clears a pending number, returns from details, and closes; Escape asks to cancel the run's running workers with the same confirmation as the agent list. It never focuses a worker; use `/graph focus` for the tab. The timer lives only while the view is open. Inspection is read-only; the confirmed Escape cancellation is its only mutation |
+| `/graph watch <runId> [--follow]` | One line per running worker: agent, node, process state, and the last thing it did, read from the worker's own terminal; the most recent lines follow. Without `--follow` it prints once. With `--follow` it stays on screen as a widget above the editor, redraws every two seconds while the run is active, and takes keys while the editor is empty: Enter opens the only running worker or focuses the list for the arrows, a number then Enter opens that worker directly (the same view as the agent list, bound to the attempt, so a vanished Herdr tab changes nothing), `r` redraws; `q` clears a pending number, returns from details, and closes; Escape asks to cancel the run's running workers with the same confirmation as the agent list. It never focuses a worker; use `/graph focus` for the tab. The timer lives only while the view is open. Inspection is read-only; the confirmed Escape cancellation is its only mutation |
 | `/graph log <runId> [--tail <count>] [--agent <name>]` | The event ledger; default tail 50, filterable by agent |
 | `/graph focus <runId> <node-or-agent>` | Bring a Herdr worker tab forward; headless workers have nothing to focus |
 | `/graph resume <runId> <operationId>` | Operator-approved retry of a parked operation with its stored policy digest and frozen route; never reopens the picker |
 | `/graph ledger <runId> [path]` | Derived, read-only JSON view of a run: attempts, outcomes, candidates, checkpoints, decisions, supersessions, events. Printed, or written mode-600 to `path`. It is consulted by no gate. |
-| `/graph prune [days]` | Remove settled runs older than the retention window (default 30 days) |
+| `/graph prune [days]` | Remove settled runs older than the retention window (default 30 days), and reclaim what they left on disk: retained evidence, never-dispatched diagnostics, and the transient run directory of every operation of a pruned run. A story's ledger entries are never removed |
 
 `/graph resume` is the operator's fenced replacement of a parked attempt: it advances the transient counter so the new identity is fresh, never restores the budget, and never bypasses edges or joins.
 
@@ -267,7 +285,7 @@ Exact-model locks cannot be unlocked; they remain authoritative.
 | `init` | `story`, `task`; optional `graph` (`build`, `research`, `operations`), `modelPolicy`, and `commands` for operations runs. Returns the run and its first pending operations. |
 | `next` | `runId`. Current-phase operations with their frozen route, `modelPolicy`, `policyDigest`, attempt counters, `retry_not_before`, and the active attempt. |
 | `status` | `runId`. Read-only rendered status. |
-| `watch` | `runId`. Read-only view of every running worker: agent, node, process and acceptance state, the retained stream path, its last rendered activity, the most recent rendered lines, and prompt, tool-call and text counts. Emits a `watch` progress event, so ACP clients such as Air show the same summary. Consulted by no gate. |
+| `watch` | `runId`. Read-only view of every running worker: agent, node, process and acceptance state, the pane its live output is read from, its last rendered line, and the most recent lines. Emits a `watch` progress event, so ACP clients such as Air show the same summary. Consulted by no gate. |
 | `dispatch` | `runId`, `operationId`, optional `transport`. Preflights, materializes the run evidence for the worker, launches one worker, and registers the agent and the attempt under its frozen identity. |
 | `collect` | `runId`, `operationId`. Waits for the worker and settles the attempt from durable evidence: process outcome, retained candidate, observed session. Collecting again returns the same settlement. The result also carries what the supervisor needs to decide: `answer` (the retained answer, first 16 KiB, with `answerBytes` and `answerTruncated`), `verdict` (the answer's final `VERDICT:` line, or null), a `decide` template with this operation's id and the fields its node takes (`verdict` for review, test, audit and source_search, read from the answer; `verdict: DONE` for thinker_synthesize on the operations graph, supplied by the supervisor; `payload.slices` for thinker_plan and thinker_split), and a `note` naming the next step, read from the candidate's own staging manifest (`op=integrate` first when it records file changes, decide directly when it records none, reject-then-retry for an empty candidate, `op=retry` when no candidate was retained). |
 | `integrate` | `runId`, `operationId`, optional `decision: "rejected"` to roll back. Applies a coding or operational candidate's audited changes through the journal. |
@@ -283,7 +301,7 @@ Direct initialization accepts every tagged model-policy form: `auto`, a named pr
 
 `collect` always converges. When the launcher cannot produce a settlement record, the attempt settles `failed` with the launcher's reason and names the retained `failure-<operationId>.json` diagnostic bundle (mode 600, redacted, written before the attempt directory is removed); the operation keeps that failed attempt until `retry` classifies it. `cancel` refuses while a worker's ACPX state is `alive` and its cancel command fails, and records `cancelled` when the state is already `no-session`.
 
-An operation whose worker was never registered has nothing to collect: `collect` refuses it without writing anywhere, and `cancel` settles it as cancelled with a diagnostic under `failures/<runId>/` beside the graph database naming the cause. A dispatch whose preflight fails classifies the launch failure through `retry`, fenced to the exact counters that were dispatched. A wrong `runId` is a refusal, not a write.
+An operation whose worker was never registered has nothing to collect: `collect` refuses it without writing anywhere, and `cancel` settles it as cancelled with an `unlaunched-<operationId>.json` diagnostic under `failures/<runId>/` beside the graph database naming the cause. The name distinguishes it from a worker's `failure-<operationId>.json` bundle, which carries the same operation id under `evidence/<runId>/`. A dispatch whose preflight fails classifies the launch failure through `retry`, fenced to the exact counters that were dispatched. A wrong `runId` is a refusal, not a write.
 
 A parked run resumes through `resolve`: `retry` supersedes the parked attempt and returns the operation to `pending` with a fresh identity; `defer`, `abort` and `escalate` are graph transitions. An escalated run can also be resumed by the operator. Foreign, stale, cancelled, terminal, and completed semantic-cap operations cannot be reopened.
 
@@ -368,6 +386,35 @@ Call `init`, then repeat `next -> dispatch -> collect -> [integrate] -> decide |
 
 ## Worker lifecycle
 
+### One attempt, end to end
+
+The picture below is what one `dispatch` creates and what one `collect` tears down. Every box is a process or a file this package owns; the graph database is the only thing that outlives the attempt.
+
+```mermaid
+flowchart TB
+    pi["Pi supervisor session<br/>extension host · delegate_graph tool"]
+    store[("GraphStore · SQLite schema v12<br/>runs · agents · operations · runtime_attempts<br/>events · ledger_entries · ledger_claims · ledger_aggregates")]
+    transport["scripts/delegate.ts<br/>headless_delegate.py · herdr_delegate.py"]
+    sup["headless_supervisor.py<br/>owns the PTY, the capture files, the live stream"]
+    pane["Herdr tab and pane<br/>the worker's own rendered output"]
+    overlay["agentfs run --session attempt-key<br/>copy-on-write overlay, mode-600 credential inside"]
+    acpx["scripts/acpx-worker.ts → ACPX → agent CLI<br/>Pi · Codex · Claude"]
+    view["/graph watch · --follow · the agent list"]
+
+    pi -->|"next operation, then decisions"| store
+    pi -->|"op=dispatch"| transport
+    transport --> sup
+    transport -->|"creates the tab"| pane
+    sup -->|"launcher argv, under a private PTY"| overlay
+    overlay --> acpx
+    acpx -->|"staged owned paths"| overlay
+    pane -.->|"herdr pane read"| view
+    sup -.->|"loopback stream, bearer token"| view
+    sup -->|"status, settlement and cleanup evidence"| pi
+```
+
+The repository root README carries the same picture at product level, together with what a run retains and where it is written.
+
 ### Transport
 
 Execution is ACPX-only. Headless runs without Herdr. `auto` selects Herdr only when the `herdr` executable and complete workspace and tab identity are present; explicit `herdr` fails closed without them, and explicit `headless` creates no Herdr resource. Both adapters share planning, launch, audit, cancellation, settlement, and cleanup, and both deliver the same frozen policy, model identity, role, and failover route.
@@ -406,11 +453,17 @@ The answer and the audited overlay changes are retained as content-addressed pri
 
 Cancellation, focus failure, abort, retry, and cleanup all run the same persisted `acpx-cancel.ts` boundary: it validates the ACPX session, record, attempt key, and AgentFS session cwd, requires structured cancel acknowledgement and the transition to `idle` or `no-session`, then requires `session_closed` and final `no-session`.
 
-Cleanup audits the queue owner, ACPX session files, AgentFS mount, server, database, and HOME, provider links, Herdr agent, pane, and tab, owned processes, and the attempt directory, and records that audit as `cleanup-<agent>.json` every time, including a repeat cleanup of an already torn-down attempt. Absence is the goal: a present resource is a failure, an already-absent one converges. `sessionClosed` is true only from an observed cancellation, an observed close, or a session absent from both session files and owned processes, and `sessionClosureEvidence` says which. Cleanup names credential targets by basename only.
+Cleanup audits the queue owner, ACPX session files, AgentFS mount, server, database, and HOME, provider links, Herdr agent, pane, and tab, owned processes, and the attempt directory, and records that audit as `cleanup-<agent>.json` every time, including a repeat cleanup of an already torn-down attempt. Absence is the goal: a present resource is a failure, an already-absent one converges. A settled Herdr worker's tab is closed as part of settling, after its ACPX session closes and before this audit, so a run that settles happily converges without an operator cleanup pass; a close that fails is reported with the audit's own failure rather than replacing it. `sessionClosed` is true only from an observed cancellation, an observed close, or a session absent from both session files and owned processes, and `sessionClosureEvidence` says which. Cleanup names credential targets by basename only.
 
 ### Watching a worker
 
-The worker runs ACPX with `--format json --json-strict` because settlement needs the JSON-RPC stream to retain the answer and observe the session. That stream is written only to the attempt's private capture files. What the launcher prints, and therefore what a Herdr pane shows, is a rendering of it: assistant text as it streams, thoughts dimmed, one line per tool call (`\u25b8` started, `\u2713` completed, `\u2717` failed), `plan: done/total steps`, and short rules for prompt start, `end_turn`, cancellation and errors. Adapter bookkeeping (usage, commands, session info) is suppressed and non-JSON lines pass through prefixed with `|`. Nothing in the rendering is a success signal. `/graph watch` and `op=watch` apply the same renderer to the tail of each running worker's stream to produce the per-agent summary. `/graph watch --follow` is the navigable form: the summary stays on screen above the editor, a number plus Enter opens a worker's details, and it closes on `q`. `/graph focus` is the only command that brings a Herdr tab forward.
+The worker runs ACPX with `--format json --json-strict` because settlement needs the JSON-RPC stream to retain the answer and observe the session. That stream is written only to the attempt's private capture files. What the launcher prints, and therefore what a Herdr pane shows, is a rendering of it: assistant text as it streams, thoughts dimmed, one line per tool call (`\u25b8` started, `\u2713` completed, `\u2717` failed), `plan: done/total steps`, and short rules for prompt start, `end_turn`, cancellation and errors. Adapter bookkeeping (usage, commands, session info) is suppressed and non-JSON lines pass through prefixed with `|`. Nothing in the rendering is a success signal.
+
+The live views read that terminal, not the capture file. `/graph watch`, `op=watch` and the agent list run `herdr pane read <pane_id> --source recent` for each running worker, so what an operator sees is the worker's own output and deleting the capture file changes nothing. A worker whose transport has no terminal reports that plainly instead of falling back to a file. `/graph watch --follow` is the navigable form: the summary stays on screen above the editor, a number plus Enter opens a worker's details, and it closes on `q`. `/graph focus` is the only command that brings a Herdr tab forward.
+
+A headless worker has no pane, so its supervisor publishes the same output live on a loopback endpoint instead: a `127.0.0.1` listener on an ephemeral port, admitting only a connection that presents the per-attempt bearer token written mode 600 beside the run's other private files. A subscriber receives a bounded window of what was already emitted - the most recent output, capped in number of pieces and in total size, so a late subscriber is shown where the worker is and the channel's memory cannot grow with the worker - and then the live output as the worker writes it, whether or not it has ended a line. The channel retains nothing: the listener, the token, and the endpoint descriptor are all gone once the supervisor exits. The bind is probed before dispatch, so an unavailable loopback is the named blocker `live worker stream unavailable: cannot bind a loopback listener on 127.0.0.1 (<code>)` rather than a worker that starts and cannot be watched.
+
+The loopback backend is chosen because it behaves identically on macOS, Linux and Windows, but **Windows remains unsupported**, for three reasons this channel does not address: `scripts/headless_supervisor.py` requires the private PTY executable `script`, which Windows does not provide; `scripts/doctor.mjs` fails on any platform other than `darwin` or `linux`; and AgentFS v0.6.4, a hard requirement, needs FUSE and Linux mount namespaces. These are recorded gates, not solved problems.
 
 ### Denials and empty turns
 

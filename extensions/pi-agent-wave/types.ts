@@ -190,3 +190,74 @@ export interface EventRow {
 	verdict: string | null;
 	payload_json: string;
 }
+
+export const LEDGER_OUTCOMES = ["accepted", "blocked", "failed"] as const;
+export type LedgerOutcome = (typeof LEDGER_OUTCOMES)[number];
+
+/**
+ * A claim's evidence state, stored as a state rather than written as prose. `unverified` and
+ * `unverified-recall` are the byte-exact markers the supervisor rules require, so a claim that rests
+ * on memory or inference cannot be reported as though it had been checked.
+ */
+export const LEDGER_CLAIM_STATUSES = ["verified", "unverified", "unverified-recall"] as const;
+export type LedgerClaimStatus = (typeof LEDGER_CLAIM_STATUSES)[number];
+
+export interface LedgerClaimRow {
+	position: number;
+	claim: string;
+	evidence: string;
+	status: LedgerClaimStatus;
+}
+
+/**
+ * `percentage` is stored as the caller supplied it, not derived: an audit that recomputes it is only
+ * meaningful if a recorded figure can disagree with its own components.
+ */
+export interface LedgerAggregateRow {
+	position: number;
+	name: string;
+	numerator: number;
+	denominator: number;
+	percentage: number;
+}
+
+export interface LedgerEntryRow {
+	id: string;
+	story: string;
+	sequence: number;
+	topic: string;
+	runId: string;
+	tier: string;
+	model: string;
+	outcome: LedgerOutcome;
+	dispatchedAt: string;
+	task: string;
+	claims: LedgerClaimRow[];
+	aggregates: LedgerAggregateRow[];
+}
+
+export interface LedgerFinding {
+	entry: string;
+	code: "LEDGER_EMPTY" | "SEQUENCE_GAP" | "AGGREGATE_INVALID" | "AGGREGATE_MISMATCH";
+	message: string;
+}
+
+export interface StoryLedgerAudit {
+	story: string;
+	entries: number;
+	valid: boolean;
+	findings: LedgerFinding[];
+}
+
+export interface LedgerEntryInput {
+	story: string;
+	topic: string;
+	runId: string;
+	tier: string;
+	model: string;
+	outcome: LedgerOutcome;
+	task: string;
+	dispatchedAt?: string;
+	claims?: readonly { claim: string; evidence: string; status: LedgerClaimStatus }[];
+	aggregates?: readonly { name: string; numerator: number; denominator: number; percentage: number }[];
+}

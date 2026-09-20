@@ -149,7 +149,52 @@ print(json.dumps({'hasExportConfig': 'export_config' in resource, 'snapshot': re
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
 
-	test("an incomplete capture retains the prompt worker's own stream, and a clean settlement retains nothing", () => {
+	test("a clean settlement that retains no candidate still writes a failure bundle, so the bounded tail is never the only artifact", () => {
+		const root = mkdtempSync(join(tmpdir(), "runtime-py-no-candidate-"));
+		try {
+			const result = python(prelude + `
+os.environ['DELEGATE_GRAPH_DB'] = str(root / 'graph.db')
+args = core.build_parser().parse_args(['start', str(private), 'searcher', '--node', 'search', '--model', model, '--access-mode', 'read-only'])
+resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'candidate-less-fixture'}, 'fixture-worker', model, task, 'search')
+resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher', 'node': 'search', 'operation_id': 'op-candidate-less', 'tab': None, 'pane': None, 'worker_pid': None})
+attempt = Path(resource['attempt_dir'])
+output_dir = attempt / 'runtime-output'; output_dir.mkdir(mode=0o700)
+(output_dir / 'public-answer.txt').write_text(''); (output_dir / 'public-answer.txt').chmod(0o600)
+(attempt / 'worker.stderr.txt').write_text('acpx: the reply arrived outside the prompt turn\\n'); (attempt / 'worker.stderr.txt').chmod(0o600)
+# The shape the 2026-09-12 operations smoke 3 lost: the worker exited cleanly and captured no answer at all.
+worker_result = {'schemaVersion': 2, 'resultContract': 'runtime-v1', 'agent': 'codex', 'selectedModel': model, 'sessionName': resource['acpx_session'], 'attemptKey': resource['acpx_attempt_key'], 'outputDir': str(output_dir),
+  'output': {'schemaVersion': 1, 'attemptKey': resource['acpx_attempt_key'], 'sessionId': resource['acpx_session'], 'outcome': {'kind': 'exited', 'exitCode': 0},
+             'capture': {'requestId': '3', 'sessionId': 'acp-created', 'sessionOrigin': 'created', 'captureStatus': 'empty', 'responseCompleteness': 'unverified', 'inputBytes': 1, 'answerBytes': 0, 'publicChunks': 0, 'ignoredEvents': 2, 'peakBufferedBytes': 0, 'diagnostics': []}, 'stderrTruncated': False}}
+Path(resource['worker_result']).write_text(json.dumps(worker_result))
+core.observe_presentation_identity = lambda r: {'presentationVerified': True, 'identityMatches': True, 'transport': 'headless', 'herdrVisible': False}
+core.close_acpx_attempt = lambda r: {'closed': True, 'noSession': True}
+core.verify_provider_links = lambda *a, **k: True
+core.abort_acpx_attempt = lambda r, **k: []
+core.verify_cleanup_absence = lambda run_dir, r, **k: (run_dir / 'cleanup-fixture-worker.json')
+audit = core.settle_runtime_attempt(private, resource)
+evidence = json.loads(Path(audit['settlementEvidencePath']).read_text())
+bundle_path = Path(audit['diagnosticsPath']) if audit['diagnosticsPath'] else None
+bundle = json.loads(bundle_path.read_text()) if bundle_path else None
+print(json.dumps({'candidate': evidence['candidate'], 'diagnosticsPath': audit['diagnosticsPath'],
+  'bundleName': bundle_path.name if bundle_path else None, 'inRunDir': bool(bundle_path) and bundle_path.parent == private,
+  'mode': oct(bundle_path.stat().st_mode & 0o777) if bundle_path else None,
+  'reason': bundle['reason'] if bundle else None, 'operationId': bundle['operationId'] if bundle else None,
+  'stderrTail': bundle['stderrTail'] if bundle else None, 'failures': audit['postSettlementFailures']}))
+`, root);
+			assert.equal(result.status, 0, result.stderr);
+			const out = JSON.parse(result.stdout);
+			assert.equal(out.candidate, null, "the fixture settles with no candidate");
+			assert.deepEqual(out.failures, [], "the settlement itself is clean; only the candidate is missing");
+			assert.ok(out.diagnosticsPath, "a candidate-less settlement must retain a failure bundle");
+			assert.equal(out.bundleName, "failure-op-candidate-less.json", "the bundle is named for the operation");
+			assert.equal(out.inRunDir, true);
+			assert.equal(out.mode, "0o600");
+			assert.match(String(out.reason), /settled without a candidate/);
+			assert.match(String(out.stderrTail), /outside the prompt turn/, "the bundle carries what the bounded tail cannot: the worker's stderr");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	test("an incomplete capture retains a bounded tail of the worker's stream, and a clean settlement retains nothing", () => {
 		const root = mkdtempSync(join(tmpdir(), "runtime-py-capture-"));
 		try {
 			const result = python(prelude + `
@@ -161,7 +206,9 @@ attempt = Path(resource['attempt_dir'])
 # The prompt-mode worker writes its stream where RuntimeOutputFiles puts it, beside the result file.
 output_dir = Path(resource['worker_result']).parent / 'runtime-output'; output_dir.mkdir(mode=0o700, exist_ok=True)
 stream = output_dir / 'worker.stdout.ndjson'
-stream.write_text('{"method":"session/update"}\\n'); stream.chmod(0o600)
+# Far more events than the diagnostic window keeps, so a wholesale copy is distinguishable from a tail.
+event_total = core.FAILURE_DIAGNOSTIC_EVENT_LIMIT * 5
+stream.write_text(''.join(json.dumps({'method': 'session/update', 'seq': index}) + '\\n' for index in range(event_total))); stream.chmod(0o600)
 evidence_path = private / 'runtime-settlement-fixture-worker.json'
 
 def write_evidence(status, candidate):
@@ -172,9 +219,16 @@ retained = core.retain_incomplete_capture(private, resource, evidence_path)
 write_evidence('complete', {'kind': 'research'})
 clean_target = private / 'runtime-capture-fixture-worker-clean.ndjson'
 clean = core.retain_incomplete_capture(private, resource, evidence_path)
+retained_lines = Path(retained).read_text().splitlines() if retained else []
 print(json.dumps({
   'retained': str(retained) if retained else None,
-  'contents': Path(retained).read_text() if retained else None,
+  'lines': len(retained_lines),
+  'limit': core.FAILURE_DIAGNOSTIC_EVENT_LIMIT,
+  'sourceLines': event_total,
+  'retainedBytes': Path(retained).stat().st_size if retained else None,
+  'sourceBytes': stream.stat().st_size,
+  'first': retained_lines[0] if retained_lines else None,
+  'last': retained_lines[-1] if retained_lines else None,
   'mode': oct(Path(retained).stat().st_mode & 0o777) if retained else None,
   'inRunDir': bool(retained) and Path(retained).parent == private,
   'cleanRetained': str(clean) if clean else None,
@@ -186,9 +240,77 @@ print(json.dumps({
 			assert.ok(out.retained, "an incomplete capture with no candidate must retain the worker stream");
 			assert.match(String(out.retained), /runtime-capture-fixture-worker\.ndjson$/);
 			assert.equal(out.inRunDir, true);
-			assert.equal(out.contents, '{"method":"session/update"}\n');
 			assert.equal(out.mode, "0o600");
+			// The bound is the failure bundle's own event window, and the tail is the end of the stream,
+			// which is where the evidence for an incomplete capture is.
+			assert.equal(out.lines, out.limit, "the retained capture is bounded by the diagnostic event window");
+			assert.ok(out.retainedBytes < out.sourceBytes, `a bounded tail is smaller than the stream: ${out.retainedBytes} of ${out.sourceBytes}`);
+			assert.equal(JSON.parse(String(out.last)).seq, out.sourceLines - 1, "the tail ends at the stream's final event");
+			assert.equal(JSON.parse(String(out.first)).seq, out.sourceLines - out.limit, "the tail starts one window back, not at the stream's head");
 			assert.equal(out.cleanRetained, null, "a complete capture carrying a candidate retains nothing");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	test("a settled Herdr worker's tab is closed before the absence audit, and a close that fails is still reported", () => {
+		const root = mkdtempSync(join(tmpdir(), "runtime-py-herdr-settle-"));
+		try {
+			const result = python(prelude + `
+core.ACTIVE_TRANSPORT = 'herdr'
+os.environ['HERDR_WORKSPACE_ID'] = 'workspace-fixture'
+os.environ['HERDR_TAB_ID'] = 'caller-tab-fixture'
+# The shipped run() helper stays in place: the Herdr CLI is an executable on PATH here, so a failing
+# close reaches it as a genuine non-zero exit instead of being simulated inside this process.
+herdr_shim = Path(sys.argv[1]).parent / 'test' / 'support' / 'herdr-shim'
+os.environ['PATH'] = str(herdr_shim) + os.pathsep + os.environ['PATH']
+model = 'openai-codex/gpt-5.6-sol'
+
+def case(name, close_fails):
+    base = root / f'base-{name}'; base.mkdir()
+    private = root / f'private-{name}'; private.mkdir(mode=0o700)
+    task = private / 'task.md'; task.write_text('Fixture task; no model is dispatched.'); task.chmod(0o600)
+    os.environ['DELEGATE_GRAPH_DB'] = str(root / f'graph-{name}.db')
+    os.chdir(base)
+    args = core.build_parser().parse_args(['start', str(private), 'searcher', '--node', 'search', '--model', model, '--access-mode', 'read-only'])
+    resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'settled-tab-fixture'}, 'fixture-worker', model, task, 'search')
+    resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher', 'node': 'search', 'tab': 'tab-fixture', 'pane': 'pane-fixture', 'worker_pid': None, 'execution': 'acpx-agentfs'})
+    core.write_state(private, {'caller_tab': 'caller-tab-fixture', 'transport': 'herdr', 'closed_tabs': [], 'resources': [resource], 'run_label': 'settled-tab-fixture'})
+    attempt = Path(resource['attempt_dir'])
+    output_dir = attempt / 'runtime-output'; output_dir.mkdir(mode=0o700)
+    answer = output_dir / 'public-answer.txt'; answer.write_text('Retained answer text'); answer.chmod(0o600)
+    worker_result = {'schemaVersion': 2, 'resultContract': 'runtime-v1', 'agent': 'codex', 'selectedModel': model, 'sessionName': resource['acpx_session'], 'attemptKey': resource['acpx_attempt_key'], 'outputDir': str(output_dir),
+      'output': {'schemaVersion': 1, 'attemptKey': resource['acpx_attempt_key'], 'sessionId': resource['acpx_session'], 'outcome': {'kind': 'exited', 'exitCode': 0},
+                 'capture': {'requestId': '3', 'sessionId': 'acp-created', 'sessionOrigin': 'created', 'captureStatus': 'complete', 'responseCompleteness': 'unverified', 'inputBytes': 1, 'answerBytes': 20, 'publicChunks': 1, 'ignoredEvents': 0, 'peakBufferedBytes': 1, 'diagnostics': []}, 'stderrTruncated': False}}
+    Path(resource['worker_result']).write_text(json.dumps(worker_result))
+    herdr_state = root / f'herdr-{name}.json'
+    herdr_state.write_text(json.dumps({'tab_id': 'tab-fixture', 'tab_open': True, 'close_fails': close_fails, 'calls': []}))
+    os.environ['FAKE_HERDR_STATE'] = str(herdr_state)
+    core.observe_presentation_identity = lambda r: {'presentationVerified': True, 'identityMatches': True, 'transport': 'herdr', 'herdrVisible': True}
+    core.close_acpx_attempt = lambda r: {'closed': True, 'noSession': True}
+    core.release_agentfs_session = lambda r: []
+    core.abort_acpx_attempt = lambda r, **k: []
+    audit = core.settle_runtime_attempt(private, resource)
+    herdr = json.loads(herdr_state.read_text())
+    evidence = audit.get('cleanupEvidencePath')
+    return {'failures': audit['postSettlementFailures'], 'cleanupEvidence': evidence, 'cleanupEvidenceExists': bool(evidence) and Path(evidence).exists(),
+            'herdrCalls': herdr['calls'], 'tabStillOpen': herdr['tab_open'], 'valid': audit['valid'],
+            'closedTabs': core.read_state(private).get('closed_tabs'), 'attemptDirRemained': attempt.exists()}
+
+print(json.dumps({'settled': case('settled', False), 'closeFails': case('close-fails', True)}))
+`, root);
+			assert.equal(result.status, 0, result.stderr);
+			const out = JSON.parse(result.stdout);
+			const settled = out.settled;
+			assert.deepEqual(settled.herdrCalls, [["tab", "close", "tab-fixture"], ["tab", "list", "--workspace", "workspace-fixture"], ["pane", "get", "pane-fixture"], ["agent", "get", "fixture-worker"]], `the tab must be closed before the audit enumerates the workspace: ${JSON.stringify(settled.herdrCalls)}`);
+			assert.equal(settled.tabStillOpen, false, "a happily settled worker must not leave its tab open");
+			assert.deepEqual(settled.failures, [], "and it must report no post-settlement failure");
+			assert.equal(settled.cleanupEvidenceExists, true, "the absence audit must pass and write its evidence");
+			assert.deepEqual(settled.closedTabs, ["tab-fixture"], "the close is recorded in run state, so a repeated close is a no-op");
+			assert.equal(settled.attemptDirRemained, false);
+			const closeFails = out.closeFails;
+			assert.match(String(closeFails.failures.join("\n")), /tab is busy/, `a close that fails must be reported: ${JSON.stringify(closeFails)}`);
+			assert.match(String(closeFails.failures.join("\n")), /tabAbsent/, "and the audit that follows must still name the tab it could not verify absent");
+			assert.equal(closeFails.cleanupEvidence, null, "no absence evidence may be written while the tab survives");
+			assert.equal(closeFails.tabStillOpen, true, "the fixture's failing close must not be mistaken for a closed tab");
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
 });

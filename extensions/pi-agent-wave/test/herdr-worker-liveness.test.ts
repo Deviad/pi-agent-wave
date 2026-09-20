@@ -1,6 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("../scripts/herdr_delegate.py", import.meta.url));
@@ -120,5 +121,31 @@ core['wait_for_worker_exit'] = lambda resource: None
 		const observed = probe(body, "herdr");
 		assert.equal(observed.error, null, "a worker whose pane still has an agent must not be torn down");
 		assert.ok((observed.calls as string[][]).every((argv) => argv[3] === "wZ:p9"), `probe must query the pane, got ${JSON.stringify(observed.calls)}`);
+	});
+
+	test("the worker publishes its result atomically, so a poll can never read a half-written file", () => {
+		// The observed intermittent failure was `invalid ACPX worker result: Expecting value: line 1
+		// column 1 (char 0)`: the waiter polls for the path and parses it, and the worker used to create
+		// the file and write it afterwards, so the poll could catch it empty. The rename closes that window.
+		const worker = readFileSync(fileURLToPath(new URL("../scripts/acpx-worker.ts", import.meta.url)), "utf8");
+		assert.match(worker, /renameSync\(pending, config\.resultPath\)/, "the runtime result is published by rename");
+		assert.equal(/openSync\(config\.resultPath, "wx"/.test(worker), false, "the result path is never created before it is written");
+
+		// And the waiter, driven for real: a writer that publishes by rename is never seen half-written.
+		const body = String.raw`
+def fake_run(argv, check=True, **_kwargs):
+    calls.append(argv)
+    return Result(0, json.dumps({'result': {'agent': {'agent': 'worker', 'agent_status': 'working', 'pane_id': 'wZ:p9'}}}))
+def finish():
+    target = attempt_dir / 'worker-result.json'
+    pending = attempt_dir / 'worker-result.json.tmp'
+    # Exactly the worker's sequence: content first, into a sibling, then one rename.
+    pending.write_text(json.dumps({'schemaVersion': 2, 'resultContract': 'runtime-v1'}))
+    pending.rename(target)
+threading.Timer(0.8, finish).start()
+core['wait_for_worker_exit'] = lambda resource: None
+`;
+		const observed = probe(body, "herdr");
+		assert.equal(observed.error, null, "the published result parses on the first poll that sees it");
 	});
 });

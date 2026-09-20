@@ -251,9 +251,13 @@ export function auditAgentFsChanges(dbPath: string, baseDir: string, ownedPaths:
 	const ignored: AgentFsChange[] = [];
 	const violations: AgentFsChange[] = [];
 	const under = (change: AgentFsChange, paths: readonly string[]): boolean => paths.some((path) => path === "" || change.path === path || change.path.startsWith(`${path}/`));
+	// A directory a worker creates to hold an owned file is a container rather than a change of its own;
+	// without this an implement slice that adds a new module directory is refused as unowned. It grants
+	// no ownership to the container's other children, which stay violations unless declared.
+	const containerOf = (change: AgentFsChange, paths: readonly string[]): boolean => change.kind === "directory" && paths.some((path) => path === "" || path.startsWith(`${change.path}/`));
 	for (const change of inventory.changes) {
-		if (under(change, allowed)) owned.push(change);
-		else if (under(change, ignoredAllowed)) ignored.push(change);
+		if (under(change, allowed) || containerOf(change, allowed)) owned.push(change);
+		else if (under(change, ignoredAllowed) || containerOf(change, ignoredAllowed)) ignored.push(change);
 		// Finder/Spotlight metadata is discarded rather than exported or refused, but only outside ownership.
 		else if (platformMetadata(change.path)) ignored.push(change);
 		else violations.push(change);

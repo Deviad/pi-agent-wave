@@ -58,15 +58,18 @@ describe("ACPX spike preflight", () => {
 	test("checks the current environment without substituting a fixture for ACPX", () => {
 		const home = mkdtempSync(join(tmpdir(), "acpx-spike-real-home-"));
 		directories.push(home);
+		// PATH and the resolved acpx stay the real ones; only the Herdr identity is named, because it is a
+		// precondition input to the preflight rather than the artifact under test.
+		const identity = { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace:test", HERDR_TAB_ID: "tab:test" };
 		const acpx = resolveExecutable("acpx", process.env.PATH ?? "");
 		if (!acpx) {
 			assert.throws(
-				() => collectAcpxPreflight({ path: process.env.PATH ?? "", home, env: process.env, agentCommand: "codex" }),
+				() => collectAcpxPreflight({ path: process.env.PATH ?? "", home, env: { ...process.env, ...identity }, agentCommand: "codex" }),
 				(error: unknown) => error instanceof AcpxPreflightError && error.blockers.includes("missing executable: acpx"),
 			);
 			return;
 		}
-		const baseline = collectAcpxPreflight({ path: process.env.PATH ?? "", home, env: process.env, agentCommand: "codex" });
+		const baseline = collectAcpxPreflight({ path: process.env.PATH ?? "", home, env: { ...process.env, ...identity }, agentCommand: "codex" });
 		assert.equal(baseline.dependencies.acpx.path, acpx);
 	});
 });

@@ -6,9 +6,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "delegate_core.py"
@@ -16,6 +18,17 @@ spec = importlib.util.spec_from_file_location("herdr_delegate", MODULE_PATH)
 assert spec and spec.loader
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+def use_transport(name: str) -> None:
+    """Declare the transport a case exercises.
+
+    The module default is ``herdr``, which any importer inherits, so a case that never selects a
+    transport runs in Herdr mode and reads a workspace identity it was never given. Cases that
+    assert file and process closure are transport-neutral and say so; the Herdr release cases keep
+    the default because they really do exercise Herdr.
+    """
+    module.ACTIVE_TRANSPORT = name
 
 
 def resource(root: Path) -> dict[str, object]:
@@ -412,6 +425,7 @@ def default_cancel_case() -> dict[str, object]:
 
 
 def persistence_case() -> dict[str, object]:
+    use_transport("headless")
     root = Path(tempfile.mkdtemp(prefix="acpx-cleanup-persist-"))
     owned = resource(root)
     shutil.rmtree(Path(str(owned["attempt_dir"])))
@@ -425,6 +439,97 @@ def persistence_case() -> dict[str, object]:
         return {"case": "cleanup-evidence", "failed": False}
     finally:
         module.run = original_run
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def mount_leak_case() -> dict[str, object]:
+    """A killed worker leaves its AgentFS mount behind, and the release step must remove it.
+
+    A clean ``agentfs run`` exit unmounts itself, so the leak only appears when the worker is killed.
+    The case starts a real session, waits for its real mount to appear, kills the process group so
+    nothing can unmount on the way out, and then requires the release step to remove what is left.
+    """
+    root = Path(tempfile.mkdtemp(prefix="acpx-mount-leak-"))
+    owned = resource(root)
+    home = Path(str(owned["agentfs_home"]))
+    home.mkdir(parents=True, mode=0o700)
+    base = root / "base"
+    base.mkdir()
+    session = f"dg-mount-{uuid.uuid4().hex[:10]}"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
+    env["HOME"] = str(home)
+    env["AGENTFS_HOME"] = str(home)
+    try:
+        proc = subprocess.Popen(
+            ["agentfs", "run", "--session", session, "--no-default-allows", "--allow", str(root), "/bin/sh", "-c", "sleep 600"],
+            cwd=str(base), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError as error:
+        shutil.rmtree(root, ignore_errors=True)
+        return {"case": "mount-leak", "skipped": True, "reason": f"agentfs unavailable: {error}"}
+    try:
+        mounted: list[str] = []
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            mounted = module.agentfs_mount_points(owned)
+            if mounted:
+                break
+            if proc.poll() is not None:
+                return {"case": "mount-leak", "skipped": True, "reason": "agentfs run exited before mounting"}
+            time.sleep(0.5)
+        if not mounted:
+            return {"case": "mount-leak", "skipped": True, "reason": "agentfs never mounted the session"}
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        proc.wait(timeout=30)
+        time.sleep(1)
+        leaked = module.agentfs_mount_points(owned)
+        # What the audit says while the mount is still there: the field must not read absent yet.
+        mounts_before = module.run(["mount"], check=False).stdout
+        absent_before = module.cleanup_absence_inventory(owned, "", False, False, "", mounts_before)["agentFsMountAbsent"]
+        failures = module.release_agentfs_session(owned)
+        mounts_after = module.run(["mount"], check=False).stdout
+        return {
+            "case": "mount-leak",
+            "mountSeen": len(mounted),
+            "leakedAfterKill": len(leaked),
+            "failures": failures,
+            "remaining": module.agentfs_mount_points(owned),
+            "agentFsMountAbsentBeforeRelease": absent_before,
+            "agentFsMountAbsentAfterRelease": module.cleanup_absence_inventory(owned, "", False, False, "", mounts_after)["agentFsMountAbsent"],
+        }
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        # An unmounted mount outlives its directory, so release on the failure path too: otherwise a
+        # failing assertion leaks exactly the hazard this case exists to catch.
+        module.release_agentfs_session(owned)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def herdr_unverifiable_case() -> dict[str, object]:
+    """A Herdr absence audit with no workspace identity must fail closed by name.
+
+    Reading HERDR_WORKSPACE_ID directly raised KeyError, and there is no safe fallback: the workspace
+    is what proves the tab is gone, so silence would report an absent tab nobody verified.
+    """
+    root = Path(tempfile.mkdtemp(prefix="acpx-herdr-unverifiable-"))
+    owned = resource(root)
+    shutil.rmtree(Path(str(owned["attempt_dir"])), ignore_errors=True)
+    use_transport("herdr")
+    saved = os.environ.pop("HERDR_WORKSPACE_ID", None)
+    try:
+        try:
+            module.verify_cleanup_absence(root, owned, evidence_writer=lambda path, text: path.write_text(text))
+        except module.DelegateError as error:
+            return {"case": "herdr-unverifiable", "failed": True, "error": str(error)}
+        return {"case": "herdr-unverifiable", "failed": False, "error": None}
+    finally:
+        use_transport("herdr")
+        if saved is not None:
+            os.environ["HERDR_WORKSPACE_ID"] = saved
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -487,6 +592,7 @@ def closure_case(case: str) -> dict[str, object]:
     removes everything and records a verified close, so the audit passes and says which observation
     proved closure.
     """
+    use_transport("headless")
     root = Path(tempfile.mkdtemp(prefix="acpx-closure-"))
     owned = resource(root)
     run_dir = root / "run"
@@ -527,6 +633,8 @@ elif mode == "live": result = live_process_case()
 elif mode == "closure": result = closure_case(case)
 elif mode == "default-cancel": result = default_cancel_case()
 elif mode == "persistence": result = persistence_case()
+elif mode == "mount-leak": result = mount_leak_case()
+elif mode == "herdr-unverifiable": result = herdr_unverifiable_case()
 elif mode == "inventory": result = inventory_case(case)
 else: raise ValueError(mode)
 print(json.dumps(result, sort_keys=True))

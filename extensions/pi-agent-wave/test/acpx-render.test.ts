@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AcpxRenderer, summarizeAcpxStream } from "../lib/acpx-render.ts";
+import { AcpxRenderer } from "../lib/acpx-render.ts";
 
 const update = (update: Record<string, unknown>) => JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update } });
 const STREAM = [
@@ -38,15 +38,4 @@ test("the renderer shows content and never the transport envelope", () => {
 	assert.equal(silent.includes("Let me look"), false);
 	const colored = (() => { let text = ""; const r = new AcpxRenderer((piece) => { text += piece; }, { color: true }); r.push(STREAM); r.end(); return text; })();
 	assert.match(colored, /\u001b\[2mLet me look at the cache\.\u001b\[0m/);
-});
-
-test("the stream summary reports the last activity and counts without deciding anything", () => {
-	const summary = summarizeAcpxStream(STREAM, 3);
-	assert.equal(summary.lastActivity, "\u2500\u2500 end_turn \u2500\u2500");
-	assert.deepEqual(summary.recent.length, 3);
-	assert.deepEqual([summary.prompts, summary.toolCalls], [1, 2]);
-	assert.equal(summary.textBytes, Buffer.byteLength("The cache lives in src/cache.ts.\n\nVERDICT: DONE"));
-	assert.deepEqual(summarizeAcpxStream(""), { lastActivity: null, recent: [], prompts: 0, toolCalls: 0, textBytes: 0 });
-	const partial = summarizeAcpxStream(STREAM.split("\n").slice(0, 7).join("\n"));
-	assert.equal(partial.lastActivity, "The cache lives in", "a streamed chunk is summarized with trailing space trimmed");
 });

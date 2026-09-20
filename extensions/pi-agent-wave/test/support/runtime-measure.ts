@@ -32,6 +32,12 @@ const graph = option("--graph", "research") as "research" | "build" | "operation
 if (graph !== "research" && graph !== "build" && graph !== "operations") throw new Error("--graph must be research, build or operations");
 const model = option("--model", "alibaba/qwen3.8-flash");
 const repeats = Number.parseInt(option("--repeats", "1"), 10);
+/**
+ * The dispatch transport. Herdr is the visible adapter: it creates a real tab and pane per worker, which is
+ * what makes that run the proof that the live view reads a worker's own terminal rather than a stream file.
+ */
+const transport = option("--transport", "headless");
+if (transport !== "headless" && transport !== "herdr") throw new Error("--transport must be headless or herdr");
 const contracts = ["runtime-v1"] as const;
 const evidenceDir = resolve(option("--evidence-dir", join(REPO, "agent-output", `runtime-measure-${new Date().toISOString().slice(0, 10)}`)));
 const runTimeoutMs = Number.parseInt(option("--run-timeout-ms", String((graph === "build" ? 40 : 20) * 60_000)), 10);
@@ -43,6 +49,13 @@ if (!Number.isInteger(repeats) || repeats < 1) throw new Error("--repeats must b
  * provider turn is spent on it, so a root that can be reclaimed mid-run is refused before any worker starts.
  */
 const runRootBase = resolve(option("--run-root", SCRATCH_ROOT));
+/**
+ * Keep the run root after the run. A live run spends an authorized provider turn, and the store now retains
+ * settlement evidence, cleanup evidence and any capture stream under `<run root>/evidence/<runId>/` while
+ * removing the per-operation directories; deleting the root discards exactly the artifacts an operator needs
+ * to inspect afterwards, so an evidence-producing run asks for this flag.
+ */
+const keepRunRoot = flag("--keep-run-root");
 function assertUsableRunRoot(base: string): void {
 	let stat; try { stat = statSync(base); } catch { throw new Error(`run root ${base} does not exist; refusing to start a live run whose state would have nowhere durable to live`); }
 	if (!stat.isDirectory()) throw new Error(`run root ${base} is not a directory; refusing to start`);
@@ -70,7 +83,7 @@ const PLAN_NODE = graph === "build" ? "thinker_plan" : graph === "operations" ? 
 const VERDICT_NODES: Record<string, readonly string[]> = { review: ["PASS", "FAIL"], test: ["GREEN", "NOT_OK"], audit: ["PASS", "FAIL"], source_search: ["DONE", "BLOCKED"] };
 const FIXED_VERDICTS: Record<string, string> = { thinker_plan: "READY", thinker_split: "READY", implement: "DONE", search: "DONE", thinker_synthesize: "DONE" };
 const plan = {
-	mode, model, adapter, contracts, repeats, graph, task: TASK, slices: SLICE_IDS, workerTurnsPerRun: graph === "build" ? 1 + SLICE_IDS.length + 3 : graph === "operations" ? SLICE_IDS.length + 2 : 1 + SLICE_IDS.length + 1,
+	mode, model, adapter, transport, contracts, repeats, graph, task: TASK, slices: SLICE_IDS, workerTurnsPerRun: graph === "build" ? 1 + SLICE_IDS.length + 3 : graph === "operations" ? SLICE_IDS.length + 2 : 1 + SLICE_IDS.length + 1,
 	runTimeoutMs, evidenceDir, runRoot: runRootBase, spend: "provider-priced; no dollar estimate; usage is not reported by the worker path", activation: "runs in a temporary DELEGATE_GRAPH_DB; the real Pi installation is not modified",
 	acceptance: "runtime-v1 candidates are accepted automatically by the driver; this is not independent review",
 	verdicts: "review, test and audit verdicts are read from the final VERDICT: line of the worker's answer; a FAIL or NOT_OK follows the graph edge back to implementation",
@@ -100,10 +113,10 @@ const now = () => performance.now();
 interface Timed { readonly kind: string; readonly operationId: string | null; readonly node: string | null; readonly ms: number; readonly detail: Record<string, unknown> }
 interface RunRecord {
 	contract: string; repeat: number; runId: string | null; runRoot: string | null; startedAt: string; finishedAt: string | null; totalMs: number | null; finalStatus: string | null; terminal: boolean;
-	dispatches: number; collects: number; completions: number; retries: number; modelFallbacks: number; parked: boolean; failures: string[]; phases: Timed[]; operations: Record<string, unknown>[];
+	dispatches: number; collects: number; completions: number; retries: number; modelFallbacks: number; parked: boolean; failures: string[]; postSettlementFailures: string[]; phases: Timed[]; operations: Record<string, unknown>[];
 	privateRunDirs: string[]; progress: { kind: string; at: number; details: Record<string, unknown> }[]; ledgerPath: string | null; error: string | null;
 	verdicts: { operationId: string; node: string; verdict: string | null; source: string; answerExcerpt: string | null }[]; integrations: { operationId: string; state: string; changes: number }[];
-	watchSamples: { at: number; agents: { agentName: string | null; node: string; processState: string | null; toolCalls: number; lastActivity: string | null }[] }[];
+	watchSamples: { at: number; agents: { agentName: string | null; node: string; processState: string | null; paneId: string | null; lastActivity: string | null }[]; panes?: { paneId: string; paneLastLine: string | null; agrees: boolean }[] }[];
 	workspace: { status: string; diff: string } | null;
 }
 
@@ -156,7 +169,10 @@ function exec(command: string, argv: string[], options?: { cwd?: string }): Prom
 
 async function loadTool(dbPath: string): Promise<{ execute: (params: Record<string, unknown>, onUpdate: (update: unknown) => void, ctx: unknown) => Promise<unknown> }> {
 	process.env.DELEGATE_GRAPH_DB = dbPath;
-	delete process.env.HERDR_ENV; delete process.env.HERDR_WORKSPACE_ID; delete process.env.HERDR_TAB_ID;
+	// Headless stays the default whatever the ambient environment says, so an ordinary run cannot borrow a
+	// Herdr workspace by accident. A run that explicitly asks for the visible adapter keeps the identity it
+	// was given, which is what makes `--transport herdr` a real tab-and-pane run.
+	if (transport === "headless") { delete process.env.HERDR_ENV; delete process.env.HERDR_WORKSPACE_ID; delete process.env.HERDR_TAB_ID; }
 	const { default: extension } = await import(`../../index.ts?measure=${Date.now()}-${Math.random()}`);
 	let tool: { execute: (id: string, params: Record<string, unknown>, signal: unknown, onUpdate: (update: unknown) => void, ctx: unknown) => Promise<unknown> } | undefined;
 	// The extension subscribes to session_shutdown to close its interactive views; the driver has no session, so the
@@ -178,7 +194,7 @@ function parsed(result: unknown): Record<string, any> {
 }
 
 async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRecord> {
-	const record: RunRecord = { contract, repeat, runId: null, runRoot: null, startedAt: new Date().toISOString(), finishedAt: null, totalMs: null, finalStatus: null, terminal: false, dispatches: 0, collects: 0, completions: 0, retries: 0, modelFallbacks: 0, parked: false, failures: [], phases: [], operations: [], privateRunDirs: [], progress: [], ledgerPath: null, error: null, verdicts: [], integrations: [], workspace: null, watchSamples: [] };
+	const record: RunRecord = { contract, repeat, runId: null, runRoot: null, startedAt: new Date().toISOString(), finishedAt: null, totalMs: null, finalStatus: null, terminal: false, dispatches: 0, collects: 0, completions: 0, retries: 0, modelFallbacks: 0, parked: false, failures: [], postSettlementFailures: [], phases: [], operations: [], privateRunDirs: [], progress: [], ledgerPath: null, error: null, verdicts: [], integrations: [], workspace: null, watchSamples: [] };
 	const root = runRootBase === SCRATCH_ROOT ? makeScratchDir(`pi-wave-measure-${contract}-`) : mkdtempSync(join(runRootBase, `pi-wave-measure-${contract}-`));
 	record.runRoot = root;
 	const repo = join(root, "repo"); mkdirSync(repo); if (graph === "operations") operationsCorpus(repo); else corpus(repo);
@@ -212,18 +228,30 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 			if (!pending.length && !running.length) throw new Error("active run with nothing pending or running");
 			for (const operation of pending) {
 				if (operation.retry_not_before) { const wait = Date.parse(operation.retry_not_before) - Date.now(); if (wait > 0) { record.phases.push({ kind: "backoff", operationId: operation.id, node: operation.node, ms: wait, detail: {} }); await sleep(wait); } }
-				const dispatched = await timed("dispatch", operation.id, operation.node, () => tool.execute({ op: "dispatch", runId, operationId: operation.id, transport: "headless" }, progress, ctx).then(parsed));
+				const dispatched = await timed("dispatch", operation.id, operation.node, () => tool.execute({ op: "dispatch", runId, operationId: operation.id, transport }, progress, ctx).then(parsed));
 				if (dispatched.error) throw new Error(`dispatch failed: ${dispatched.error}`);
 				record.dispatches += 1;
 				if (dispatched.dispatched === false) { record.failures.push(`preflight: ${dispatched.reason}`); if (dispatched.retry) record.retries += 1; continue; }
 				if (dispatched.launch && typeof dispatched.launch["acpx-cancel-script"] === "string") { const dir = resolve(dispatched.launch["acpx-cancel-script"], "..", "..", ".."); if (!record.privateRunDirs.includes(dir)) record.privateRunDirs.push(dir); }
 				running.push({ ...operation, status: "running" });
 			}
-			// While workers run, sample the read-only watch view every 20 s: this is the evidence that the pane rendering and the summary line work on a real stream.
+			// While workers run, sample the read-only watch view every 20 s: this is the evidence that reading the worker's own pane renders on a real run.
 			const watcher = setInterval(async () => {
 				try {
 					const view = parsed(await tool.execute({ op: "watch", runId }, () => {}, ctx));
-					if (record.watchSamples.length < 30 && Array.isArray(view.agents)) record.watchSamples.push({ at: Math.round(now() - started), agents: view.agents.map((agent: Record<string, any>) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, toolCalls: agent.toolCalls, lastActivity: agent.lastActivity })) });
+					if (record.watchSamples.length >= 30 || !Array.isArray(view.agents)) return;
+					const agents = view.agents.map((agent: Record<string, any>) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, paneId: agent.paneId, lastActivity: agent.lastActivity }));
+					// For a visible worker, read the pane directly as well: the sample then carries both what the
+					// view rendered and what the terminal actually held, so agreement is checkable rather than assumed.
+					const panes: { paneId: string; paneLastLine: string | null; agrees: boolean }[] = [];
+					for (const agent of agents) {
+						if (!agent.paneId) continue;
+						const read = spawnSync("herdr", ["pane", "read", String(agent.paneId), "--source", "recent", "--lines", "5", "--format", "text"], { encoding: "utf8", timeout: 5_000 });
+						const lines = read.status === 0 ? String(read.stdout).split("\n").map((line) => line.trim()).filter(Boolean) : [];
+						const last = lines.at(-1) ?? null;
+						panes.push({ paneId: String(agent.paneId), paneLastLine: last, agrees: !!agent.lastActivity && !!last });
+					}
+					record.watchSamples.push({ at: Math.round(now() - started), agents, panes });
 				} catch { /* sampling only */ }
 			}, 20_000);
 			await Promise.all(running.map(async (operation) => {
@@ -233,6 +261,9 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 				const slicePayload = operation.node === PLAN_NODE ? { slices } : {};
 				const attempt = collected.attempt;
 				if (collected.captureRetainedPath) record.failures.push(`capture retained: ${collected.captureRetainedPath}`);
+				// A settlement that reports a post-settlement failure is the run saying its teardown did not converge,
+				// and a summary that omits it reports "0 failures" for a run whose every operation failed its audit.
+				if (Array.isArray(collected.postSettlementFailures)) record.postSettlementFailures.push(...collected.postSettlementFailures.filter((item: unknown): item is string => typeof item === "string"));
 				if (attempt.processState === "exited" && attempt.candidate) {
 					let verdict: string | undefined = FIXED_VERDICTS[operation.node];
 					if (VERDICT_NODES[operation.node]) {
@@ -279,7 +310,8 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 	} finally {
 		record.finishedAt = new Date().toISOString(); record.totalMs = Math.round(now() - started);
 		writeFileSync(join(evidenceDir, `run-${contract}-${repeat}.json`), JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
-		rmSync(root, { recursive: true, force: true });
+		if (keepRunRoot) console.log(JSON.stringify({ keptRunRoot: root, evidence: join(root, "evidence"), failures: join(root, "failures") }));
+		else rmSync(root, { recursive: true, force: true });
 	}
 	return record;
 }
@@ -289,16 +321,16 @@ for (let repeat = 1; repeat <= repeats; repeat += 1) for (const contract of cont
 	console.log(JSON.stringify({ starting: { contract, repeat } }));
 	const record = await measureRun(contract, repeat);
 	records.push(record);
-	console.log(JSON.stringify({ finished: { contract, repeat, runId: record.runId, status: record.finalStatus, terminal: record.terminal, totalMs: record.totalMs, dispatches: record.dispatches, retries: record.retries, modelFallbacks: record.modelFallbacks, failures: record.failures.length, error: record.error } }));
+	console.log(JSON.stringify({ finished: { contract, repeat, runId: record.runId, status: record.finalStatus, terminal: record.terminal, totalMs: record.totalMs, dispatches: record.dispatches, retries: record.retries, modelFallbacks: record.modelFallbacks, failures: record.failures.length, postSettlementFailures: record.postSettlementFailures.length, error: record.error } }));
 }
 const phaseSum = (record: RunRecord, kind: string) => record.phases.filter((phase) => phase.kind === kind).reduce((sum, phase) => sum + phase.ms, 0);
 const summary = {
 	schemaVersion: 1, measuredAt: new Date().toISOString(), plan, hostPiVersion: spawnSync("pi", ["--version"], { encoding: "utf8" }).stdout.trim(), sampleCounts: Object.fromEntries(contracts.map((contract) => [contract, records.filter((record) => record.contract === contract).length])),
-	runs: records.map((record) => ({ contract: record.contract, repeat: record.repeat, runId: record.runId, runRoot: record.runRoot, terminal: record.terminal, finalStatus: record.finalStatus, totalMs: record.totalMs, dispatches: record.dispatches, collects: record.collects, completions: record.completions, retries: record.retries, modelFallbacks: record.modelFallbacks, failures: record.failures, error: record.error, dispatchMs: phaseSum(record, "dispatch"), collectMs: phaseSum(record, "collect"), completionMs: phaseSum(record, "record-completed") + phaseSum(record, "decide"), integrateMs: phaseSum(record, "integrate"), backoffMs: phaseSum(record, "backoff"), verdicts: record.verdicts, integrations: record.integrations, workspaceChanged: record.workspace ? record.workspace.status.trim().length > 0 : null, criticalPathNote: "collect phases of a fan-out overlap; collectMs is the sum, totalMs is elapsed wall time" })),
+	runs: records.map((record) => ({ contract: record.contract, repeat: record.repeat, runId: record.runId, runRoot: record.runRoot, terminal: record.terminal, finalStatus: record.finalStatus, totalMs: record.totalMs, dispatches: record.dispatches, collects: record.collects, completions: record.completions, retries: record.retries, modelFallbacks: record.modelFallbacks, failures: record.failures, postSettlementFailures: record.postSettlementFailures, error: record.error, dispatchMs: phaseSum(record, "dispatch"), collectMs: phaseSum(record, "collect"), completionMs: phaseSum(record, "record-completed") + phaseSum(record, "decide"), integrateMs: phaseSum(record, "integrate"), backoffMs: phaseSum(record, "backoff"), verdicts: record.verdicts, integrations: record.integrations, workspaceChanged: record.workspace ? record.workspace.status.trim().length > 0 : null, criticalPathNote: "collect phases of a fan-out overlap; collectMs is the sum, totalMs is elapsed wall time" })),
 	cost: "unknown: provider usage is not reported by the worker path and is not estimated",
 };
 writeFileSync(join(evidenceDir, "summary.json"), JSON.stringify(summary, null, 2) + "\n", { mode: 0o600 });
-const lines = ["# Matched live measurement", "", `Measured ${summary.measuredAt} on Pi ${summary.hostPiVersion}, model \`${model}\`, adapter pi, ${graph} graph, ${repeats} repeat(s) per contract. Cost: ${summary.cost}.`, "", "| contract | repeat | terminal | status | total ms | dispatches | retries | fallbacks | completions | failures | verdicts | workspace changed | error |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |", ...summary.runs.map((run) => `| ${run.contract} | ${run.repeat} | ${run.terminal} | ${run.finalStatus} | ${run.totalMs} | ${run.dispatches} | ${run.retries} | ${run.modelFallbacks} | ${run.completions} | ${run.failures.length} | ${run.verdicts.map((item) => `${item.node}=${item.verdict ?? "none"}`).join(" ") || "-"} | ${run.workspaceChanged ?? "-"} | ${run.error ?? ""} |`), "", "Runtime-v1 candidates were accepted automatically by the driver; this measures latency, turns and recovery, not quality or independent review. Review, test and audit verdicts were read from the worker. Sums of parallel collect phases exceed elapsed time by design."];
+const lines = ["# Matched live measurement", "", `Measured ${summary.measuredAt} on Pi ${summary.hostPiVersion}, model \`${model}\`, adapter pi, ${graph} graph, ${repeats} repeat(s) per contract. Cost: ${summary.cost}.`, "", "| contract | repeat | terminal | status | total ms | dispatches | retries | fallbacks | completions | failures | post-settle | verdicts | workspace changed | error |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |", ...summary.runs.map((run) => `| ${run.contract} | ${run.repeat} | ${run.terminal} | ${run.finalStatus} | ${run.totalMs} | ${run.dispatches} | ${run.retries} | ${run.modelFallbacks} | ${run.completions} | ${run.failures.length} | ${run.postSettlementFailures.length} | ${run.verdicts.map((item) => `${item.node}=${item.verdict ?? "none"}`).join(" ") || "-"} | ${run.workspaceChanged ?? "-"} | ${run.error ?? ""} |`), "", "Runtime-v1 candidates were accepted automatically by the driver; this measures latency, turns and recovery, not quality or independent review. Review, test and audit verdicts were read from the worker. A post-settle count is how many post-settlement failures the collects reported, which settle the attempt and report a teardown that did not converge. Sums of parallel collect phases exceed elapsed time by design."];
 writeFileSync(join(evidenceDir, "summary.md"), lines.join("\n") + "\n", { mode: 0o600 });
 console.log(JSON.stringify({ evidenceDir, summary: join(evidenceDir, "summary.md"), runs: summary.runs.length, terminal: summary.runs.filter((run) => run.terminal).length }));
 process.exitCode = records.every((record) => record.terminal && !record.error) ? 0 : 1;

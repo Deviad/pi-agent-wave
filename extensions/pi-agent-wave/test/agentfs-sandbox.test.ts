@@ -151,6 +151,15 @@ describe("AgentFS operation-attempt sandbox", () => {
 		assert.throws(() => exportOwnedAgentFsChanges("agentfs", db, f.base, audit), /unowned changes/);
 	});
 
+	test("treats a directory created for an owned file as a container but still refuses its other children", () => {
+		const f = fixture("container");
+		const db = runScript(f, "attempt-container", "mkdir -p app/topics\nprintf 'module\\n' > app/topics/index.ts\nprintf 'stray\\n' > app/stray.txt\nmkdir -p stray-dir");
+		const audit = auditAgentFsChanges(db, f.base, [join(f.base, "app/topics/index.ts")]);
+		assert.deepEqual(audit.owned.filter((change) => change.kind === "directory").map((change) => change.path).sort(), ["app", "app/topics"]);
+		assert.deepEqual(audit.owned.filter((change) => change.kind === "file").map((change) => change.path), ["app/topics/index.ts"]);
+		assert.deepEqual(audit.violations.map((change) => change.path).sort(), ["app/stray.txt", "stray-dir"]);
+	});
+
 	test("prevents writes through credential symlinks to real provider homes", () => {
 		const f = fixture("credential-boundary");
 		const target = join(process.env.HOME ?? "", `.pi-agent-wave-agentfs-boundary-${process.pid}`);

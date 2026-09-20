@@ -1,8 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
-import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { summarizeAcpxStream } from "./lib/acpx-render.ts";
+import { LIVE_VIEW_PENDING, liveViewFor, refreshLiveView, streamRunDirectory } from "./lib/live-stream.ts";
+import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import type { RuntimeAttempt } from "./lib/runtime-results.ts";
 import type { GraphStore } from "./store.ts";
@@ -15,7 +14,7 @@ import type { GraphStore } from "./store.ts";
  */
 
 export const AGENT_LIST_WIDGET = "delegate-graph-agents";
-const STREAM_TAIL_BYTES = 64 * 1024;
+const LIVE_OUTPUT_LINES = 12;
 const ANSWER_LIMIT_BYTES = 4 * 1024;
 const TASK_LIMIT = 240;
 
@@ -106,19 +105,6 @@ function sameItem(a: CursorItem | null, b: CursorItem): boolean {
 const entries: AgentListEntry[] = [];
 let session: AgentListSession | null = null;
 
-/** The last bytes of a file, so a long stream is summarized without reading all of it. */
-function readTail(path: string, limit: number): string {
-	const size = statSync(path).size;
-	const start = Math.max(0, size - limit);
-	const fd = openSync(path, "r");
-	try {
-		const buffer = Buffer.alloc(size - start);
-		readSync(fd, buffer, 0, buffer.length, start);
-		const text = buffer.toString("utf8");
-		return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
-	} finally { closeSync(fd); }
-}
-
 /** Decodes a byte prefix without emitting a replacement character for a multi-byte sequence cut at the boundary. */
 export function decodePrefix(bytes: Uint8Array): string {
 	return new TextDecoder("utf-8").decode(bytes, { stream: true });
@@ -147,27 +133,51 @@ export function processLabel(attempt: RuntimeAttempt): string {
 	}
 }
 
-function streamPathFor(store: GraphStore, attempt: RuntimeAttempt): string | null {
-	const agent = attempt.agentId ? store.agents(attempt.runId).find((row) => row.id === attempt.agentId) : undefined;
-	if (!agent?.acpx_cancel_script) return null;
-	const candidate = join(dirname(agent.acpx_cancel_script), "runtime-output", "worker.stdout.ndjson");
-	return existsSync(candidate) ? candidate : null;
+/**
+ * The live view for one agent: its terminal when the transport has one, otherwise the stream its
+ * supervisor publishes. Neither branch reads the attempt's capture file.
+ */
+function liveViewForAgent(agent: { herdr_pane_id?: string | null; acpx_cancel_script?: string | null } | undefined, attemptKey: string, limit: number): { lines: readonly string[]; note: string | null } {
+	if (agent?.herdr_pane_id) {
+		const rendered = paneLines(agent.herdr_pane_id, limit);
+		if (rendered === null) return { lines: [], note: "(the worker's pane could not be read)" };
+		return { lines: rendered, note: rendered.length ? null : "(the pane is empty; the worker has rendered nothing yet)" };
+	}
+	// Every registered worker carries a cancel script (the store refuses an incomplete provenance set), so a
+	// worker with no pane always has a run directory that either publishes a stream or says why it does not.
+	const cached = liveViewFor(attemptKey);
+	// A view that has not been read yet is pending rather than empty: the refresh is asynchronous, and
+	// reporting "nothing" for it would read as "the worker did nothing".
+	return cached ?? { lines: [], note: LIVE_VIEW_PENDING };
 }
 
-/** Everything the detail view shows for one attempt, read from runtime state and retained content only. */
+/** Reads every running entry's live view into the cache. Asynchronous and bounded, so it never blocks a redraw. */
+export async function refreshAgentListLiveViews(store: GraphStore): Promise<void> {
+	for (const entry of entries) {
+		try {
+			const attempt = store.runtimeAttempt(entry.attemptKey);
+			if (attempt.processState !== "running") continue;
+			const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
+			if (agent?.herdr_pane_id) continue;
+			await refreshLiveView(entry.attemptKey, streamRunDirectory(agent?.acpx_cancel_script), LIVE_OUTPUT_LINES);
+		} catch { /* a view that cannot be read keeps the last one it had */ }
+	}
+}
+
+/** Reads the running workers' live views and repaints. The read only ever adds to what is already shown. */
+function refreshThenDraw(store: GraphStore): void {
+	void refreshAgentListLiveViews(store).then(() => { if (session) draw(); }).catch(() => {});
+}
+
+/** Everything the detail view shows for one attempt, read from the worker's pane or published stream, and retained content. */
 export function attemptDetail(store: GraphStore, entry: AgentListEntry): AgentDetail {
 	const attempt = store.runtimeAttempt(entry.attemptKey);
 	const operation = store.getOperation(entry.operationId);
 	const state = store.getState(entry.runId);
 	const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
-	const streamPath = streamPathFor(store, attempt);
-	let liveOutput: readonly string[] = [];
-	let liveOutputNote: string | null = streamPath ? null : "(no stream retained for this attempt)";
-	if (streamPath) {
-		const summary = summarizeAcpxStream(readTail(streamPath, STREAM_TAIL_BYTES), 12);
-		liveOutput = summary.recent;
-		if (!summary.recent.length) liveOutputNote = "(stream exists but nothing renderable has arrived)";
-	}
+	const live = liveViewForAgent(agent, entry.attemptKey, LIVE_OUTPUT_LINES);
+	const liveOutput = live.lines;
+	const liveOutputNote = live.note;
 	let answer: string | null = null;
 	let answerNote: string | null = null;
 	const retained = attempt.candidate?.answer ?? null;
@@ -207,8 +217,8 @@ export function listRows(store: GraphStore): AgentListRow[] {
 		try {
 			const attempt = store.runtimeAttempt(entry.attemptKey);
 			const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
-			const streamPath = streamPathFor(store, attempt);
-			const activity = streamPath ? summarizeAcpxStream(readTail(streamPath, STREAM_TAIL_BYTES), 1).lastActivity ?? "(no output yet)" : "(no stream)";
+			const live = liveViewForAgent(agent, entry.attemptKey, 1);
+			const activity = live.lines.at(-1) ?? live.note ?? "(no output yet)";
 			return { number: entry.number, agentName: agent?.name ?? entry.operationId, node: store.getOperation(entry.operationId).node, state: processLabel(attempt), model: shortModel(agent?.selected_model ?? null), activity, running: attempt.processState === "running" && !attempt.supersededAt };
 		} catch (error) {
 			return { number: entry.number, agentName: entry.operationId, node: "?", state: `unavailable (${error instanceof Error ? error.message : String(error)})`, model: "?", activity: "", running: false };
@@ -302,7 +312,15 @@ function draw(): void {
 function ensureTimer(): void {
 	const current = session;
 	if (!current || current.timer || !anyRunning(current.store)) return;
-	const timer = setInterval(draw, current.intervalMs);
+	// Each tick reads the running workers' live views before redrawing, so the renderers stay synchronous
+	// and the terminal cannot be blocked by a worker, a socket or a `herdr` process.
+	const tick = async (): Promise<void> => {
+		const active = session;
+		if (!active) return;
+		await refreshAgentListLiveViews(active.store);
+		if (session === active) draw();
+	};
+	const timer = setInterval(() => { void tick(); }, current.intervalMs);
 	timer.unref?.();
 	current.timer = timer;
 }
@@ -453,15 +471,19 @@ export function noteRegisteredAttempt(store: GraphStore, ctx: ExtensionContext, 
 	if (!entries.some((entry) => entry.attemptKey === registration.attemptKey)) {
 		entries.push({ number: entries.length + 1, attemptKey: registration.attemptKey, runId: registration.runId, operationId: registration.operationId });
 	}
-	if (session) { ensureTimer(); draw(); return; }
+	if (session) { ensureTimer(); draw(); refreshThenDraw(store); return; }
 	open(store, ctx, intervalMs, actions);
+	// Paint from what is known now, then enrich: waiting for the refresh would leave a newly registered
+	// worker out of the list until the next interval, and the read is only ever an addition to the view.
+	refreshThenDraw(store);
 }
 
 /** Explicit reopening of the overview for the attempts this session has seen; nothing to show is reported, not invented. */
 export function reopenAgentList(store: GraphStore, ctx: ExtensionContext, intervalMs: number, actions: AgentListActions): boolean {
 	if (ctx.mode !== "tui" || !entries.length) return false;
-	if (session) { session.selected = null; session.pending = ""; session.confirming = null; draw(); return true; }
+	if (session) { session.selected = null; session.pending = ""; session.confirming = null; draw(); refreshThenDraw(store); return true; }
 	open(store, ctx, intervalMs, actions);
+	refreshThenDraw(store);
 	return true;
 }
 

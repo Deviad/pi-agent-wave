@@ -4,7 +4,7 @@ import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Database } from "../sqlite.ts";
@@ -110,6 +110,12 @@ describe("settlement for an operation whose worker never started", () => {
 		assert.equal(runStatus(dbPath, runId), "cancelled", "the run must leave the active set");
 		const again = parsed(await tool.execute("cancel", { op: "cancel", runId, operationId }, undefined, () => {}, {} as ExtensionContext));
 		assert.equal(again.error, undefined, `a repeated cancel must be a no-op, got ${JSON.stringify(again)}`);
+		// The unlaunched record is named for what it is. A worker's failure bundle carries the same
+		// operation id under `evidence/<runId>/`, so one shared name would be one logical record with two
+		// homes and two different contents.
+		assert.equal(basename(String(cancelled.diagnosticsPath)), `unlaunched-${operationId}.json`);
+		assert.ok(String(cancelled.diagnosticsPath).includes(join("failures", runId)), "an unlaunched record lives under failures/, never evidence/");
+		assert.equal(existsSync(join(dirname(dbPath), "failures", runId, `failure-${operationId}.json`)), false, "and never takes a worker bundle's name");
 	});
 
 	test("a run the caller got wrong is refused without writing anywhere", async () => {

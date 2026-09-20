@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../sqlite.ts";
-import { GraphStore } from "../store.ts";
+import { CURRENT_SCHEMA_VERSION, GraphStore } from "../store.ts";
 
 const directories: string[] = [];
 
@@ -68,7 +68,7 @@ describe("GraphStore transport-aware provenance through schema v6", () => {
 		const columns = db.query<{ name: string }, []>("PRAGMA table_info(agents)").all().map((row) => row.name);
 		const version = db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version;
 		assert.deepEqual(columns.filter((name) => name.startsWith("acp") || name.startsWith("agentfs") || name === "herdr_pane_id"), ["acp_agent", "acpx_record_id", "acpx_session_id", "acpx_state", "acpx_attempt_key", "agentfs_session_id", "agentfs_db_path", "herdr_pane_id", "acpx_cancel_script"]);
-		assert.equal(version, 11);
+		assert.equal(version, CURRENT_SCHEMA_VERSION);
 		db.close();
 	});
 
@@ -104,7 +104,7 @@ describe("GraphStore transport-aware provenance through schema v6", () => {
 			assert.equal(migrated.agents(state.runId)[0]?.name, "legacy-agent");
 			migrated.close();
 			const db = new Database(dbPath, { readonly: true });
-			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 			for (const table of ["runs", "operations", "agents", "events"] as const) {
 				const observed = db.query<Record<string, unknown>, []>(`SELECT ${expected[table].columns.join(",")} FROM ${table} ORDER BY rowid`).all();
 				assert.deepEqual(observed, expected[table].rows, `${table} legacy state changed during v${sourceVersion} migration`);
@@ -131,7 +131,7 @@ describe("GraphStore transport-aware provenance through schema v6", () => {
 		const db = new Database(dbPath, { readonly: true });
 		const columns = db.query<{ name: string }, []>("PRAGMA table_info(agents)").all().map((row) => row.name);
 		assert.ok(columns.includes("agentfs_db_path"));
-		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 		db.close();
 	});
 
@@ -160,7 +160,7 @@ describe("GraphStore transport-aware provenance through schema v6", () => {
 			migrated.close();
 
 			const db = new Database(dbPath, { readonly: true });
-			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+			assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 			const after = db.query<Record<string, unknown>, []>("SELECT * FROM agents ORDER BY rowid").all().map((row) => ({ ...row, transport: "<retired>" }));
 			assert.deepEqual(after, expected, `retired ${retiredTransport} row lost data during migration`);
 			assert.equal(db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM agents").get()?.count, 1);

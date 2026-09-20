@@ -1,20 +1,36 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GraphStore } from "../store.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
+import { setPaneReaderForTests, type PaneReader } from "../lib/pane-read.ts";
 import { renderFollow, renderWatch, watchRun } from "../index.ts";
-import { AGENT_LIST_WIDGET, agentListState, attemptDetail, noteRegisteredAttempt, resetAgentListForTests, type AgentListActions, type CancelRunReport } from "../agent-list.ts";
+import { AGENT_LIST_WIDGET, agentListState, attemptDetail, noteRegisteredAttempt, refreshAgentListLiveViews, resetAgentListForTests, type AgentListActions, type CancelRunReport } from "../agent-list.ts";
+import { LIVE_VIEW_UNAVAILABLE, resetLiveViewsForTests } from "../lib/live-stream.ts";
 import { cancelRunWorkers } from "../index.ts";
 import { renderStatus } from "../commands.ts";
 
 const dirs: string[] = [];
-afterEach(() => { resetAgentListForTests(); cancelRequests.length = 0; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { resetAgentListForTests(); resetLiveViewsForTests(); setPaneReaderForTests(null); panes.clear(); cancelRequests.length = 0; paneReads.length = 0; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+/** What each pane is showing; a pane absent from the map reads as unavailable, the way an unknown pane id does. */
+const panes = new Map<string, string>();
+const paneReads: { paneId: string; lines: number }[] = [];
+const stubPaneReader: PaneReader = (paneId, lines) => {
+	paneReads.push({ paneId, lines });
+	const text = panes.get(paneId);
+	return text === undefined ? null : text.split("\n").slice(-lines).join("\n");
+};
 function parsed(result: unknown): Record<string, any> { return JSON.parse((result as { content: { text: string }[] }).content[0].text); }
+/** The live view is read asynchronously; a test asserts after it settles rather than racing it. */
+async function until(check: () => boolean, ms = 3_000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (Date.now() < deadline) { if (check()) return; await new Promise((resolve) => setTimeout(resolve, 20)); }
+}
 const ROLES = ["thinker", "implementer", "reviewer", "tester", "auditor", "searcher"];
 
 const commands = new Map<string, Record<string, any>>();
@@ -39,7 +55,7 @@ async function harness(dir: string): Promise<Record<string, any>> {
 	return tool;
 }
 
-test("op=watch renders what each running worker is doing from its retained stream and decides nothing", async () => {
+test("op=watch renders what each running worker is doing from its own terminal and decides nothing", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "runtime-watch-")); dirs.push(dir);
 	const originalEnv = { ...process.env };
 	try {
@@ -52,35 +68,36 @@ test("op=watch renders what each running worker is doing from its retained strea
 		const idle = parsed(await tool.execute("watch", { op: "watch", runId }, undefined, () => {}, ctx));
 		assert.deepEqual(idle.agents, [], "nothing runs before dispatch");
 
+		setPaneReaderForTests(stubPaneReader);
 		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
 		const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: "openai-codex/gpt-5.6-sol", agent: "codex" });
 		const attemptDir = join(dir, "private-run", "acpx", "worker-1"); mkdirSync(join(attemptDir, "runtime-output"), { recursive: true });
 		const cancelScript = join(attemptDir, "cancel-acpx.sh"); writeFileSync(cancelScript, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
-		const agentId = store.registerAgent({ runId, name: "worker-1", node: operation.node, role: "thinker", transport: "headless", acpAgent: "codex", acpxRecordId: identity.sessionName, acpxSessionId: identity.sessionName, acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: identity.agentFsSession, agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript, currentTask: operation.task });
+		const agentId = store.registerAgent({ runId, name: "worker-1", node: operation.node, role: "thinker", transport: "herdr", herdrAgent: "herdr-worker-1", tabId: "w1:t9", herdrPaneId: "w1:p9", acpAgent: "codex", acpxRecordId: identity.sessionName, acpxSessionId: identity.sessionName, acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: identity.agentFsSession, agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript, currentTask: operation.task });
 		store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: store.policy(runId).digest, agentId });
 		const before = parsed(await tool.execute("watch", { op: "watch", runId }, undefined, () => {}, ctx));
 		assert.equal(before.agents.length, 1);
-		assert.deepEqual([before.agents[0].agentName, before.agents[0].processState, before.agents[0].streamPath, before.agents[0].lastActivity], ["worker-1", "running", null, null]);
+		assert.deepEqual([before.agents[0].agentName, before.agents[0].processState, before.agents[0].paneId, before.agents[0].lastActivity], ["worker-1", "running", "w1:p9", null], "an unreadable pane reports no activity and never falls back to a file");
 
-		const update = (u: Record<string, unknown>) => JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: u } });
-		writeFileSync(join(attemptDir, "runtime-output", "worker.stdout.ndjson"), [
-			JSON.stringify({ jsonrpc: "2.0", id: "1", method: "session/prompt", params: { sessionId: "s", prompt: [] } }),
-			update({ sessionUpdate: "tool_call", toolCallId: "c1", title: "read docs/design.md", kind: "read" }),
-			update({ sessionUpdate: "tool_call_update", toolCallId: "c1", status: "completed" }),
-			update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Reading the design notes first" } }),
-		].join("\n") + "\n", { mode: 0o600 });
+		// The stream file the display path used to read; it must stay unread now that the pane is the source.
+		const streamFile = join(attemptDir, "runtime-output", "worker.stdout.ndjson");
+		writeFileSync(streamFile, JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "FILE ONLY: never displayed" } } } }) + "\n", { mode: 0o600 });
+		panes.set("w1:p9", "\u25b8 read docs/design.md (read)\n\u2713 read docs/design.md\nReading the design notes first\n");
 		const progress: Record<string, unknown>[] = [];
 		const live = parsed(await tool.execute("watch", { op: "watch", runId }, undefined, (u: unknown) => progress.push(parsed(u)), ctx));
 		const agent = live.agents[0];
 		assert.equal(agent.lastActivity, "Reading the design notes first");
-		assert.deepEqual(agent.recent, ["\u2500\u2500 prompt \u2500\u2500", "\u25b8 read docs/design.md (read)", "\u2713 read docs/design.md", "Reading the design notes first"]);
-		assert.deepEqual([agent.prompts, agent.toolCalls], [1, 1]);
-		assert.equal(JSON.stringify(live).includes("jsonrpc"), false);
+		assert.deepEqual(agent.recent, ["\u25b8 read docs/design.md (read)", "\u2713 read docs/design.md", "Reading the design notes first"]);
+		assert.equal(JSON.stringify(live).includes("FILE ONLY"), false, "the worker's stream file is never a display source");
 		assert.equal(progress.at(-1)?.kind, "watch");
 		assert.deepEqual((progress.at(-1)?.agents as Record<string, unknown>[])[0]?.lastActivity, "Reading the design notes first");
 		const rendered = renderWatch(watchRun(store, runId));
-		assert.match(rendered, /^run run_[^\n]* \| node=thinker_split \| status=active\nworker-1 \| thinker_split \| running \| tools=1 \| Reading the design notes first\n/);
+		assert.match(rendered, /^run run_[^\n]* \| node=thinker_split \| status=active\nworker-1 \| thinker_split \| running \| Reading the design notes first\n/);
 		assert.match(rendered, /    \u2713 read docs\/design\.md/);
+		// The pane keeps rendering after the file is deleted, because the file was never the source.
+		rmSync(streamFile);
+		assert.equal(watchRun(store, runId).agents[0]!.lastActivity, "Reading the design notes first");
+		assert.deepEqual(paneReads.map((read) => read.paneId), ["w1:p9", "w1:p9", "w1:p9", "w1:p9"], "every render reads the pane");
 		// Watching is read-only: the attempt, the operation and the graph are untouched.
 		assert.equal(store.runtimeAttempt(identity.attemptKey).outcome, null);
 		assert.equal(store.getOperation(operation.id).status, "running");
@@ -114,20 +131,21 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, opens 
 		const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: "openai-codex/gpt-5.6-sol", agent: "codex" });
 		const attemptDir = join(dir, "private-run", "acpx", "worker-1"); mkdirSync(join(attemptDir, "runtime-output"), { recursive: true });
 		const cancelScript = join(attemptDir, "cancel-acpx.sh"); writeFileSync(cancelScript, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
-		const agentId = store.registerAgent({ runId, name: "worker-1", node: operation.node, role: "thinker", transport: "headless", acpAgent: "codex", acpxRecordId: identity.sessionName, acpxSessionId: identity.sessionName, acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: identity.agentFsSession, agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript, currentTask: operation.task });
+		setPaneReaderForTests(stubPaneReader);
+		const agentId = store.registerAgent({ runId, name: "worker-1", node: operation.node, role: "thinker", transport: "herdr", herdrAgent: "herdr-worker-1", tabId: "w1:t9", herdrPaneId: "w1:p9", acpAgent: "codex", acpxRecordId: identity.sessionName, acpxSessionId: identity.sessionName, acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: identity.agentFsSession, agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript, currentTask: operation.task });
 		store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: store.policy(runId).digest, agentId });
-		writeFileSync(join(attemptDir, "runtime-output", "worker.stdout.ndjson"), JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Reading the corpus" } } } }) + "\n", { mode: 0o600 });
+		panes.set("w1:p9", "Reading the corpus\n");
 		const before = widgets.length;
 		await new Promise((resolve) => setTimeout(resolve, 200));
 		assert.ok(widgets.length > before, "the widget redraws on the interval while the run is active");
-		assert.match(widgets.at(-1)![1]!, /^1\. worker-1 \| thinker_split \| running \| tools=0 \| Reading the corpus$/);
+		assert.match(widgets.at(-1)![1]!, /^1\. worker-1 \| thinker_split \| running \| Reading the corpus$/);
 		assert.deepEqual(handler!("r"), { consume: true });
 		assert.deepEqual(handler!("1"), { consume: true });
 		assert.match(widgets.at(-1)!.at(-1)!, /^selecting: 1_ \(Enter opens, Esc clears\)$/, "the pending digit is shown");
 		assert.deepEqual(handler!("\r"), { consume: true });
 		assert.match(widgets.at(-1)![0]!, /^agent 1: worker-1 \| keys: q back to list, r refresh, Esc cancels the run's workers$/, "Enter opens the worker's details in the follow view");
 		assert.match(widgets.at(-1)![3]!, /^process running \| acceptance unavailable$/);
-		assert.ok(widgets.at(-1)!.some((line) => line.includes("Reading the corpus")), "details render the retained stream");
+		assert.ok(widgets.at(-1)!.some((line) => line.includes("Reading the corpus")), "details render what the worker's pane is showing");
 		assert.equal(notices.some((notice) => /no pane to focus|agent_not_found/.test(notice)), false, "no Herdr focus is attempted");
 		assert.deepEqual(handler!("q"), { consume: true });
 		assert.match(widgets.at(-1)![0]!, new RegExp(`^watch ${runId} \\|`), "q returns from details to the overview");
@@ -194,7 +212,7 @@ const cancelRequests: string[] = [];
 /** The default action double: records the request and reports nothing cancelled; tests that cancel for real use cancelRunWorkers. */
 const actions: AgentListActions = { cancelRun: async (runId) => { cancelRequests.push(runId); return { runId, cancelled: [], failed: [], status: "active" }; } };
 
-interface Registered { attemptKey: string; agentId: string; attemptDir: string; identity: ReturnType<typeof createHeadlessAcpxAttemptIdentity> }
+interface Registered { attemptKey: string; agentId: string; attemptDir: string; identity: ReturnType<typeof createHeadlessAcpxAttemptIdentity>; paneId: string | null }
 /** Registers a worker for an operation the way the dispatch path does, without a real launch. */
 function registerWorker(store: GraphStore, dir: string, runId: string, operationId: string, name: string, options: { transport?: "headless" | "herdr"; transientAttempt?: number } = {}): Registered {
 	const operation = store.getOperation(operationId);
@@ -202,9 +220,10 @@ function registerWorker(store: GraphStore, dir: string, runId: string, operation
 	const attemptDir = join(dir, "private-run", "acpx", name); mkdirSync(join(attemptDir, "runtime-output"), { recursive: true });
 	const cancelScript = join(attemptDir, "cancel-acpx.sh"); writeFileSync(cancelScript, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
 	const transport = options.transport ?? "headless";
-	const agentId = store.registerAgent({ runId, name, node: operation.node, role: roleOf(operation.node), transport, herdrAgent: transport === "herdr" ? `herdr-${name}` : undefined, tabId: transport === "herdr" ? "w1:t9" : undefined, herdrPaneId: transport === "herdr" ? "w1:p9" : undefined, selectedModel: "openai-codex/gpt-5.6-sol", modelAttempt: operation.model_attempt, acpAgent: "codex", acpxRecordId: identity.sessionName, acpxSessionId: identity.sessionName, acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: identity.agentFsSession, agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript, currentTask: operation.task });
+	const paneId = `w1:p-${name}`;
+	const agentId = store.registerAgent({ runId, name, node: operation.node, role: roleOf(operation.node), transport, herdrAgent: transport === "herdr" ? `herdr-${name}` : undefined, tabId: transport === "herdr" ? "w1:t9" : undefined, herdrPaneId: transport === "herdr" ? paneId : undefined, selectedModel: "openai-codex/gpt-5.6-sol", modelAttempt: operation.model_attempt, acpAgent: "codex", acpxRecordId: identity.sessionName, acpxSessionId: identity.sessionName, acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: identity.agentFsSession, agentFsDbPath: join(attemptDir, "delta.db"), acpxCancelScript: cancelScript, currentTask: operation.task });
 	store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: store.policy(runId).digest, agentId });
-	return { attemptKey: identity.attemptKey, agentId, attemptDir, identity };
+	return { attemptKey: identity.attemptKey, agentId, attemptDir, identity, paneId: transport === "herdr" ? paneId : null };
 }
 function roleOf(node: string): string { return node.startsWith("thinker") ? "thinker" : node.startsWith("search") ? "searcher" : node; }
 function streamLine(text: string): string { return JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } }); }
@@ -256,7 +275,10 @@ test("agent list opens on registered dispatch only", async () => {
 		assert.equal(agentListState().open, true);
 		assert.deepEqual(agentListState().entries.map((e) => [e.number, e.attemptKey]), [[1, planned.attemptKey]]);
 		assert.match(tui.last()![0]!, /^agents \(1\) \| keys: Enter opens the running worker or focuses the list, up\/down move, number then Enter opens by number, s shows or hides settled, r refresh, q close, Esc cancels the run's workers$/);
-		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no stream\)$/);
+		// A headless worker registers no pane, so the row's activity comes from its published stream; this
+		// fixture publishes none, so the row says so rather than naming a capture file.
+		await until(() => tui.last()?.[1]?.includes("no live stream") ?? false);
+		assert.match(tui.last()![1]!, /^1\. worker-1 \| thinker_split \| running \| gpt-5\.6-sol \| \(no live stream:/, "a worker that publishes nothing says so in its row");
 	} finally { process.env = originalEnv; }
 });
 
@@ -299,22 +321,28 @@ test("number selection shows attempt-bound live and retained details", async () 
 	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
 	const tui = fakeTui();
 	const run = newRun(store, "detail");
-	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-d");
+	setPaneReaderForTests(stubPaneReader);
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-d", { transport: "herdr" });
 	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
 	select(tui, 1);
 	let view = tui.last()!;
 	assert.match(view[0]!, /^agent 1: worker-d \| keys: q back to list, r refresh, Esc cancels the run's workers$/);
 	assert.match(view[1]!, new RegExp(`^run ${run.runId} \\(active\\) \\| operation ${run.operationId}$`));
-	assert.match(view[2]!, /^node thinker_split \| role thinker \| transport headless \| model openai-codex\/gpt-5\.6-sol$/);
+	assert.match(view[2]!, /^node thinker_split \| role thinker \| transport herdr \| model openai-codex\/gpt-5\.6-sol$/);
 	assert.match(view[3]!, /^process running \| acceptance unavailable$/);
 	assert.match(view[4]!, /^task: /);
-	assert.ok(view.includes("  (no stream retained for this attempt)"), view.join("\n"));
+	assert.ok(view.includes("  (the worker's pane could not be read)"), view.join("\n"));
 	assert.ok(view.includes("  (no answer yet: the worker is still running)"), view.join("\n"));
-	writeFileSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"), `${streamLine("Reading the corpus")}\n${streamLine("Drafting the answer")}\n`, { mode: 0o600 });
+	// The capture file exists and carries different text; the detail view must show the pane, not the file.
+	writeFileSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"), `${streamLine("FILE ONLY: never displayed")}\n`, { mode: 0o600 });
+	panes.set(worker.paneId!, "Reading the corpus\nDrafting the answer\n");
 	assert.deepEqual(tui.input("r"), { consume: true });
 	view = tui.last()!;
 	assert.ok(view.some((line) => line.includes("Reading the corpus")) && view.some((line) => line.includes("Drafting the answer")), view.join("\n"));
-	assert.equal(view.join("\n").includes("jsonrpc"), false, "raw protocol envelopes stay out of the detail view");
+	assert.equal(view.join("\n").includes("FILE ONLY"), false, "the capture file is never a display source");
+	rmSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"));
+	assert.deepEqual(tui.input("r"), { consume: true });
+	assert.ok(tui.last()!.some((line) => line.includes("Drafting the answer")), "deleting the capture file changes nothing the operator sees");
 	const answer = store.retainRuntimeContent(Buffer.from("The corpus says: forty-two.\nSecond line.\n"));
 	store.settleRuntimeAttempt({ attemptKey: worker.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "research", answer, sources: [] }, observation: { sessionId: worker.identity.sessionName, requestId: "1", sessionOrigin: "created", captureStatus: "complete", manifest: null } });
 	assert.deepEqual(tui.input("r"), { consume: true });
@@ -332,9 +360,10 @@ test("a retained answer larger than the preview limit still renders as a bounded
 	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
 	const tui = fakeTui();
 	const run = newRun(store, "long-answer");
-	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-long");
+	setPaneReaderForTests(stubPaneReader);
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-long", { transport: "herdr" });
 	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
-	writeFileSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"), `${streamLine("Still streaming")}\n`, { mode: 0o600 });
+	panes.set(worker.paneId!, "Still streaming\n");
 	// 4 KiB of ASCII, then a multi-byte character straddling the 4096-byte boundary, then far more text.
 	const body = `${"x".repeat(4095)}\u00e9${"y\n".repeat(8000)}VERDICT: PASS\n`;
 	const answer = store.retainRuntimeContent(Buffer.from(body));
@@ -851,4 +880,40 @@ test("a cancellation in flight cannot be aborted, confirmed twice, or closed ove
 	assert.match(tui.notices.at(-1)!, /^run .* cancelled: cancelled 1 worker \(worker-slow\)$/);
 	assert.equal(agentListState().confirming, null);
 	store.close();
+});
+
+test("a worker that publishes no stream says so, and no display path reads the worker's stream file", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "agent-list-no-terminal-")); dirs.push(dir);
+	const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+	setPaneReaderForTests(stubPaneReader);
+	const tui = fakeTui();
+	const run = newRun(store, "no-terminal");
+	const worker = registerWorker(store, dir, run.runId, run.operationId, "worker-headless");
+	assert.equal(worker.paneId, null, "a headless worker registers no pane");
+	noteRegisteredAttempt(store, tui.ctx, { attemptKey: worker.attemptKey, runId: run.runId, operationId: run.operationId }, 60, actions);
+	// A stream file full of renderable events: the view must never read it, whatever it cannot show.
+	writeFileSync(join(worker.attemptDir, "runtime-output", "worker.stdout.ndjson"), `${streamLine("FILE ONLY: never displayed")}\n`, { mode: 0o600 });
+	await refreshAgentListLiveViews(store);
+	select(tui, 1);
+	const view = tui.last()!;
+	assert.ok(view.includes(`  ${LIVE_VIEW_UNAVAILABLE}`), view.join("\n"));
+	assert.ok(view.includes("  (no answer yet: the worker is still running)"), view.join("\n"));
+	assert.equal(view.join("\n").includes("FILE ONLY"), false, "the stream file is never displayed");
+	assert.deepEqual(paneReads, [], "a worker with no pane is not read as a terminal");
+	assert.equal(watchRun(store, run.runId).agents[0]!.paneId, null, "the watch view reports the absent terminal too");
+	assert.match(renderWatch(watchRun(store, run.runId)), /no live output yet/, "and the watch view says the same rather than showing a file");
+	store.close();
+});
+
+test("no display path contains a reader of the worker's stream file", () => {
+	const root = join(import.meta.dirname, "..");
+	for (const name of ["agent-list.ts", "index.ts"]) {
+		const source = readFileSync(join(root, name), "utf8");
+		assert.equal(source.includes("worker.stdout.ndjson"), false, `${name} must not name the worker's stream file`);
+		assert.equal(/\breadTail\b/.test(source), false, `${name} must not carry a stream-file tail reader`);
+	}
+	// The live source is the pane, through the one reader both display paths share.
+	for (const name of ["agent-list.ts", "index.ts"]) {
+		assert.match(readFileSync(join(root, name), "utf8"), /paneLines\(/, `${name} reads the pane`);
+	}
 });
