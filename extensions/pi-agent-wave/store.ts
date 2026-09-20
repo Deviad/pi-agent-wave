@@ -1,6 +1,6 @@
 import { Database } from "./sqlite.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { decideTransition, graphDefinition } from "./graph-core.ts";
@@ -17,6 +17,11 @@ import type {
 	EventRow,
 	FrozenPolicy,
 	GraphKind,
+	LedgerAggregateRow,
+	LedgerClaimRow,
+	LedgerEntryInput,
+	LedgerEntryRow,
+	LedgerFinding,
 	ModelPolicyInput,
 	NodeName,
 	OperationRow,
@@ -30,10 +35,25 @@ import type {
 	RunStatus,
 	SliceSpec,
 	StateRow,
+	StoryLedgerAudit,
 } from "./types.ts";
+import { LEDGER_CLAIM_STATUSES, LEDGER_OUTCOMES } from "./types.ts";
 
-export const DEFAULT_GRAPH_HOME = join(homedir(), ".cache", "delegate-graph");
+/**
+ * Durable home for graph runs, retained content and diagnostics. Deliberately not a cache directory:
+ * the store is the single source of truth for a story's execution record, and `prune` cascades, so a
+ * reclamable location would let the trail be deleted as if it were scratch. `DELEGATE_GRAPH_DB` is
+ * the documented override; tests and drivers point it at a temporary file.
+ */
+export const DEFAULT_GRAPH_HOME = join(homedir(), ".local", "share", "delegate-graph");
 export const DEFAULT_DB_PATH = join(DEFAULT_GRAPH_HOME, "delegate-graph.db");
+
+/**
+ * The schema version this build migrates to. Tests pin the store against this rather than a literal,
+ * and `migrate()` refuses a build whose migrations stop short of it, so forgetting to bump it is a
+ * loud failure instead of a store that silently reports an older version.
+ */
+export const CURRENT_SCHEMA_VERSION = 12;
 
 export interface StoreOptions {
 	dbPath?: string;
@@ -389,6 +409,10 @@ export class GraphStore {
 		this.migrateToV9();
 		this.migrateToV10();
 		this.migrateToV11();
+		this.migrateToV12();
+		if (this.schemaVersion() !== CURRENT_SCHEMA_VERSION) {
+			throw new Error(`store migrated to schema v${this.schemaVersion()}, but this build expects v${CURRENT_SCHEMA_VERSION}`);
+		}
 	}
 
 	private schemaVersion(): number {
@@ -819,6 +843,59 @@ export class GraphStore {
 		try {
 			if (this.schemaVersion() >= 11) { this.db.exec("ROLLBACK"); return; }
 			this.db.exec("DROP TABLE IF EXISTS runtime_adapters; INSERT OR REPLACE INTO schema_version(version) VALUES (11)");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
+	/**
+	 * v12 makes the store the single source of truth for a story's execution record.
+	 *
+	 * The ledger tables carry no foreign key to `runs` on purpose. `prune` deletes runs and cascades,
+	 * so a reference would either take the story's record with the run or block the prune. `run_id` is
+	 * kept as a value instead: that is what lets a story outlive the run that produced it. Claims
+	 * cascade from their entry, because they are part of it rather than a record of their own.
+	 */
+	private migrateToV12(): void {
+		if (this.schemaVersion() >= 12) return;
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			if (this.schemaVersion() >= 12) { this.db.exec("ROLLBACK"); return; }
+			this.db.exec(`
+				CREATE TABLE IF NOT EXISTS ledger_entries (
+					id TEXT PRIMARY KEY,
+					story TEXT NOT NULL,
+					sequence INTEGER NOT NULL CHECK(sequence > 0),
+					topic TEXT NOT NULL,
+					run_id TEXT NOT NULL,
+					tier TEXT NOT NULL,
+					model TEXT NOT NULL,
+					outcome TEXT NOT NULL CHECK(outcome IN ('accepted','blocked','failed')),
+					dispatched_at TEXT NOT NULL,
+					task TEXT NOT NULL
+				);
+				CREATE UNIQUE INDEX IF NOT EXISTS ledger_entries_sequence ON ledger_entries(story, sequence);
+				CREATE TABLE IF NOT EXISTS ledger_claims (
+					entry_id TEXT NOT NULL REFERENCES ledger_entries(id) ON DELETE CASCADE,
+					position INTEGER NOT NULL,
+					claim TEXT NOT NULL,
+					evidence TEXT NOT NULL,
+					status TEXT NOT NULL CHECK(status IN ('verified','unverified','unverified-recall')),
+					PRIMARY KEY (entry_id, position)
+				);
+				CREATE TABLE IF NOT EXISTS ledger_aggregates (
+					entry_id TEXT NOT NULL REFERENCES ledger_entries(id) ON DELETE CASCADE,
+					position INTEGER NOT NULL,
+					name TEXT NOT NULL,
+					numerator REAL NOT NULL,
+					denominator REAL NOT NULL,
+					percentage REAL NOT NULL,
+					PRIMARY KEY (entry_id, position)
+				);
+				INSERT OR REPLACE INTO schema_version(version) VALUES (12);
+			`);
 			this.db.exec("COMMIT");
 		} catch (error) {
 			this.db.exec("ROLLBACK");
@@ -1795,15 +1872,138 @@ export class GraphStore {
 		return path;
 	}
 
+	/**
+	 * Retain one record an operation produced, under the durable home rather than the transient run
+	 * directory, so removing that directory cannot lose it. Bytes are copied verbatim: a capture stream
+	 * is NDJSON read back as written, and re-serializing it would change what it reports.
+	 */
+	retainRunEvidence(runId: string, name: string, content: string | Buffer): string {
+		const path = join(dirname(this.dbPath), "evidence", runId, basename(name));
+		ensurePrivatePath(path);
+		writeFileSync(path, content, { mode: 0o600 });
+		chmodSync(path, 0o600);
+		return path;
+	}
+
+	/**
+	 * Append one story ledger entry, with its claims and aggregates, in a single transaction.
+	 *
+	 * The sequence is computed inside that transaction, which is what replaces the file ledger's
+	 * `.sequence-lock`: two writers cannot read the same maximum and insert the same number, because
+	 * `BEGIN IMMEDIATE` serializes them and the unique index refuses the loser rather than a gap.
+	 */
+	recordLedgerEntry(input: LedgerEntryInput): LedgerEntryRow {
+		if (!input.story.trim()) throw new Error("ledger entry requires a story");
+		if (!input.topic.trim()) throw new Error("ledger entry requires a topic");
+		if (!LEDGER_OUTCOMES.includes(input.outcome)) throw new Error(`unsupported ledger outcome ${input.outcome}`);
+		for (const claim of input.claims ?? []) {
+			if (!LEDGER_CLAIM_STATUSES.includes(claim.status)) throw new Error(`unsupported ledger claim status ${claim.status}`);
+		}
+		const id = randomUUID();
+		const dispatchedAt = input.dispatchedAt ?? this.iso();
+		const claims: LedgerClaimRow[] = (input.claims ?? []).map((claim, index) => ({ position: index + 1, claim: claim.claim, evidence: claim.evidence, status: claim.status }));
+		const aggregates: LedgerAggregateRow[] = (input.aggregates ?? []).map((aggregate, index) => ({ position: index + 1, ...aggregate }));
+		return this.transaction(() => {
+			const sequence = this.db.query<{ next: number }, [string]>("SELECT COALESCE(MAX(sequence),0)+1 AS next FROM ledger_entries WHERE story=?").get(input.story)?.next ?? 1;
+			this.db.query("INSERT INTO ledger_entries(id,story,sequence,topic,run_id,tier,model,outcome,dispatched_at,task) VALUES (?,?,?,?,?,?,?,?,?,?)")
+				.run(id, input.story, sequence, input.topic, input.runId, input.tier, input.model, input.outcome, dispatchedAt, input.task);
+			for (const claim of claims) {
+				this.db.query("INSERT INTO ledger_claims(entry_id,position,claim,evidence,status) VALUES (?,?,?,?,?)")
+					.run(id, claim.position, claim.claim, claim.evidence, claim.status);
+			}
+			for (const aggregate of aggregates) {
+				this.db.query("INSERT INTO ledger_aggregates(entry_id,position,name,numerator,denominator,percentage) VALUES (?,?,?,?,?,?)")
+					.run(id, aggregate.position, aggregate.name, aggregate.numerator, aggregate.denominator, aggregate.percentage);
+			}
+			return { id, story: input.story, sequence, topic: input.topic, runId: input.runId, tier: input.tier, model: input.model, outcome: input.outcome, dispatchedAt, task: input.task, claims, aggregates };
+		});
+	}
+
+	/** One story's execution record in sequence order, read back through the store rather than a file. */
+	storyLedger(story: string): LedgerEntryRow[] {
+		const entries = this.db
+			.query<{ id: string; story: string; sequence: number; topic: string; run_id: string; tier: string; model: string; outcome: LedgerEntryRow["outcome"]; dispatched_at: string; task: string }, [string]>(
+				"SELECT id,story,sequence,topic,run_id,tier,model,outcome,dispatched_at,task FROM ledger_entries WHERE story=? ORDER BY sequence")
+			.all(story);
+		return entries.map((entry) => ({
+			id: entry.id,
+			story: entry.story,
+			sequence: entry.sequence,
+			topic: entry.topic,
+			runId: entry.run_id,
+			tier: entry.tier,
+			model: entry.model,
+			outcome: entry.outcome,
+			dispatchedAt: entry.dispatched_at,
+			task: entry.task,
+			claims: this.db.query<LedgerClaimRow, [string]>("SELECT position,claim,evidence,status FROM ledger_claims WHERE entry_id=? ORDER BY position").all(entry.id)
+				.map((claim) => ({ position: claim.position, claim: claim.claim, evidence: claim.evidence, status: claim.status })),
+			aggregates: this.db.query<LedgerAggregateRow, [string]>("SELECT position,name,numerator,denominator,percentage FROM ledger_aggregates WHERE entry_id=? ORDER BY position").all(entry.id)
+				.map((aggregate) => ({ position: aggregate.position, name: aggregate.name, numerator: aggregate.numerator, denominator: aggregate.denominator, percentage: aggregate.percentage })),
+		}));
+	}
+
+	/**
+	 * Audit one story's record. The aggregate is recomputed from its own components rather than trusted,
+	 * because a stored percentage that disagrees with its numerator and denominator is exactly the defect
+	 * this check exists to surface, and imported history may hold one.
+	 */
+	auditStoryLedger(story: string): StoryLedgerAudit {
+		const entries = this.storyLedger(story);
+		const findings: LedgerFinding[] = [];
+		if (!entries.length) findings.push({ entry: story, code: "LEDGER_EMPTY", message: "no ledger entries for this story" });
+		entries.forEach((entry, index) => {
+			if (entry.sequence !== index + 1) findings.push({ entry: entry.id, code: "SEQUENCE_GAP", message: `sequence ${entry.sequence} sits at position ${index + 1}` });
+			for (const aggregate of entry.aggregates) {
+				if (!aggregate.name.trim() || !Number.isFinite(aggregate.numerator) || !Number.isFinite(aggregate.denominator) || aggregate.denominator === 0 || !Number.isFinite(aggregate.percentage)) {
+					findings.push({ entry: entry.id, code: "AGGREGATE_INVALID", message: `aggregate ${aggregate.position} incomplete or has a zero denominator` });
+					continue;
+				}
+				const expected = aggregate.numerator / aggregate.denominator * 100;
+				if (Math.abs(expected - aggregate.percentage) > 1e-9) {
+					findings.push({ entry: entry.id, code: "AGGREGATE_MISMATCH", message: `${aggregate.name}: recorded ${aggregate.percentage}, computed ${expected}` });
+				}
+			}
+		});
+		return { story, entries: entries.length, valid: findings.length === 0, findings };
+	}
+
+	/**
+	 * Delete settled runs older than the cutoff, and reclaim what those runs left on disk: their retained
+	 * evidence, their never-dispatched diagnostics, and the transient run directory of every operation
+	 * that registered a worker.
+	 *
+	 * A story's ledger entries are deliberately untouched. They hold no foreign key to `runs`, so a record
+	 * outlives the run that produced it, which is why the record survives while this evidence does not:
+	 * the entry is the story's history, the evidence files are the run's working residue. As a
+	 * consequence a settled outcome in the database names a path that stops resolving once its run is
+	 * pruned, which the storage documentation states rather than hides.
+	 *
+	 * The directories are resolved from `agents.acpx_cancel_script` before the rows are deleted, which is
+	 * exact — `cancel-acpx.sh` sits three levels below its run directory — rather than guessing at
+	 * `/tmp` names. Filesystem removal runs after the commit, so a failure there cannot resurrect a row
+	 * that a rollback would have kept while its files were already gone.
+	 */
 	prune(days: number): number {
 		if (!Number.isFinite(days) || days < 0) throw new Error("days must be non-negative");
 		const cutoff = new Date(this.now().getTime() - days * 86_400_000).toISOString();
 		const rows = this.db
 			.query<{ id: string }, [string]>("SELECT id FROM runs WHERE status IN ('terminal','blocked','cancelled') AND updated_at < ?")
 			.all(cutoff);
+		const runDirectories = new Set<string>();
+		for (const row of rows) {
+			const scripts = this.db.query<{ acpx_cancel_script: string | null }, [string]>("SELECT acpx_cancel_script FROM agents WHERE run_id=?").all(row.id);
+			for (const script of scripts) if (script.acpx_cancel_script) runDirectories.add(dirname(dirname(dirname(script.acpx_cancel_script))));
+		}
 		this.transaction(() => {
 			for (const row of rows) this.db.query("DELETE FROM runs WHERE id=?").run(row.id);
 		});
+		const home = dirname(this.dbPath);
+		for (const row of rows) {
+			rmSync(join(home, "evidence", row.id), { recursive: true, force: true });
+			rmSync(join(home, "failures", row.id), { recursive: true, force: true });
+		}
+		for (const directory of runDirectories) rmSync(directory, { recursive: true, force: true });
 		return rows.length;
 	}
 

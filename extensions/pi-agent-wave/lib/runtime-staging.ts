@@ -57,7 +57,7 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 	if (!input.attemptKey.trim() || !input.baseRevision.trim()) throw new Error("staging requires attempt and base identity");
 	const workspace = realpathSync(input.baseDir);
 	const before = snapshotDigest(input.snapshotPath);
-	const scratch = makeScratchDir("pi-wave-staging-");
+	const scratch = makeScratchDir(`pi-wave-staging-${process.pid}-`);
 	try {
 		const workingSnapshot = join(scratch, "snapshot.db");
 		copyFileSync(input.snapshotPath, workingSnapshot);
@@ -68,8 +68,9 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 		if (errors.length) throw new Error(agentFsAuditErrorMessage(errors));
 		if (!input.readOnly && audit.violations.length) throw new Error(`AgentFS contains unowned changes: ${audit.violations.map((item) => item.path).join(", ")}`);
 		const files: RuntimeContent[] = [];
-		const changes = (input.readOnly ? [] : audit.owned).map((change) => {
-			if (change.kind === "directory") throw new Error("directory staging requires directory integration support");
+		// Container directories carry no content of their own: an owned file's parents are created when it
+		// is applied, so staging the container would only ask integration for a change Git does not model.
+		const changes = (input.readOnly ? [] : audit.owned).filter((change) => change.kind !== "directory").map((change) => {
 			let after: RuntimeContent | null = null;
 			if (change.kind === "file") {
 				const result = spawnSync(input.agentFsExecutable, ["fs", workingSnapshot, "cat", `/${change.path}`], { shell: false, encoding: null, maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });

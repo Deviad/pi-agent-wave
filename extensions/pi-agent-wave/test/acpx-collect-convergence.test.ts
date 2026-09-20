@@ -2,7 +2,7 @@ import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GraphStore } from "../store.ts";
@@ -96,6 +96,11 @@ describe("provider preflight at dispatch", () => {
 			assert.ok(start, "the actual private launcher invocation must be observed");
 			const modeIndex = start.args.indexOf("--access-mode");
 			assert.deepEqual(start.args.slice(modeIndex, modeIndex + 2), ["--access-mode", graph === "build" ? "read-only" : "owned-write"]);
+			// `init` creates the run directory before the launch, and no collect will ever run for a blocked
+			// dispatch, so the block must remove the directory it created rather than leave it to accumulate.
+			const runDir = start.args[start.args.indexOf("start") + 1];
+			assert.ok(String(runDir).includes("delegate-graph-herdr-"), `expected a run directory, got ${runDir}`);
+			assert.equal(existsSync(String(runDir)), false, "a blocked dispatch must leave no run directory behind");
 		} finally {
 			Object.assign(process.env, saved);
 		}
@@ -114,9 +119,12 @@ describe("terminated attempt convergence", () => {
 			assert.equal(collected.error, undefined, `collect must converge, got ${JSON.stringify(collected)}`);
 			assert.equal(collected.settled, true);
 			assert.equal(collected.attempt.processState, "failed");
-			assert.equal(collected.diagnosticsPath, started.diagnosticsPath, "the retained diagnostic bundle must be named to the supervisor");
+			assert.equal(basename(String(collected.diagnosticsPath)), basename(started.diagnosticsPath), "the retained diagnostic bundle must be named to the supervisor");
+			assert.ok(String(collected.diagnosticsPath).includes(join("evidence", started.runId)), "the settled bundle must name the durable copy, not the removed run directory");
+			assert.equal(existsSync(String(collected.diagnosticsPath)), true, "the named bundle must still exist after the run directory is removed");
+			assert.equal(existsSync(started.privateRunDir), false, "a settled operation leaves no run directory");
 			assert.ok(String(collected.reason).length > 0, "the launcher reason must be reported");
-			assert.match(String(collected.attempt.outcome.error), new RegExp(`retained worker diagnostics: ${started.diagnosticsPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the settled outcome must name the retained bundle");
+			assert.match(String(collected.attempt.outcome.error), new RegExp(`retained worker diagnostics: ${String(collected.diagnosticsPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the settled outcome must name the retained bundle it points at, not a path that is about to be deleted");
 			// The fact is settled; the operation stays on its failed attempt until the runtime replaces it.
 			assert.equal(collected.operation.status, "running");
 			const retried = parsed(await started.tool.execute("retry", { op: "retry", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
@@ -183,7 +191,8 @@ describe("terminated attempt convergence", () => {
 			assert.equal(collected.settled, true);
 			assert.equal(collected.attempt.processState, "failed");
 			assert.equal(collected.reason, "attempt aborted before cleanup", "the launcher's recorded reason is the settled reason");
-			assert.equal(collected.diagnosticsPath, started.diagnosticsPath);
+			assert.equal(basename(String(collected.diagnosticsPath)), basename(started.diagnosticsPath));
+			assert.equal(existsSync(started.privateRunDir), false, "a torn-down attempt's directory is removed once it settles");
 			assert.equal(invocations.some((call) => call.args.some((arg) => arg.endsWith("delegate.ts"))), false, "no wait may be spawned for a torn-down attempt");
 			const again = parsed(await started.tool.execute("collect", { op: "collect", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(again.error, undefined, `a repeated collect must be a no-op, got ${JSON.stringify(again)}`);

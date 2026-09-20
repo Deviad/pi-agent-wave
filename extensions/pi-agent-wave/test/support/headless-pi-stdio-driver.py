@@ -23,6 +23,8 @@ resource = {
     "headless_stdout": str(root / "stdout"),
     "headless_stderr": str(root / "stderr"),
     "headless_status": str(root / "status.json"),
+    "stream_token": str(root / "stream-token"),
+    "stream_endpoint": str(root / "stream-endpoint.json"),
 }
 started = time.monotonic()
 pid = launch_headless_worker(resource, {**os.environ, "FIXTURE_RESULT": str(result)})

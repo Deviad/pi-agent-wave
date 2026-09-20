@@ -21,6 +21,13 @@ import time
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+# Some callers load this module by file path rather than by name, so the sibling import cannot rely on
+# the caller having put this directory on the path.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from stream_endpoint import probe_stream_endpoint
+
 RESOLVER = SCRIPT_DIR / "resolve-model.mjs"
 ACPX_WORKER = SCRIPT_DIR / "acpx-worker.ts"
 RUNTIME_SETTLE = SCRIPT_DIR / "runtime-settle.ts"
@@ -829,6 +836,10 @@ def prepare_acpx_attempt(
 
 
 def launch_headless_worker(resource: dict[str, Any], environment: dict[str, str]) -> int:
+    # A headless worker has no pane, so the supervisor publishes its stdout live. Binding is probed here,
+    # before the launch, so an unavailable loopback is a named blocker rather than a worker that starts
+    # and then cannot be watched.
+    probe_stream_endpoint()
     process = subprocess.Popen([
         sys.executable, str(HEADLESS_SUPERVISOR),
         "--launcher", str(resource["worker_launcher"]),
@@ -836,6 +847,8 @@ def launch_headless_worker(resource: dict[str, Any], environment: dict[str, str]
         "--stdout", str(resource["headless_stdout"]),
         "--stderr", str(resource["headless_stderr"]),
         "--status", str(resource["headless_status"]),
+        "--stream-token", str(resource["stream_token"]),
+        "--stream-endpoint", str(resource["stream_endpoint"]),
     ], cwd=Path(str(resource["sandbox_base"])), env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return process.pid
 
@@ -917,6 +930,8 @@ def command_start(args: argparse.Namespace) -> None:
         "transport": ACTIVE_TRANSPORT,
         "pane": pane_id,
         "worker_pid": None,
+        "stream_token": str(run_dir / f"headless-{slugify(agent_name)}.stream-token"),
+        "stream_endpoint": str(run_dir / f"headless-{slugify(agent_name)}.stream-endpoint.json"),
         "headless_stdout": str(run_dir / f"headless-{slugify(agent_name)}.stdout"),
         "headless_stderr": str(run_dir / f"headless-{slugify(agent_name)}.stderr"),
         "headless_status": str(run_dir / f"headless-{slugify(agent_name)}.status.json"),
@@ -1443,6 +1458,28 @@ def _read_text_tail(path: Path, limit: int) -> str:
     return redact_failure_text(text[-limit:])
 
 
+def read_settlement_evidence(evidence_path: Path) -> dict[str, Any] | None:
+    """The settlement record the runtime wrote, or None when it is absent or unreadable."""
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return evidence if isinstance(evidence, dict) else None
+
+
+def _stream_tail(path: Path, limit: int) -> str:
+    """The final `limit` stream lines, each truncated to the diagnostic event window and redacted.
+
+    Lines are kept as written rather than parsed: the stream is NDJSON whose unparsable lines are exactly what a
+    capture failure needs to show, so a line that is not JSON is retained as text instead of being dropped.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "".join(f"{redact_failure_text(line)[:FAILURE_DIAGNOSTIC_EVENT_CHARS]}\n" for line in lines[-limit:])
+
+
 def _recent_worker_events(path: Path, limit: int) -> list[object]:
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1538,6 +1575,7 @@ def abort_acpx_attempt(resource: dict[str, Any], cancel_attempt: Any = run_struc
                 resource["session_closure"] = "cancel-proved"
         except Exception as error:
             failures.append(f"ACPX cancel/close error: {without_target_paths(str(error))}")
+    failures.extend(release_agentfs_session(resource))
     remaining_links = [Path(str(link.get("link") if isinstance(link, dict) else link)) for link in resource.get("provider_links", []) if str(link)]
     # Absence is the desired teardown end state, so integrity is only verified while a link is still there.
     if any(os.path.lexists(link) for link in remaining_links):
@@ -1563,6 +1601,37 @@ def abort_acpx_attempt(resource: dict[str, Any], cancel_attempt: Any = run_struc
             remove_tree(owned_directory)
         if owned_directory.exists():
             failures.append(f"owned directory still exists: {owned_directory}")
+    return failures
+
+
+def agentfs_mount_points(resource: dict[str, Any]) -> list[str]:
+    """Mount points whose path lies under this attempt's private AgentFS home."""
+    home = str(resource.get("agentfs_home", "")).strip()
+    if not home:
+        return []
+    points: list[str] = []
+    for line in run(["mount"], check=False).stdout.splitlines():
+        if " on " not in line or home not in line:
+            continue
+        point = line.split(" on ", 1)[1].rsplit(" (", 1)[0].strip()
+        if point:
+            points.append(point)
+    return points
+
+
+def release_agentfs_session(resource: dict[str, Any]) -> list[str]:
+    """Unmount the AgentFS mount a cancelled or killed worker leaves behind.
+
+    ``agentfs run`` unmounts on a clean exit, but a worker that is cancelled or killed leaves an NFS
+    mount to 127.0.0.1 that outlives its run directory: the path then hangs every read and macOS
+    reports ``Server connections interrupted``. ``agentfs prune mounts`` refuses to run off Linux, so
+    the mount is located from ``mount`` output and released with the host's own force unmount.
+    """
+    failures: list[str] = []
+    for point in agentfs_mount_points(resource):
+        result = run(["umount", "-f", point], check=False)
+        if result.returncode != 0 and Path(point).is_mount():
+            failures.append(f"AgentFS mount release failed: {without_target_paths(str(result.stderr or result.stdout).strip())}")
     return failures
 
 
@@ -1619,7 +1688,12 @@ def cleanup_absence_inventory(resource: dict[str, Any], tabs_output: str, pane_e
 
 def verify_cleanup_absence(run_dir: Path, resource: dict[str, Any], evidence_writer: Any = write_private) -> Path:
     if using_herdr():
-        tabs = run(["herdr", "tab", "list", "--workspace", os.environ["HERDR_WORKSPACE_ID"]], check=False)
+        # An absence audit that cannot enumerate the workspace must say so: reading the variable directly
+        # raised KeyError, and falling back to the resource's own tab would report a tab present.
+        workspace = os.environ.get("HERDR_WORKSPACE_ID", "").strip()
+        if not workspace:
+            raise DelegateError("cleanup absence audit cannot verify Herdr tab absence: HERDR_WORKSPACE_ID is not set")
+        tabs = run(["herdr", "tab", "list", "--workspace", workspace], check=False)
         pane = run(["herdr", "pane", "get", str(resource["pane"])], check=False)
         agent = run(["herdr", "agent", "get", str(resource["agent"])], check=False)
         tabs_output = tabs.stdout if tabs.returncode == 0 else str(resource["tab"])
@@ -1664,7 +1738,7 @@ def command_wait(args: argparse.Namespace) -> None:
 
 
 def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_path: Path) -> Path | None:
-    """Keep the raw worker stream as private evidence when capture was not complete or produced no candidate.
+    """Keep a bounded tail of the worker stream as private evidence when capture was not complete or produced no candidate.
 
     The attempt directory is removed after a clean settlement, which left the 2026-09-12 operations smoke 3 with an
     exited, candidate-less synthesis attempt (`output-outside-prompt`) and nothing to diagnose it from.
@@ -1672,12 +1746,15 @@ def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_
     A prompt worker's stream is written by RuntimeOutputFiles beside its result file, not at the attempt-directory
     path the worker configuration names; that path only carries a `close` run. Both are searched, nearest first,
     which is why run_74d142d5 (2026-09-16) retained nothing for exactly the failure this function exists to explain.
+
+    The retained window is the failure bundle's own: the last FAILURE_DIAGNOSTIC_EVENT_LIMIT lines, each capped at
+    FAILURE_DIAGNOSTIC_EVENT_CHARS. A stream runs to the 16 MB RuntimeOutputFiles cap, and nothing automated reads
+    this file, so copying it whole put an unbounded artifact in durable storage for a human-sized diagnostic need.
     """
-    try:
-        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    evidence = read_settlement_evidence(evidence_path)
+    if evidence is None:
         return None
-    observation = evidence.get("observation") if isinstance(evidence, dict) else None
+    observation = evidence.get("observation")
     status = observation.get("captureStatus") if isinstance(observation, dict) else None
     if status == "complete" and evidence.get("candidate") is not None:
         return None
@@ -1688,7 +1765,7 @@ def retain_incomplete_capture(run_dir: Path, resource: dict[str, Any], evidence_
     if source is None:
         return None
     retained = run_dir / f"runtime-capture-{slugify(str(resource['agent']))}.ndjson"
-    write_private_bytes(retained, source.read_bytes())
+    write_private(retained, _stream_tail(source, FAILURE_DIAGNOSTIC_EVENT_LIMIT))
     return retained
 
 
@@ -1753,6 +1830,14 @@ def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str,
             error = DelegateError(f"{error}\n" + "\n".join(cleanup_failures))
         raise error
     capture_retained = retain_incomplete_capture(run_dir, resource, evidence_path)
+    # An attempt that settles cleanly but retains no candidate is a failure the bounded capture tail alone
+    # cannot explain: the bundle carries the worker result, terminal kind, exit and stderr tail beside it.
+    settled_evidence = read_settlement_evidence(evidence_path)
+    diagnostics_retained = (
+        write_failure_diagnostics(resource, "attempt settled without a candidate")
+        if settled_evidence is None or settled_evidence.get("candidate") is None
+        else None
+    )
     session_closed = False
     provider_links_verified = False
     try:
@@ -1771,6 +1856,7 @@ def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str,
         shutil.rmtree(Path(str(resource["acpx_home"])), ignore_errors=True)
     cleanup_evidence: Path | None = None
     try:
+        post_settlement_failures.extend(release_agentfs_session(resource))
         cleanup_evidence = verify_cleanup_absence(run_dir, resource)
     except DelegateError as error:
         post_settlement_failures.append(str(error))
@@ -1780,6 +1866,7 @@ def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str,
         "resultContract": "runtime-v1",
         "settlementEvidencePath": str(evidence_path),
         "captureRetainedPath": str(capture_retained) if capture_retained else None,
+        "diagnosticsPath": str(diagnostics_retained) if diagnostics_retained else None,
         "cleanupEvidencePath": str(cleanup_evidence) if cleanup_evidence else None,
         "sessionClosed": session_closed,
         "providerLinksVerified": provider_links_verified,

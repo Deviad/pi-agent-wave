@@ -156,24 +156,3 @@ export class AcpxRenderer {
 		if (tail) this.write(tail);
 	}
 }
-
-export interface AcpxStreamSummary {
-	/** The last rendered line, truncated; null when nothing renderable arrived yet. */
-	readonly lastActivity: string | null;
-	/** The most recent rendered lines, oldest first. */
-	readonly recent: readonly string[];
-	readonly prompts: number;
-	readonly toolCalls: number;
-	readonly textBytes: number;
-}
-
-/** Summarizes a captured stream for a watch view; pure and bounded, never a decision input. */
-export function summarizeAcpxStream(stream: string, recentLimit = 5, lineLimit = 160): AcpxStreamSummary {
-	const state = createRenderState();
-	let buffer = "";
-	for (const line of stream.split("\n")) buffer += renderAcpxLine(line, state, { color: false });
-	buffer += leave(state);
-	const lines = buffer.split("\n").map((line) => line.trimEnd()).filter((line) => line.trim().length > 0)
-		.map((line) => line.length > lineLimit ? `${line.slice(0, lineLimit - 1)}${ELLIPSIS}` : line);
-	return { lastActivity: lines.at(-1) ?? null, recent: lines.slice(-recentLimit), prompts: state.prompts, toolCalls: state.toolCalls, textBytes: state.textBytes };
-}

@@ -149,7 +149,52 @@ print(json.dumps({'hasExportConfig': 'export_config' in resource, 'snapshot': re
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});
 
-	test("an incomplete capture retains the prompt worker's own stream, and a clean settlement retains nothing", () => {
+	test("a clean settlement that retains no candidate still writes a failure bundle, so the bounded tail is never the only artifact", () => {
+		const root = mkdtempSync(join(tmpdir(), "runtime-py-no-candidate-"));
+		try {
+			const result = python(prelude + `
+os.environ['DELEGATE_GRAPH_DB'] = str(root / 'graph.db')
+args = core.build_parser().parse_args(['start', str(private), 'searcher', '--node', 'search', '--model', model, '--access-mode', 'read-only'])
+resource, _ = core.prepare_acpx_attempt(private, args, {'run_label': 'candidate-less-fixture'}, 'fixture-worker', model, task, 'search')
+resource.update({'run_dir': str(private), 'agent': 'fixture-worker', 'role': 'searcher', 'node': 'search', 'operation_id': 'op-candidate-less', 'tab': None, 'pane': None, 'worker_pid': None})
+attempt = Path(resource['attempt_dir'])
+output_dir = attempt / 'runtime-output'; output_dir.mkdir(mode=0o700)
+(output_dir / 'public-answer.txt').write_text(''); (output_dir / 'public-answer.txt').chmod(0o600)
+(attempt / 'worker.stderr.txt').write_text('acpx: the reply arrived outside the prompt turn\\n'); (attempt / 'worker.stderr.txt').chmod(0o600)
+# The shape the 2026-09-12 operations smoke 3 lost: the worker exited cleanly and captured no answer at all.
+worker_result = {'schemaVersion': 2, 'resultContract': 'runtime-v1', 'agent': 'codex', 'selectedModel': model, 'sessionName': resource['acpx_session'], 'attemptKey': resource['acpx_attempt_key'], 'outputDir': str(output_dir),
+  'output': {'schemaVersion': 1, 'attemptKey': resource['acpx_attempt_key'], 'sessionId': resource['acpx_session'], 'outcome': {'kind': 'exited', 'exitCode': 0},
+             'capture': {'requestId': '3', 'sessionId': 'acp-created', 'sessionOrigin': 'created', 'captureStatus': 'empty', 'responseCompleteness': 'unverified', 'inputBytes': 1, 'answerBytes': 0, 'publicChunks': 0, 'ignoredEvents': 2, 'peakBufferedBytes': 0, 'diagnostics': []}, 'stderrTruncated': False}}
+Path(resource['worker_result']).write_text(json.dumps(worker_result))
+core.observe_presentation_identity = lambda r: {'presentationVerified': True, 'identityMatches': True, 'transport': 'headless', 'herdrVisible': False}
+core.close_acpx_attempt = lambda r: {'closed': True, 'noSession': True}
+core.verify_provider_links = lambda *a, **k: True
+core.abort_acpx_attempt = lambda r, **k: []
+core.verify_cleanup_absence = lambda run_dir, r, **k: (run_dir / 'cleanup-fixture-worker.json')
+audit = core.settle_runtime_attempt(private, resource)
+evidence = json.loads(Path(audit['settlementEvidencePath']).read_text())
+bundle_path = Path(audit['diagnosticsPath']) if audit['diagnosticsPath'] else None
+bundle = json.loads(bundle_path.read_text()) if bundle_path else None
+print(json.dumps({'candidate': evidence['candidate'], 'diagnosticsPath': audit['diagnosticsPath'],
+  'bundleName': bundle_path.name if bundle_path else None, 'inRunDir': bool(bundle_path) and bundle_path.parent == private,
+  'mode': oct(bundle_path.stat().st_mode & 0o777) if bundle_path else None,
+  'reason': bundle['reason'] if bundle else None, 'operationId': bundle['operationId'] if bundle else None,
+  'stderrTail': bundle['stderrTail'] if bundle else None, 'failures': audit['postSettlementFailures']}))
+`, root);
+			assert.equal(result.status, 0, result.stderr);
+			const out = JSON.parse(result.stdout);
+			assert.equal(out.candidate, null, "the fixture settles with no candidate");
+			assert.deepEqual(out.failures, [], "the settlement itself is clean; only the candidate is missing");
+			assert.ok(out.diagnosticsPath, "a candidate-less settlement must retain a failure bundle");
+			assert.equal(out.bundleName, "failure-op-candidate-less.json", "the bundle is named for the operation");
+			assert.equal(out.inRunDir, true);
+			assert.equal(out.mode, "0o600");
+			assert.match(String(out.reason), /settled without a candidate/);
+			assert.match(String(out.stderrTail), /outside the prompt turn/, "the bundle carries what the bounded tail cannot: the worker's stderr");
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
+
+	test("an incomplete capture retains a bounded tail of the worker's stream, and a clean settlement retains nothing", () => {
 		const root = mkdtempSync(join(tmpdir(), "runtime-py-capture-"));
 		try {
 			const result = python(prelude + `
@@ -161,7 +206,9 @@ attempt = Path(resource['attempt_dir'])
 # The prompt-mode worker writes its stream where RuntimeOutputFiles puts it, beside the result file.
 output_dir = Path(resource['worker_result']).parent / 'runtime-output'; output_dir.mkdir(mode=0o700, exist_ok=True)
 stream = output_dir / 'worker.stdout.ndjson'
-stream.write_text('{"method":"session/update"}\\n'); stream.chmod(0o600)
+# Far more events than the diagnostic window keeps, so a wholesale copy is distinguishable from a tail.
+event_total = core.FAILURE_DIAGNOSTIC_EVENT_LIMIT * 5
+stream.write_text(''.join(json.dumps({'method': 'session/update', 'seq': index}) + '\\n' for index in range(event_total))); stream.chmod(0o600)
 evidence_path = private / 'runtime-settlement-fixture-worker.json'
 
 def write_evidence(status, candidate):
@@ -172,9 +219,16 @@ retained = core.retain_incomplete_capture(private, resource, evidence_path)
 write_evidence('complete', {'kind': 'research'})
 clean_target = private / 'runtime-capture-fixture-worker-clean.ndjson'
 clean = core.retain_incomplete_capture(private, resource, evidence_path)
+retained_lines = Path(retained).read_text().splitlines() if retained else []
 print(json.dumps({
   'retained': str(retained) if retained else None,
-  'contents': Path(retained).read_text() if retained else None,
+  'lines': len(retained_lines),
+  'limit': core.FAILURE_DIAGNOSTIC_EVENT_LIMIT,
+  'sourceLines': event_total,
+  'retainedBytes': Path(retained).stat().st_size if retained else None,
+  'sourceBytes': stream.stat().st_size,
+  'first': retained_lines[0] if retained_lines else None,
+  'last': retained_lines[-1] if retained_lines else None,
   'mode': oct(Path(retained).stat().st_mode & 0o777) if retained else None,
   'inRunDir': bool(retained) and Path(retained).parent == private,
   'cleanRetained': str(clean) if clean else None,
@@ -186,8 +240,13 @@ print(json.dumps({
 			assert.ok(out.retained, "an incomplete capture with no candidate must retain the worker stream");
 			assert.match(String(out.retained), /runtime-capture-fixture-worker\.ndjson$/);
 			assert.equal(out.inRunDir, true);
-			assert.equal(out.contents, '{"method":"session/update"}\n');
 			assert.equal(out.mode, "0o600");
+			// The bound is the failure bundle's own event window, and the tail is the end of the stream,
+			// which is where the evidence for an incomplete capture is.
+			assert.equal(out.lines, out.limit, "the retained capture is bounded by the diagnostic event window");
+			assert.ok(out.retainedBytes < out.sourceBytes, `a bounded tail is smaller than the stream: ${out.retainedBytes} of ${out.sourceBytes}`);
+			assert.equal(JSON.parse(String(out.last)).seq, out.sourceLines - 1, "the tail ends at the stream's final event");
+			assert.equal(JSON.parse(String(out.first)).seq, out.sourceLines - out.limit, "the tail starts one window back, not at the stream's head");
 			assert.equal(out.cleanRetained, null, "a complete capture carrying a candidate retains nothing");
 		} finally { rmSync(root, { recursive: true, force: true }); }
 	});

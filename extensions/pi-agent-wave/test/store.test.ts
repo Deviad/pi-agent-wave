@@ -482,7 +482,7 @@ describe("SQLite state store", () => {
 		store.close();
 	});
 
-	test("migrates a v1 database to v5 preserving existing rows", () => {
+	test("migrates a v1 database to the current version preserving existing rows", () => {
 		const dir = mkdtempSync(join(tmpdir(), "delegate-graph-v1-"));
 		dirs.push(dir);
 		const dbPath = join(dir, "graph.db");
@@ -519,11 +519,18 @@ describe("SQLite state store", () => {
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM operations WHERE id='op_v1'").get()?.selected_model).toBe(null);
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM agents WHERE id='agent_v1'").get()?.selected_model).toBe(null);
 		const version = db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get();
-		expect(version?.version).toBe(11);
+		expect(version?.version).toBe(12);
+		// v12 is additive, so the oldest supported schema must gain the ledger tables without any
+		// historical row changing, which is what the counts above already pin for runs and events.
+		for (const table of ["ledger_entries", "ledger_claims", "ledger_aggregates"]) {
+			expect(db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table)?.name).toBe(table);
+		}
 		db.close();
 		migrated.close();
 		const reopened = new GraphStore({ dbPath });
 		expect(reopened.policy("run_v1").input).toEqual({ kind: "auto" });
+		expect(reopened.recordLedgerEntry({ story: "legacy", topic: "migrated", runId: "run_v1", tier: "coding", model: "alibaba/deepseek-v4.1-flash", outcome: "accepted", task: "Legacy task" }).sequence).toBe(1);
+		expect(reopened.auditStoryLedger("legacy").valid).toBe(true);
 		reopened.close();
 	});
 

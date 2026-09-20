@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 // it is started from the repository root or the package directory.
 const DRIVER = new URL("./support/acpx-cleanup-driver.py", import.meta.url).pathname;
 
-function driver(mode: "abort" | "default-cancel" | "persistence" | "inventory" | "teardown" | "closure" | "live", name: string): Record<string, unknown> {
+function driver(mode: "abort" | "default-cancel" | "persistence" | "inventory" | "teardown" | "closure" | "live" | "mount-leak" | "herdr-unverifiable", name: string): Record<string, unknown> {
 	const result = spawnSync("python3", [DRIVER, mode, name], { cwd: process.cwd(), encoding: "utf8" });
 	assert.equal(result.status, 0, result.stderr);
 	return JSON.parse(result.stdout);
@@ -127,6 +127,21 @@ describe("ACPX AgentFS targeted cleanup", () => {
 
 	test("fails closed on Herdr pane release by rejecting the remaining pane", () => {
 		assert.ok((driver("inventory", "pane").falseFields as string[]).includes("paneAbsent"));
+	});
+
+	test("releases an AgentFS mount a killed worker left behind", () => {
+		const result = driver("mount-leak", "leak");
+		if (result.skipped === true) return console.log(`skipped: ${String(result.reason)}`);
+		assert.ok(Number(result.mountSeen) >= 1, "the probe must see a real AgentFS mount before it kills the worker");
+		assert.ok(Number(result.leakedAfterKill) >= 1, "a killed worker must leave the mount it cannot unmount itself");
+		assert.deepEqual(result.failures, [], "releasing a mounted attempt must not report a failure");
+		assert.deepEqual(result.remaining, [], "the release step must leave no AgentFS mount for the attempt");
+	});
+
+	test("fails closed when a Herdr absence audit has no workspace identity", () => {
+		const result = driver("herdr-unverifiable", "herdr-unverifiable");
+		assert.equal(result.failed, true, "an unverifiable tab absence must never be reported as absence");
+		assert.match(String(result.error), /HERDR_WORKSPACE_ID is not set/);
 	});
 
 	test("fails closed on cleanup-evidence persistence failure", () => {

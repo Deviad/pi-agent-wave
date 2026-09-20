@@ -1,8 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
-import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { summarizeAcpxStream } from "./lib/acpx-render.ts";
+import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import type { RuntimeAttempt } from "./lib/runtime-results.ts";
 import type { GraphStore } from "./store.ts";
@@ -15,7 +13,7 @@ import type { GraphStore } from "./store.ts";
  */
 
 export const AGENT_LIST_WIDGET = "delegate-graph-agents";
-const STREAM_TAIL_BYTES = 64 * 1024;
+const LIVE_OUTPUT_LINES = 12;
 const ANSWER_LIMIT_BYTES = 4 * 1024;
 const TASK_LIMIT = 240;
 
@@ -106,19 +104,6 @@ function sameItem(a: CursorItem | null, b: CursorItem): boolean {
 const entries: AgentListEntry[] = [];
 let session: AgentListSession | null = null;
 
-/** The last bytes of a file, so a long stream is summarized without reading all of it. */
-function readTail(path: string, limit: number): string {
-	const size = statSync(path).size;
-	const start = Math.max(0, size - limit);
-	const fd = openSync(path, "r");
-	try {
-		const buffer = Buffer.alloc(size - start);
-		readSync(fd, buffer, 0, buffer.length, start);
-		const text = buffer.toString("utf8");
-		return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
-	} finally { closeSync(fd); }
-}
-
 /** Decodes a byte prefix without emitting a replacement character for a multi-byte sequence cut at the boundary. */
 export function decodePrefix(bytes: Uint8Array): string {
 	return new TextDecoder("utf-8").decode(bytes, { stream: true });
@@ -147,26 +132,21 @@ export function processLabel(attempt: RuntimeAttempt): string {
 	}
 }
 
-function streamPathFor(store: GraphStore, attempt: RuntimeAttempt): string | null {
-	const agent = attempt.agentId ? store.agents(attempt.runId).find((row) => row.id === attempt.agentId) : undefined;
-	if (!agent?.acpx_cancel_script) return null;
-	const candidate = join(dirname(agent.acpx_cancel_script), "runtime-output", "worker.stdout.ndjson");
-	return existsSync(candidate) ? candidate : null;
-}
+/** The note shown instead of live output when the worker runs on a transport that has no terminal to read. */
+export const NO_TERMINAL_NOTE = "(this worker's transport has no terminal; there is no live view for it)";
 
-/** Everything the detail view shows for one attempt, read from runtime state and retained content only. */
+/** Everything the detail view shows for one attempt, read from the worker's pane and retained content only. */
 export function attemptDetail(store: GraphStore, entry: AgentListEntry): AgentDetail {
 	const attempt = store.runtimeAttempt(entry.attemptKey);
 	const operation = store.getOperation(entry.operationId);
 	const state = store.getState(entry.runId);
 	const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
-	const streamPath = streamPathFor(store, attempt);
+	const rendered = paneLines(agent?.herdr_pane_id ?? null, LIVE_OUTPUT_LINES);
 	let liveOutput: readonly string[] = [];
-	let liveOutputNote: string | null = streamPath ? null : "(no stream retained for this attempt)";
-	if (streamPath) {
-		const summary = summarizeAcpxStream(readTail(streamPath, STREAM_TAIL_BYTES), 12);
-		liveOutput = summary.recent;
-		if (!summary.recent.length) liveOutputNote = "(stream exists but nothing renderable has arrived)";
+	let liveOutputNote: string | null = agent?.herdr_pane_id ? "(the worker's pane could not be read)" : NO_TERMINAL_NOTE;
+	if (rendered) {
+		liveOutput = rendered;
+		liveOutputNote = rendered.length ? null : "(the pane is empty; the worker has rendered nothing yet)";
 	}
 	let answer: string | null = null;
 	let answerNote: string | null = null;
@@ -207,8 +187,8 @@ export function listRows(store: GraphStore): AgentListRow[] {
 		try {
 			const attempt = store.runtimeAttempt(entry.attemptKey);
 			const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
-			const streamPath = streamPathFor(store, attempt);
-			const activity = streamPath ? summarizeAcpxStream(readTail(streamPath, STREAM_TAIL_BYTES), 1).lastActivity ?? "(no output yet)" : "(no stream)";
+			const rendered = paneLines(agent?.herdr_pane_id ?? null, 1);
+			const activity = rendered ? rendered.at(-1) ?? "(no output yet)" : agent?.herdr_pane_id ? "(pane unreadable)" : "(no terminal)";
 			return { number: entry.number, agentName: agent?.name ?? entry.operationId, node: store.getOperation(entry.operationId).node, state: processLabel(attempt), model: shortModel(agent?.selected_model ?? null), activity, running: attempt.processState === "running" && !attempt.supersededAt };
 		} catch (error) {
 			return { number: entry.number, agentName: entry.operationId, node: "?", state: `unavailable (${error instanceof Error ? error.message : String(error)})`, model: "?", activity: "", running: false };

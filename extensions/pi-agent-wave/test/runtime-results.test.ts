@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, chmodSync, symlinkSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { GraphStore } from "../store.ts";
+import { CURRENT_SCHEMA_VERSION, GraphStore } from "../store.ts";
 import { Database } from "../sqlite.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { parseResultContract, canonical } from "../lib/runtime-results.ts";
@@ -60,7 +60,7 @@ test("schema v10 carries no contract or report columns and reopens cleanly", () 
 	try {
 		assert.deepEqual(db.query<{ name: string }>("PRAGMA table_info(runs)").all().map((column) => column.name).filter((name) => name === "result_contract"), []);
 		assert.deepEqual(db.query<{ name: string }>("PRAGMA table_info(operations)").all().map((column) => column.name).filter((name) => name === "report_path"), []);
-		assert.equal(db.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+		assert.equal(db.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 	} finally { db.close(); }
 });
 
@@ -182,7 +182,7 @@ test("no adapter enablement gate exists: the store carries no runtime_adapters t
 	try {
 		const tables = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_adapters'").all();
 		assert.deepEqual(tables, [], "schema v11 drops the enablement table");
-		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+		assert.equal(db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 	} finally { db.close(); }
 });
 
@@ -544,7 +544,7 @@ test("v7 databases with settled attempts and decisions migrate to v8 with rows a
 	const migrated = new GraphStore({ dbPath: join(root, "graph.db") }); stores.push(migrated);
 	const check = new Database(join(root, "graph.db"), { readonly: true });
 	try {
-		assert.equal(check.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, 11);
+		assert.equal(check.query<{ version: number }>("SELECT MAX(version) AS version FROM schema_version").get()?.version, CURRENT_SCHEMA_VERSION);
 		assert.deepEqual(check.query<Record<string, unknown>, []>("SELECT attempt_key,run_id,operation_id,identity_json,outcome_json,candidate_json,candidate_id,started_at,finished_at,observation_json,agent_id FROM runtime_attempts").all(), before);
 		assert.deepEqual(check.query<Record<string, unknown>, []>("SELECT * FROM runtime_decisions").all(), decisions);
 		assert.equal(check.query<{ n: number }>("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='index' AND name='runtime_attempts_active'").get()?.n, 1);

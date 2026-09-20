@@ -3,11 +3,11 @@ import { Type } from "typebox";
 import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, type RuntimeAttempt, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { summarizeAcpxStream, type AcpxStreamSummary } from "./lib/acpx-render.ts";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { renderLog, renderStatus } from "./commands.ts";
 import delegationIdentityExtension from "./delegation-identity.ts";
 import { supervisorContract } from "./contract.ts";
@@ -232,8 +232,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Copy one of an operation's records into the durable home and return the path that will still exist
+ * once the transient run directory is removed. Retention happens here, before a settled outcome embeds
+ * the path, so no recorded fact is left naming a file that is about to be deleted.
+ */
+function retainRunRecord(graphStore: GraphStore, runId: string, path: string): string {
+	return graphStore.retainRunEvidence(runId, basename(path), readFileSync(path));
+}
+
 /** Newest retained failure diagnostic bundle in one private run directory, if the launcher kept one. */
-function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
+function retainedFailureDiagnostics(privateRunDir: string, graphStore: GraphStore, runId: string): string | undefined {
 	let entries: string[];
 	try {
 		entries = readdirSync(privateRunDir);
@@ -250,7 +259,7 @@ function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
 			continue;
 		}
 	}
-	return newest?.path;
+	return newest ? retainRunRecord(graphStore, runId, newest.path) : undefined;
 }
 
 /**
@@ -258,18 +267,18 @@ function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
  * for this operation exists and the attempt directory (the launcher's parent) is gone. Either fact
  * alone is not enough: a bundle beside a live attempt directory is a teardown still in progress.
  */
-function retainedTeardown(privateRunDir: string, operationId: string, agent: AgentRow): { reason: string; diagnosticsPath: string } | undefined {
+function retainedTeardown(privateRunDir: string, operationId: string, agent: AgentRow, graphStore: GraphStore, runId: string): { reason: string; diagnosticsPath: string } | undefined {
 	if (!agent.acpx_cancel_script) return undefined;
-	const diagnosticsPath = join(privateRunDir, `failure-${operationId}.json`);
-	if (!existsSync(diagnosticsPath) || existsSync(dirname(agent.acpx_cancel_script))) return undefined;
+	const found = join(privateRunDir, `failure-${operationId}.json`);
+	if (!existsSync(found) || existsSync(dirname(agent.acpx_cancel_script))) return undefined;
 	let reason = "worker attempt torn down before collection";
 	try {
-		const bundle: unknown = JSON.parse(readFileSync(diagnosticsPath, "utf8"));
+		const bundle: unknown = JSON.parse(readFileSync(found, "utf8"));
 		if (isRecord(bundle) && typeof bundle.reason === "string" && bundle.reason.trim()) reason = bundle.reason.trim();
 	} catch {
 		// A bundle the launcher could not finish writing still proves the teardown; the default reason stands.
 	}
-	return { reason, diagnosticsPath };
+	return { reason, diagnosticsPath: retainRunRecord(graphStore, runId, found) };
 }
 
 /**
@@ -316,32 +325,20 @@ export interface WatchedAgent {
 	readonly transport: string | null;
 	readonly processState: string | null;
 	readonly acceptance: string | null;
-	readonly streamPath: string | null;
+	/** The terminal the live view reads; null when the worker's transport has no terminal. */
+	readonly paneId: string | null;
 	readonly lastActivity: string | null;
 	readonly recent: readonly string[];
-	readonly prompts: number;
-	readonly toolCalls: number;
-	readonly textBytes: number;
 }
+
+const WATCH_PANE_LINES = 5;
 
 export interface WatchView { readonly runId: string; readonly status: string; readonly node: string; readonly agents: readonly WatchedAgent[] }
 
-/** The last bytes of a file, so a long stream is summarized without reading all of it. */
-function readTail(path: string, limit: number): string {
-	const size = statSync(path).size;
-	const start = Math.max(0, size - limit);
-	const fd = openSync(path, "r");
-	try {
-		const buffer = Buffer.alloc(size - start);
-		readSync(fd, buffer, 0, buffer.length, start);
-		const text = buffer.toString("utf8");
-		return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
-	} finally { closeSync(fd); }
-}
-
 /**
- * A read-only view of what each running worker is doing right now, rendered from the ACPX stream the runtime
- * is retaining for the attempt. It reads the private files, decides nothing, and is consulted by no gate.
+ * A read-only view of what each running worker is doing right now, read from the worker's own terminal. It
+ * shells out to `herdr pane read`, decides nothing, and is consulted by no gate. A worker whose transport has
+ * no terminal has no live view; the view says so rather than falling back to the capture file.
  */
 export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 	const state = graphStore.getState(runId);
@@ -351,13 +348,9 @@ export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 		if (operation.status !== "running") continue;
 		const agent = agents.find((candidate) => candidate.id === operation.agent_id);
 		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
-		let streamPath: string | null = null;
-		let summary: AcpxStreamSummary | null = null;
-		if (agent?.acpx_cancel_script) {
-			const candidate = join(dirname(agent.acpx_cancel_script), "runtime-output", "worker.stdout.ndjson");
-			if (existsSync(candidate)) { streamPath = candidate; summary = summarizeAcpxStream(readTail(candidate, 256 * 1024)); }
-		}
-		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt?.processState ?? null, acceptance: attempt?.acceptance ?? null, streamPath, lastActivity: summary?.lastActivity ?? null, recent: summary?.recent ?? [], prompts: summary?.prompts ?? 0, toolCalls: summary?.toolCalls ?? 0, textBytes: summary?.textBytes ?? 0 });
+		const paneId = agent?.herdr_pane_id ?? null;
+		const rendered = paneLines(paneId, WATCH_PANE_LINES);
+		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt?.processState ?? null, acceptance: attempt?.acceptance ?? null, paneId, lastActivity: rendered?.at(-1) ?? null, recent: rendered ?? [] });
 	}
 	return { runId, status: state.status, node: state.currentNode, agents: rows };
 }
@@ -366,7 +359,7 @@ export function renderWatch(view: WatchView): string {
 	const lines = [`run ${view.runId} | node=${view.node} | status=${view.status}`];
 	if (!view.agents.length) lines.push("(no running workers)");
 	for (const agent of view.agents) {
-		lines.push(`${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
+		lines.push(`${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | ${agent.lastActivity ?? (agent.paneId ? "(no output yet)" : "(no terminal)")}`);
 		for (const recent of agent.recent.slice(0, -1)) lines.push(`    ${recent}`);
 	}
 	return lines.join("\n");
@@ -411,7 +404,7 @@ export function renderFollow(view: WatchView, pending = "", confirmation: Cancel
 	if (!view.agents.length) lines.push(view.status === "active" ? "(no running workers; dispatch pending operations to see them here)" : `(run is ${view.status}; nothing is running)`);
 	view.agents.forEach((agent, index) => {
 		const mark = cursorIndex === null ? "" : cursorIndex === index ? "\u203a " : "  ";
-		lines.push(`${mark}${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | tools=${agent.toolCalls} | ${agent.lastActivity ?? (agent.streamPath ? "(no output yet)" : "(no stream)")}`);
+		lines.push(`${mark}${index + 1}. ${agent.agentName ?? agent.operationId} | ${agent.node} | ${agent.processState ?? "unregistered"} | ${agent.lastActivity ?? (agent.paneId ? "(no output yet)" : "(no terminal)")}`);
 		for (const recent of agent.recent.slice(-3, -1)) lines.push(`     ${recent}`);
 	});
 	if (pending) lines.push(`selecting: ${pending}_ (Enter opens, Esc clears)`);
@@ -566,6 +559,37 @@ function settlementFromEvidence(attemptKey: string, evidencePath: string): Runti
  * facts written before any close or cleanup; a failure after them is reported, never used to discard
  * the candidate, and acceptance remains an explicit op=decide call.
  */
+/**
+ * Retain an operation's records in the durable home, then remove its transient run directory.
+ *
+ * Called from the single `collect` handler and only after the settlement and teardown evidence has been
+ * read, because `settle_runtime_attempt` returns paths inside the run directory. A repeated collect
+ * never reaches a live directory here: `collectRuntimeAttempt` short-circuits on an already-settled
+ * attempt without statting anything, so removing the directory cannot break convergence.
+ */
+/**
+ * Remove the directory `init` created when a dispatch never registered a worker.
+ *
+ * `init` runs before the launch, so a preflight block, a start failure or a throw while writing the task
+ * leaves a directory that no `collect` will ever reach and therefore that `finalizeRunDirectory` can
+ * never remove. A registered worker keeps its directory; nothing here touches a live attempt.
+ */
+function discardUnlaunchedRunDirectory(privateRunDir: string): void {
+	rmSync(privateRunDir, { recursive: true, force: true });
+}
+
+export function finalizeRunDirectory(graphStore: GraphStore, runId: string, privateRunDir: string, result: Record<string, unknown>): void {
+	for (const key of ["settlementEvidencePath", "cleanupEvidencePath", "captureRetainedPath", "diagnosticsPath"] as const) {
+		const value = result[key];
+		// Diagnostics and failure bundles found during collection were already retained and reported under
+		// their durable path, so only records still sitting inside the run directory are copied here. A
+		// record the launcher never wrote is skipped rather than failing the settlement that produced it.
+		if (typeof value !== "string" || !value || !value.startsWith(`${privateRunDir}/`) || !existsSync(value)) continue;
+		result[key] = retainRunRecord(graphStore, runId, value);
+	}
+	rmSync(privateRunDir, { recursive: true, force: true });
+}
+
 async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, runId: string, operationId: string, agent: AgentRow, privateRunDir: string, progress: (kind: string, details: Record<string, unknown>) => void): Promise<Record<string, unknown>> {
 	const attemptKey = agent.acpx_attempt_key;
 	if (!attemptKey) throw new Error(`operation ${operationId} has no runtime attempt key`);
@@ -573,13 +597,14 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 	const postSettlementFailures: string[] = [];
 	const configurationSelfWrites: Record<string, unknown>[] = [];
 	let captureRetainedPath: string | undefined;
+	let diagnosticsPath: string | undefined;
 	let cleanupEvidencePath: string | undefined;
 	let settlementEvidencePath = registered.outcome ? undefined : runtimeSettlementFile(privateRunDir);
 	if (!registered.outcome && !settlementEvidencePath) {
 		// The launcher tears an attempt down on its own when its wait times out with nobody listening
 		// (abort_acpx_attempt: failure bundle written, attempt directory removed). That evidence is
 		// terminal; waiting again would poll a result file that can no longer appear.
-		const tornDown = retainedTeardown(privateRunDir, operationId, agent);
+		const tornDown = retainedTeardown(privateRunDir, operationId, agent, graphStore, runId);
 		if (tornDown) {
 			const attempt = graphStore.settleRuntimeAttempt({ attemptKey, outcome: { kind: "failed", exitCode: null, error: `${tornDown.reason}\nretained worker diagnostics: ${tornDown.diagnosticsPath}` } });
 			progress("runtime_attempt_failed", { runId, operationId, agentName: agent.name, attemptKey, diagnosticsPath: tornDown.diagnosticsPath, via: "retained-teardown" });
@@ -592,7 +617,7 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 			const reason = (waited.stderr || waited.stdout || "worker wait failed").trim();
 			settlementEvidencePath = runtimeSettlementFile(privateRunDir);
 			if (!settlementEvidencePath) {
-				const diagnostics = retainedFailureDiagnostics(privateRunDir);
+				const diagnostics = retainedFailureDiagnostics(privateRunDir, graphStore, runId);
 				const attempt = graphStore.settleRuntimeAttempt({ attemptKey, outcome: { kind: "failed", exitCode: null, error: diagnostics ? `${reason}\nretained worker diagnostics: ${diagnostics}` : reason } });
 				progress("runtime_attempt_failed", { runId, operationId, agentName: agent.name, attemptKey, diagnosticsPath: diagnostics ?? null });
 				return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: null, reason, diagnosticsPath: diagnostics ?? null, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
@@ -606,11 +631,12 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 			if (Array.isArray(waitedValue.postSettlementFailures)) postSettlementFailures.push(...waitedValue.postSettlementFailures.filter((item): item is string => typeof item === "string"));
 			if (Array.isArray(waitedValue.configurationSelfWrites)) configurationSelfWrites.push(...waitedValue.configurationSelfWrites.filter(isRecord));
 			if (typeof waitedValue.captureRetainedPath === "string") captureRetainedPath = waitedValue.captureRetainedPath;
+			if (typeof waitedValue.diagnosticsPath === "string") diagnosticsPath = waitedValue.diagnosticsPath;
 		}
 	}
 	const attempt = registered.outcome ? registered : graphStore.settleRuntimeAttempt(settlementFromEvidence(attemptKey, required(settlementEvidencePath, "runtime settlement evidence")));
 	progress("runtime_attempt_settled", { runId, operationId, agentName: agent.name, attemptKey, processState: attempt.processState, candidate: attempt.candidate?.kind ?? null, acceptance: attempt.acceptance, postSettlementFailures: postSettlementFailures.length, configurationSelfWrites: configurationSelfWrites.length });
-	return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: attempt.candidate?.kind ?? null, ...decisionBrief(graphStore, runId, operationId, attempt), settlementEvidencePath: settlementEvidencePath ?? null, cleanupEvidencePath: cleanupEvidencePath ?? null, captureRetainedPath: captureRetainedPath ?? null, postSettlementFailures, configurationSelfWrites, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
+	return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: attempt.candidate?.kind ?? null, ...decisionBrief(graphStore, runId, operationId, attempt), settlementEvidencePath: settlementEvidencePath ?? null, cleanupEvidencePath: cleanupEvidencePath ?? null, captureRetainedPath: captureRetainedPath ?? null, diagnosticsPath: diagnosticsPath ?? null, postSettlementFailures, configurationSelfWrites, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
 }
 
 const ANSWER_PREVIEW_BYTES = 16 * 1024;
@@ -852,9 +878,15 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					if (initialized.exitCode !== 0) throw new Error(initialized.stderr || initialized.stdout || "headless init failed");
 					const privateRunDir = initialized.stdout.trim();
 					const taskFile = join(privateRunDir, "task.md");
-					const evidence = materializeRuntimeEvidence(graphStore, runId, privateRunDir);
-					writeFileSync(taskFile, `${operation.task}\n${evidence.taskSuffix}`, { mode: 0o600 });
-					chmodSync(taskFile, 0o600);
+					let evidence: { ledgerPath: string; answers: { node: string; path: string }[]; taskSuffix: string };
+					try {
+						evidence = materializeRuntimeEvidence(graphStore, runId, privateRunDir);
+						writeFileSync(taskFile, `${operation.task}\n${evidence.taskSuffix}`, { mode: 0o600 });
+						chmodSync(taskFile, 0o600);
+					} catch (error) {
+						discardUnlaunchedRunDirectory(privateRunDir);
+						throw error;
+					}
 					progress("runtime_evidence_materialized", { runId, operationId, ledgerPath: evidence.ledgerPath, answers: evidence.answers.length });
 					const role = roleForNode(operation.node);
 					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
@@ -868,6 +900,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 							// No worker was registered, so the launch failure is classified through the fenced replacement path.
 							const blocked = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
 							progress("dispatch_blocked_by_preflight", { runId, operationId, reason, status: blocked.state.status, modelAttempt: blocked.operation.model_attempt });
+							discardUnlaunchedRunDirectory(privateRunDir);
 							return textResult({
 								runId,
 								operationId,
@@ -879,6 +912,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 								retry: blocked.retry ?? null,
 							});
 						}
+						discardUnlaunchedRunDirectory(privateRunDir);
 						throw new Error(started.stderr || started.stdout || "headless start failed");
 					}
 					const launch: unknown = JSON.parse(started.stdout);
@@ -914,7 +948,9 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					if (!agent) throw new Error(`operation ${operationId} has no registered runtime attempt to collect`);
 					if (!agent.acpx_cancel_script) throw new Error(`operation ${operationId} has no collectable worker`);
 					const privateRunDir = dirname(dirname(dirname(agent.acpx_cancel_script)));
-					return textResult(await collectRuntimeAttempt(graphStore, pi, runId, operationId, agent, privateRunDir, progress));
+					const collected = await collectRuntimeAttempt(graphStore, pi, runId, operationId, agent, privateRunDir, progress);
+					finalizeRunDirectory(graphStore, runId, privateRunDir, collected);
+					return textResult(collected);
 				}
 				if (params.op === "integrate") {
 					const operationId = required(params.operationId, "operationId");

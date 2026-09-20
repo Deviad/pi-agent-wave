@@ -129,7 +129,7 @@ Pi's home defaults to `~/.pi/agent`. Set `PI_CODING_AGENT_DIR` or pass `--agent-
 
 No enablement step exists: a worker runs on the adapter its frozen model selects. Put a Pi-adapter model behind every Codex or Claude entry in `~/.pi/agent/model-routing.jsonc` so an exhausted quota falls over to another provider.
 
-Pi and Codex are proven on every graph (Codex: `agent-output/runtime-measure-codex-20260912/`, `runtime-measure-codex-build-20260912/`, `runtime-measure-codex-operations-20260912/`); Claude has passed its probe (`agent-output/runtime-result-probe-run4-20260912/claude.json`) but not a graph run. Runs and their retained evidence live under `~/.cache/delegate-graph/`; see [environment and storage](extensions/pi-agent-wave/README.md#environment-and-storage).
+Pi and Codex are proven on every graph (Codex: `agent-output/runtime-measure-codex-20260912/`, `runtime-measure-codex-build-20260912/`, `runtime-measure-codex-operations-20260912/`); Claude has passed its probe (`agent-output/runtime-result-probe-run4-20260912/claude.json`) but not a graph run. Runs and their retained evidence live under `~/.local/share/delegate-graph/`; see [environment and storage](extensions/pi-agent-wave/README.md#environment-and-storage).
 
 ## 3. Add Pi to JetBrains Air
 
@@ -220,7 +220,7 @@ After npm publication:
 pi remove npm:@dpugliese/pi-agent-wave
 ```
 
-Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs under `~/.cache/delegate-graph/`.
+Removing pi-agent-wave does not remove optional Herdr, routing configuration, migration backups, or stored Delegate Graph runs under `~/.local/share/delegate-graph/`.
 
 ## Security
 

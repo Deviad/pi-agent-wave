@@ -43,6 +43,13 @@ if (!Number.isInteger(repeats) || repeats < 1) throw new Error("--repeats must b
  * provider turn is spent on it, so a root that can be reclaimed mid-run is refused before any worker starts.
  */
 const runRootBase = resolve(option("--run-root", SCRATCH_ROOT));
+/**
+ * Keep the run root after the run. A live run spends an authorized provider turn, and the store now retains
+ * settlement evidence, cleanup evidence and any capture stream under `<run root>/evidence/<runId>/` while
+ * removing the per-operation directories; deleting the root discards exactly the artifacts an operator needs
+ * to inspect afterwards, so an evidence-producing run asks for this flag.
+ */
+const keepRunRoot = flag("--keep-run-root");
 function assertUsableRunRoot(base: string): void {
 	let stat; try { stat = statSync(base); } catch { throw new Error(`run root ${base} does not exist; refusing to start a live run whose state would have nowhere durable to live`); }
 	if (!stat.isDirectory()) throw new Error(`run root ${base} is not a directory; refusing to start`);
@@ -103,7 +110,7 @@ interface RunRecord {
 	dispatches: number; collects: number; completions: number; retries: number; modelFallbacks: number; parked: boolean; failures: string[]; phases: Timed[]; operations: Record<string, unknown>[];
 	privateRunDirs: string[]; progress: { kind: string; at: number; details: Record<string, unknown> }[]; ledgerPath: string | null; error: string | null;
 	verdicts: { operationId: string; node: string; verdict: string | null; source: string; answerExcerpt: string | null }[]; integrations: { operationId: string; state: string; changes: number }[];
-	watchSamples: { at: number; agents: { agentName: string | null; node: string; processState: string | null; toolCalls: number; lastActivity: string | null }[] }[];
+	watchSamples: { at: number; agents: { agentName: string | null; node: string; processState: string | null; paneId: string | null; lastActivity: string | null }[] }[];
 	workspace: { status: string; diff: string } | null;
 }
 
@@ -219,11 +226,11 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 				if (dispatched.launch && typeof dispatched.launch["acpx-cancel-script"] === "string") { const dir = resolve(dispatched.launch["acpx-cancel-script"], "..", "..", ".."); if (!record.privateRunDirs.includes(dir)) record.privateRunDirs.push(dir); }
 				running.push({ ...operation, status: "running" });
 			}
-			// While workers run, sample the read-only watch view every 20 s: this is the evidence that the pane rendering and the summary line work on a real stream.
+			// While workers run, sample the read-only watch view every 20 s: this is the evidence that reading the worker's own pane renders on a real run.
 			const watcher = setInterval(async () => {
 				try {
 					const view = parsed(await tool.execute({ op: "watch", runId }, () => {}, ctx));
-					if (record.watchSamples.length < 30 && Array.isArray(view.agents)) record.watchSamples.push({ at: Math.round(now() - started), agents: view.agents.map((agent: Record<string, any>) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, toolCalls: agent.toolCalls, lastActivity: agent.lastActivity })) });
+					if (record.watchSamples.length < 30 && Array.isArray(view.agents)) record.watchSamples.push({ at: Math.round(now() - started), agents: view.agents.map((agent: Record<string, any>) => ({ agentName: agent.agentName, node: agent.node, processState: agent.processState, paneId: agent.paneId, lastActivity: agent.lastActivity })) });
 				} catch { /* sampling only */ }
 			}, 20_000);
 			await Promise.all(running.map(async (operation) => {
@@ -279,7 +286,8 @@ async function measureRun(contract: "runtime-v1", repeat: number): Promise<RunRe
 	} finally {
 		record.finishedAt = new Date().toISOString(); record.totalMs = Math.round(now() - started);
 		writeFileSync(join(evidenceDir, `run-${contract}-${repeat}.json`), JSON.stringify(record, null, 2) + "\n", { mode: 0o600 });
-		rmSync(root, { recursive: true, force: true });
+		if (keepRunRoot) console.log(JSON.stringify({ keptRunRoot: root, evidence: join(root, "evidence"), failures: join(root, "failures") }));
+		else rmSync(root, { recursive: true, force: true });
 	}
 	return record;
 }
