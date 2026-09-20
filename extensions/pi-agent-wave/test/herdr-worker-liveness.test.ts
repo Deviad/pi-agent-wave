@@ -9,6 +9,12 @@ const script = fileURLToPath(new URL("../scripts/herdr_delegate.py", import.meta
  * Drives the production `wait_for_settled_agent` with a fake `run` and a temporary attempt
  * directory. `WAIT_TIMEOUT_MS` is pinned to 60 s so a regression to the blind wait shows up as
  * a hang past the 10 s spawn timeout rather than a one-hour stall.
+ *
+ * The fixture answers are the real CLI's, captured 2026-09-20 against a running Herdr:
+ *   herdr agent get wR:p3                        -> {"result":{"agent":{"agent":"dg_run-e5b0_thinker_8d06cc93","agent_status":"working","pane_id":"wR:p3",...}}}
+ *   herdr agent get dg_run-e5b0_thinker_8d06cc93 -> {"error":{"code":"agent_not_found",...}}   (same worker, alive)
+ *   herdr agent get wS:p2                        -> {"error":{"code":"agent_not_found",...}}   (pane gone)
+ * `agent get` resolves pane refs only, which is why the probe must never take the agent name.
  */
 function probe(body: string, transport: "herdr" | "headless"): Record<string, unknown> {
 	const source = String.raw`
@@ -21,7 +27,7 @@ core['ACTIVE_TRANSPORT'] = ${JSON.stringify(transport)}
 run_dir = pathlib.Path(tempfile.mkdtemp(prefix='herdr-liveness-'))
 attempt_dir = run_dir / 'acpx' / 'worker'
 attempt_dir.mkdir(parents=True)
-resource = {'agent': 'worker', 'execution': 'acpx-agentfs', 'worker_result': str(attempt_dir / 'worker-result.json'), 'attempt_dir': str(attempt_dir)}
+resource = {'agent': 'worker', 'pane': 'wZ:p9', 'execution': 'acpx-agentfs', 'worker_result': str(attempt_dir / 'worker-result.json'), 'attempt_dir': str(attempt_dir)}
 calls = []
 class Result:
     def __init__(self, returncode, stdout=''):
@@ -47,7 +53,7 @@ describe("Herdr wait notices a torn-down worker", () => {
 	test("fails within seconds when the attempt directory is removed", () => {
 		const body = String.raw`
 def fake_run(argv, check=True, **_kwargs):
-    calls.append(argv[:3])
+    calls.append(argv)
     return Result(0, json.dumps({'result': {'agent': {'agent_status': 'working'}}}))
 threading.Timer(0.5, lambda: shutil.rmtree(attempt_dir)).start()
 `;
@@ -59,19 +65,19 @@ threading.Timer(0.5, lambda: shutil.rmtree(attempt_dir)).start()
 	test("fails within seconds when Herdr no longer knows the agent", () => {
 		const body = String.raw`
 def fake_run(argv, check=True, **_kwargs):
-    calls.append(argv[:3])
+    calls.append(argv)
     return Result(1, json.dumps({'error': {'code': 'agent_not_found', 'message': 'agent target worker not found'}}))
 `;
 		const observed = probe(body, "herdr");
 		assert.match(String(observed.error), /no longer registered before result/);
 		assert.ok(Number(observed.elapsed) < 3, `took ${observed.elapsed}s`);
-		assert.deepEqual(observed.calls, [["herdr", "agent", "get"]]);
+		assert.deepEqual(observed.calls, [["herdr", "agent", "get", "wZ:p9"]], "the probe must target the pane: `herdr agent get <name>` answers agent_not_found for a live worker");
 	});
 
 	test("a malformed liveness answer keeps waiting for the result", () => {
 		const body = String.raw`
 def fake_run(argv, check=True, **_kwargs):
-    calls.append(argv[:3])
+    calls.append(argv)
     return Result(1, 'herdr: socket unavailable')
 def finish():
     (attempt_dir / 'worker-result.json').write_text(json.dumps({'schemaVersion': 2, 'resultContract': 'runtime-v1'}))
@@ -86,7 +92,7 @@ core['wait_for_worker_exit'] = lambda resource: None
 	test("headless transport never asks Herdr", () => {
 		const body = String.raw`
 def fake_run(argv, check=True, **_kwargs):
-    calls.append(argv[:3])
+    calls.append(argv)
     return Result(1, json.dumps({'error': {'code': 'agent_not_found'}}))
 def finish():
     (attempt_dir / 'worker-result.json').write_text(json.dumps({'schemaVersion': 2, 'resultContract': 'runtime-v1'}))
@@ -96,5 +102,23 @@ core['wait_for_worker_exit'] = lambda resource: None
 		const observed = probe(body, "headless");
 		assert.equal(observed.error, null);
 		assert.deepEqual(observed.calls, []);
+	});
+
+	test("a live pane keeps the wait going even though the agent name would not resolve", () => {
+		const body = String.raw`
+def fake_run(argv, check=True, **_kwargs):
+    calls.append(argv)
+    # Real shapes: the pane resolves to the reported agent; the same agent queried by NAME is not found.
+    if argv[3] == 'wZ:p9':
+        return Result(0, json.dumps({'result': {'agent': {'agent': 'worker', 'agent_status': 'working', 'pane_id': 'wZ:p9'}}}))
+    return Result(1, json.dumps({'error': {'code': 'agent_not_found', 'message': 'agent target worker not found'}}))
+def finish():
+    (attempt_dir / 'worker-result.json').write_text(json.dumps({'schemaVersion': 2, 'resultContract': 'runtime-v1'}))
+threading.Timer(0.8, finish).start()
+core['wait_for_worker_exit'] = lambda resource: None
+`;
+		const observed = probe(body, "herdr");
+		assert.equal(observed.error, null, "a worker whose pane still has an agent must not be torn down");
+		assert.ok((observed.calls as string[][]).every((argv) => argv[3] === "wZ:p9"), `probe must query the pane, got ${JSON.stringify(observed.calls)}`);
 	});
 });
