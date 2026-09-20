@@ -85,6 +85,22 @@ test("stages an owned file the worker created inside new directories, and still 
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("an owned directory the worker created but left empty stages no change", () => {
+	const root = mkdtempSync(join(tmpdir(), "runtime-stage-empty-"));
+	try {
+		// The worker creates the directory it owns and writes nothing into it. A directory is not content:
+		// there is no file to stage, so the attempt must settle with nothing staged rather than an empty change.
+		const worker = mountedWorker(root, "stage-empty", "mkdir -p app/topics");
+		const snapshotPath = join(root, "empty.db");
+		snapshotAgentFsDb(worker.dbPath, snapshotPath);
+		const content = new RuntimeContentStore(join(worker.home, "graph.db"));
+		const staged = stageRuntimeAgentFs({ agentFsExecutable: "agentfs", snapshotPath, baseDir: worker.base, baseRevision: "recorded-base", attemptKey: "attempt-empty", ownedPaths: ["app/topics"], readOnly: false }, content);
+		assert.equal(staged.files.length, 0, "an empty owned directory stages no file");
+		assert.deepEqual(staged.changes, [], "and records no change");
+		assert.equal(existsSync(join(worker.base, "app")), false, "the host tree is untouched either way");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("staging scratch does not depend on an inherited TMPDIR, and no shipped module reaches for tmpdir()", () => {
 	// The Python lifecycle pins its private directories to /tmp (delegate_core.py TMP_ROOT) because a launcher-supplied
 	// TMPDIR can outlive nothing: the 2026-09-16 live run lost a settlement to exactly that. Staging must not trust it either.

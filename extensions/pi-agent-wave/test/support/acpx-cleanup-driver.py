@@ -483,13 +483,19 @@ def mount_leak_case() -> dict[str, object]:
         proc.wait(timeout=30)
         time.sleep(1)
         leaked = module.agentfs_mount_points(owned)
+        # What the audit says while the mount is still there: the field must not read absent yet.
+        mounts_before = module.run(["mount"], check=False).stdout
+        absent_before = module.cleanup_absence_inventory(owned, "", False, False, "", mounts_before)["agentFsMountAbsent"]
         failures = module.release_agentfs_session(owned)
+        mounts_after = module.run(["mount"], check=False).stdout
         return {
             "case": "mount-leak",
             "mountSeen": len(mounted),
             "leakedAfterKill": len(leaked),
             "failures": failures,
             "remaining": module.agentfs_mount_points(owned),
+            "agentFsMountAbsentBeforeRelease": absent_before,
+            "agentFsMountAbsentAfterRelease": module.cleanup_absence_inventory(owned, "", False, False, "", mounts_after)["agentFsMountAbsent"],
         }
     finally:
         if proc.poll() is None:

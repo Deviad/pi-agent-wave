@@ -1,6 +1,7 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "../sqlite.ts";
@@ -164,5 +165,77 @@ describe("story ledger", () => {
 				/unsupported ledger claim status/,
 			);
 		} finally { store.close(); }
+	});
+
+	test("two writers racing on one store take contiguous sequences, never the same one", () => {
+		const { root, dbPath, store } = fixture();
+		store.close();
+		// Real concurrency, not two turns taken in order: both processes are told the same start time and
+		// run at once, so if the sequence were read outside the inserting transaction they could collide.
+		const driver = join(root, "writer.mjs");
+		writeFileSync(driver, `
+import { GraphStore } from ${JSON.stringify(join(import.meta.dirname, "..", "store.ts"))};
+const [dbPath, label, startAt] = process.argv.slice(2);
+const store = new GraphStore({ dbPath });
+const sequences = [];
+while (Date.now() < Number(startAt)) { /* both writers start on the same tick */ }
+for (let index = 0; index < 25; index += 1) {
+	for (;;) {
+		try { sequences.push(store.recordLedgerEntry({ story: "race", topic: label + "-" + index, runId: "r", tier: "coding", model: "m", outcome: "accepted", task: "t" }).sequence); break; }
+		catch (error) { if (!/SQLITE_BUSY|database is locked|UNIQUE/i.test(String(error))) throw error; }
+	}
+}
+store.close();
+process.stdout.write(JSON.stringify(sequences));
+`);
+		const startAt = Date.now() + 300;
+		const writers = ["a", "b"].map((label) => spawn(process.execPath, ["--experimental-strip-types", driver, dbPath, label, String(startAt)], { stdio: ["ignore", "pipe", "pipe"] }));
+		const outputs = writers.map((writer) => { let text = ""; writer.stdout.on("data", (chunk) => { text += String(chunk); }); return () => text; });
+		const errors = writers.map((writer) => { let text = ""; writer.stderr.on("data", (chunk) => { text += String(chunk); }); return () => text; });
+		const codes = writers.map((writer) => new Promise<number>((resolve) => writer.on("close", resolve)));
+		return Promise.all(codes).then((exits) => {
+			assert.deepEqual(exits, [0, 0], `${errors[0]()}\n${errors[1]()}`);
+			const taken = [...JSON.parse(outputs[0]()), ...JSON.parse(outputs[1]())].sort((a, b) => a - b);
+			assert.equal(taken.length, 50);
+			assert.deepEqual(taken, Array.from({ length: 50 }, (_, index) => index + 1), "the 50 entries take 1..50 with no gap and no duplicate");
+			const reopened = new GraphStore({ dbPath });
+			try { assert.deepEqual(reopened.auditStoryLedger("race").findings, [], "the audit sees a contiguous sequence"); }
+			finally { reopened.close(); }
+		});
+	});
+
+	test("the command surface writes through the store and audits from it, creating no ledger file", () => {
+		const { root, dbPath, store } = fixture();
+		store.close();
+		const cli = (args: string[]) => spawnSync(process.execPath, ["--experimental-strip-types", join(import.meta.dirname, "..", "scripts", "story-ledger.mjs"), ...args], { encoding: "utf8", env: { ...process.env, DELEGATE_GRAPH_DB: dbPath } });
+
+		const written = cli(["write", "cli-story", "first-topic", "--run", "run_1", "--tier", "coding", "--model", "alibaba/deepseek-v4.1-flash", "--outcome", "accepted", "--task", "Do the thing", "--claim", "the bundle exists::failure-op-1.json read back at mode 600::verified", "--aggregate", "criteria met::9::10::90"]);
+		assert.equal(written.status, 0, written.stderr);
+		const recorded = JSON.parse(written.stdout.trim().split("\n").at(-1)!);
+		assert.equal(recorded.action, "ledger_entry_recorded");
+		assert.equal(recorded.store, dbPath, "the command names the store it wrote to");
+		assert.deepEqual([recorded.story, recorded.sequence, recorded.claims, recorded.aggregates], ["cli-story", 1, 1, 1]);
+
+		// The rows are in the store, and no file ledger was produced anywhere near it.
+		const reopened = new GraphStore({ dbPath });
+		try {
+			const [entryRow] = reopened.storyLedger("cli-story");
+			assert.equal(entryRow.topic, "first-topic");
+			assert.deepEqual(entryRow.claims, [{ position: 1, claim: "the bundle exists", evidence: "failure-op-1.json read back at mode 600", status: "verified" }]);
+			assert.deepEqual(entryRow.aggregates, [{ position: 1, name: "criteria met", numerator: 9, denominator: 10, percentage: 90 }]);
+		} finally { reopened.close(); }
+		assert.equal(existsSync(join(root, "delegate-ledger")), false, "no file ledger directory is created");
+		assert.deepEqual(readdirSync(root).filter((name) => name.endsWith(".json")), [], "no ledger JSON file is written beside the store");
+
+		assert.equal(cli(["audit", "cli-story"]).status, 0, "a consistent story audits clean through the command");
+
+		// The defect the audit exists for, reached through the command rather than the store API.
+		assert.equal(cli(["write", "cli-bad", "rounded", "--run", "run_2", "--tier", "coding", "--model", "m", "--outcome", "accepted", "--task", "t", "--aggregate", "criteria met::9::10::100"]).status, 0);
+		const audited = cli(["audit", "cli-bad"]);
+		assert.equal(audited.status, 2, "a mismatched aggregate exits non-zero");
+		const report = JSON.parse(audited.stdout);
+		assert.equal(report.valid, false);
+		assert.deepEqual(report.findings.map((finding: { code: string }) => finding.code), ["AGGREGATE_MISMATCH"]);
+		assert.match(report.findings[0].message, /recorded 100, computed 90/);
 	});
 });

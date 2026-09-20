@@ -241,6 +241,14 @@ function retainRunRecord(graphStore: GraphStore, runId: string, path: string): s
 	return graphStore.retainRunEvidence(runId, basename(path), readFileSync(path));
 }
 
+/** The retained bundle a settled outcome already names, so a repeated report points at the same file. */
+function retainedDiagnosticFromOutcome(attempt: RuntimeAttempt): string | null {
+	const error = attempt.outcome && "error" in attempt.outcome ? attempt.outcome.error : null;
+	if (typeof error !== "string") return null;
+	const named = /retained (?:worker )?diagnostics: (.+)$/m.exec(error)?.[1]?.trim();
+	return named && existsSync(named) ? named : null;
+}
+
 /** Newest retained failure diagnostic bundle in one private run directory, if the launcher kept one. */
 function retainedFailureDiagnostics(privateRunDir: string, graphStore: GraphStore, runId: string): string | undefined {
 	let entries: string[];
@@ -635,6 +643,10 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 		}
 	}
 	const attempt = registered.outcome ? registered : graphStore.settleRuntimeAttempt(settlementFromEvidence(attemptKey, required(settlementEvidencePath, "runtime settlement evidence")));
+	// A repeated collect settles nothing and so learns no path of its own, but the attempt it reports is the
+	// same one: the retained diagnostic named in the settled outcome is read back rather than dropped, so the
+	// second response points at the same bundle as the first.
+	if (!diagnosticsPath) diagnosticsPath = retainedDiagnosticFromOutcome(attempt) ?? undefined;
 	progress("runtime_attempt_settled", { runId, operationId, agentName: agent.name, attemptKey, processState: attempt.processState, candidate: attempt.candidate?.kind ?? null, acceptance: attempt.acceptance, postSettlementFailures: postSettlementFailures.length, configurationSelfWrites: configurationSelfWrites.length });
 	return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: attempt.candidate?.kind ?? null, ...decisionBrief(graphStore, runId, operationId, attempt), settlementEvidencePath: settlementEvidencePath ?? null, cleanupEvidencePath: cleanupEvidencePath ?? null, captureRetainedPath: captureRetainedPath ?? null, diagnosticsPath: diagnosticsPath ?? null, postSettlementFailures, configurationSelfWrites, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
 }
@@ -722,7 +734,10 @@ function settleUnlaunchedOperation(graphStore: GraphStore, runId: string, operat
 	if (run.id !== operation.run_id) throw new Error("operation does not belong to run");
 	if (run.status !== "active") throw new Error(`run ${runId} is ${run.status}; resolve it before recording operations`);
 	const reason = `no worker was registered for operation ${operation.id}: the authorized command never started`;
-	const diagnosticsPath = graphStore.retainRunDiagnostic(runId, `failure-${operation.id}.json`, {
+	// `unlaunched-` rather than `failure-`: a worker's failure bundle carries the same operation id and is
+	// retained under `evidence/<runId>/`, so sharing one name meant one logical record resolving in two
+	// homes with different contents. These are different records and now read as different records.
+	const diagnosticsPath = graphStore.retainRunDiagnostic(runId, `unlaunched-${operation.id}.json`, {
 		schemaVersion: 1,
 		cause: reason,
 		runId,

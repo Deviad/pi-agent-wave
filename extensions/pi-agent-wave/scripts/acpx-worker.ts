@@ -1,5 +1,5 @@
 #!/usr/bin/env -S node --experimental-strip-types
-import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
@@ -205,8 +205,13 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 		const output = await runRuntimeProcess({ executable: config.acpxExecutable, args: buildPromptArgv(config), cwd: process.cwd(), env, outputDir, identity: { attemptKey: config.attemptKey, sessionId: ensured.acpxSessionId, requestId: null }, timeoutMs: config.timeoutSeconds * 1000, onStdout: (bytes) => renderer.push(bytes) });
 		renderer.end();
 		const result = { schemaVersion: 2, resultContract: "runtime-v1", agent: config.agent, selectedModel: config.selectedModel, sessionName: config.sessionName, attemptKey: config.attemptKey, outputDir, output };
-		const fd = openSync(config.resultPath, "wx", 0o600);
+		// The waiter polls for this path's existence and then parses it, so it must never exist half-written:
+		// creating it first and writing after left a window where the poll saw an empty file and the wait
+		// failed with "invalid ACPX worker result: Expecting value: line 1 column 1 (char 0)".
+		const pending = `${config.resultPath}.${process.pid}.tmp`;
+		const fd = openSync(pending, "wx", 0o600);
 		try { writeFileSync(fd, JSON.stringify(result, null, 2) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+		renameSync(pending, config.resultPath);
 		return output.outcome.kind === "exited" ? output.outcome.exitCode : 2;
 	}
 }

@@ -197,6 +197,10 @@ describe("terminated attempt convergence", () => {
 			const again = parsed(await started.tool.execute("collect", { op: "collect", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(again.error, undefined, `a repeated collect must be a no-op, got ${JSON.stringify(again)}`);
 			assert.equal(again.attempt.processState, "failed");
+			// A repeated collect settles nothing, so it learns no path of its own; it must still name the
+			// bundle the first one retained rather than answer as though no diagnostic existed.
+			assert.equal(again.diagnosticsPath, collected.diagnosticsPath, "a repeated collect names the same retained bundle");
+			assert.equal(existsSync(String(again.diagnosticsPath)), true, "and that bundle still exists");
 			const retried = parsed(await started.tool.execute("retry", { op: "retry", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(retried.error, undefined, `retry must be accepted after settlement, got ${JSON.stringify(retried)}`);
 			assert.notEqual(retried.operation.status, "running");

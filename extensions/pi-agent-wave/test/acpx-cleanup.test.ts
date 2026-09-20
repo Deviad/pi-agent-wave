@@ -134,8 +134,10 @@ describe("ACPX AgentFS targeted cleanup", () => {
 		if (result.skipped === true) return console.log(`skipped: ${String(result.reason)}`);
 		assert.ok(Number(result.mountSeen) >= 1, "the probe must see a real AgentFS mount before it kills the worker");
 		assert.ok(Number(result.leakedAfterKill) >= 1, "a killed worker must leave the mount it cannot unmount itself");
+		assert.equal(result.agentFsMountAbsentBeforeRelease, false, "the audit must not call a live mount absent");
 		assert.deepEqual(result.failures, [], "releasing a mounted attempt must not report a failure");
 		assert.deepEqual(result.remaining, [], "the release step must leave no AgentFS mount for the attempt");
+		assert.equal(result.agentFsMountAbsentAfterRelease, true, "and the settled attempt's audit reports the mount absent directly, not by inference");
 	});
 
 	test("fails closed when a Herdr absence audit has no workspace identity", () => {

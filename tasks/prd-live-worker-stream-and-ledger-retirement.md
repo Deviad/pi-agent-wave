@@ -165,27 +165,45 @@ file, on a mechanism that can support Windows later.
 
 ### US-004: The delegate-ledger writes through the store and the file ledger retires
 
-**Description:** As the user of the evidence-ledger workflow, I want one writer for a story's execution
+**Description:** As a user of the evidence-ledger workflow, I want one writer for a story's execution
 record, so that the rule I follow cannot reference a script that does not exist.
 
 **Acceptance Criteria:**
 
-- [ ] The supervisor's ledger write goes through the store's `recordLedgerEntry` and produces
-      `ledger_entries` rows. Proof: a test asserting rows appear for a story and that no
+- [x] The supervisor's ledger write goes through the store's `recordLedgerEntry` and produces
+      `ledger_entries` rows. Proof: a test asserting the rows appear for a story and that no
       `agent-output/<story>/delegate-ledger/*.json` is created.
-- [ ] `audit` reads the store and recomputes each aggregate from its components, reporting
+      Evidence: `scripts/story-ledger.mjs` is the command surface and writes only through the store. The
+      test "the command surface writes through the store and audits from it, creating no ledger file"
+      runs the command, reads the entry, claim and aggregate back through `storyLedger`, and asserts no
+      `delegate-ledger` directory and no ledger JSON file exist beside the store.
+- [x] `audit` reads the store and recomputes the aggregate from its components, reporting
       `AGGREGATE_MISMATCH`. Proof: `test/story-ledger.test.ts`'s existing aggregate case, exercised
       through the CLI surface rather than the store API directly.
-- [ ] `~/.pi/agent/scripts/delegate-ledger` no longer resolves a package script. Proof: running it against
-      a story exits zero and its output names the store, and the file contains no
-      `scripts/ledger.ts` lookup. The wrapper is the user's own file at
-      `~/.pi/agent/scripts/delegate-ledger`; the PRD records the change and the user owns it.
-- [ ] The evidence-ledger rule in `~/.pi/agent/AGENTS.md` names the store instead of the wrapper's
-      script resolution. Proof: the rule text, which currently reads "the wrapper resolves
-      `scripts/ledger.ts` from whichever package `settings.json` loads", is updated in the same change.
-- [ ] No file-ledger machinery is reintroduced into the package: no `ledger.ts`, no `report-audit.ts`, no
+      Evidence: the same test writes `criteria met::9::10::100` through the command and asserts `audit`
+      exits 2 with one `AGGREGATE_MISMATCH` reading "recorded 100, computed 90" - the exact defect the
+      supervisor rules name.
+- [x] `~/.pi/agent/scripts/delegate-ledger` no longer resolves a package script that does not exist.
+      Proof: running it against a story exits zero, its output names the store, and the file contains no
+      `scripts/ledger.ts` lookup. The wrapper is the user's own file; this PRD records the change because
+      the user owns it.
+      Evidence: before the change the wrapper printed "no loaded package provides scripts/ledger.ts" - it
+      resolved nothing, because no `ledger.ts` exists in the loaded package or anywhere else. It now
+      resolves `scripts/story-ledger.mjs`; run against a real story it wrote sequence 1 and audited clean
+      at exit 0, naming the store path in both outputs. `grep -c "ledger.ts"` on the wrapper is 0.
+- [x] The evidence-ledger rule in `~/.pi/agent/AGENTS.md` names the store instead of the wrapper's script
+      resolution. Proof: the rule text, currently reading "the wrapper resolves `scripts/ledger.ts` from
+      whichever package `settings.json` loads", is updated in the same change.
+      Evidence: the rule now gives the command's real argument shape, states the record lives in
+      `ledger_entries`/`ledger_claims`/`ledger_aggregates` and that no file ledger is produced, and names
+      `scripts/story-ledger.mjs`. A second stale reference in the rules-maintenance rule was corrected
+      too; `grep -c "ledger.ts"` on that file is 0.
+- [x] No file-ledger machinery is reintroduced into the package: no `ledger.ts`, no `report-audit.ts`, no
       `legacy-v1` report validation. Proof: `test/package-artifact.test.ts`'s required-file list is
       unchanged and `git status` shows no such file added.
+      Evidence: neither file exists; the only `legacy-v1` references left are the refusal in
+      `lib/runtime-results.ts` and the v10 migration guard in `store.ts`, both of which reject it. The
+      required-file list in `test/package-artifact.test.ts` is untouched by this change.
 
 ### US-005: The carried residuals are closed or explicitly retired
 
@@ -194,21 +212,45 @@ other, so that the record does not carry silent gaps.
 
 **Acceptance Criteria:**
 
-- [ ] An owned directory with no owned file beneath it produces no staged change. Proof: a test in
-      `test/runtime-staging.test.ts` asserting `stagedFiles` is 0 for that input — carried from
-      `prd-delegated-write-slice-settlement.md` US-001, currently unchecked.
-- [ ] `agentFsMountAbsent` is true after a settled attempt. Proof: a test asserting the field on a
-      resource whose mount the release path removed — carried from US-003, currently proven only
+- [x] An owned directory with no owned file beneath it produces no staged change. Proof: a test in
+      `test/runtime-staging.test.ts` asserting `stagedFiles` is 0 for that input - carried from
+      `prd-delegated-write-slice-settlement.md` US-001, previously unchecked.
+      Evidence: "an owned directory the worker created but left empty stages no change" runs a real
+      mounted AgentFS worker that does `mkdir -p app/topics` and nothing else, then asserts
+      `staged.files` is empty, `staged.changes` is empty, and the host tree is untouched.
+- [x] `agentFsMountAbsent` is true after a settled attempt. Proof: a test asserting the field on a
+      resource whose mount the release path removed - carried from US-003, previously proven only
       indirectly.
-- [ ] `sequence` is contiguous under two writers that overlap. Proof: a test racing two connections on one
-      store — carried from US-004 slice 2, which today exercises two connections sequentially.
-- [ ] The intermittently failing `herdr-worker-liveness.test.ts` case is diagnosed or recorded as
+      Evidence: the mount-leak case in `test/acpx-cleanup.test.ts` now asserts the field directly on both
+      sides of the release: `false` while the killed worker's real mount is still present, `true` after
+      `release_agentfs_session`. The case ran against a real mount (1.6 s, not skipped).
+- [x] `sequence` is contiguous under two writers that overlap. Proof: a test racing two connections on one
+      store - carried from US-004 slice 2, which previously exercised two connections sequentially.
+      Evidence: "two writers racing on one store take contiguous sequences, never the same one" starts two
+      processes that spin until a shared start time, each writing 25 entries to one story, and asserts the
+      50 sequences taken are exactly 1..50 with no gap and no duplicate. A manual run of the same shape
+      confirmed the writers genuinely interleave (one took 9-33 while the other took 1-8 and 34-50), so
+      the test is not passing by accidental serialization.
+- [x] The intermittently failing `herdr-worker-liveness.test.ts` case is diagnosed or recorded as
       accepted. Proof: either a fix with a test, or a recorded residual naming the observation (expected
       `null`, actual `invalid ACPX worker result: Expecting value: line 1 column 1 (char 0)`; passes 5/5
       alone; inferred writer-truncation race, unproven).
-- [ ] The two Low findings from the 2026-09-20 review are closed or accepted: one logical record name
+      Evidence: **diagnosed and fixed.** The inferred truncation race was real and in the product, not the
+      test: `scripts/acpx-worker.ts` created the result file with `openSync(resultPath, "wx")` and wrote
+      it afterwards, while `wait_for_settled_agent` polls `result_path.exists()` and then parses - so a
+      poll landing between create and write read an empty file and produced exactly that message. The
+      worker now writes a sibling temporary file, fsyncs it, and publishes by `renameSync`. The new case
+      "the worker publishes its result atomically" pins the rename, pins the absence of the old
+      create-then-write, and drives the real waiter against a writer using the same publish sequence.
+- [x] The two Low findings from the 2026-09-20 review are closed or accepted: one logical record name
       resolving under both `failures/<runId>/` and `evidence/<runId>/`, and a repeated `collect` response
       omitting `diagnosticsPath`.
+      Evidence: the never-dispatched record is now `unlaunched-<operationId>.json`, so it no longer shares
+      a name with a worker's `failure-<operationId>.json` bundle; the cancel test asserts the new name,
+      its `failures/` home, and that the old name is not taken. A repeated `collect` settles nothing and
+      so learns no path, but now reads the retained bundle back out of the settled outcome's error text;
+      `test/acpx-collect-convergence.test.ts` asserts the second response names the same existing bundle
+      as the first. Both READMEs record the rename.
 
 ## 4. Functional Requirements
 
