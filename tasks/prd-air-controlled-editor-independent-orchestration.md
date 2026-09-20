@@ -125,6 +125,12 @@ This PRD changes the current Herdr-only product direction. Before implementation
 - [x] Both real files receive private timestamped backups before atomic replacement; the final JSON files retain their original modes, contain no credential values, and rollback paths are recorded. Proof: `apply-manifest.json`; both backups exist mode 600, live files remain mode 644, and evidence secret scan reports 3 files / 0 findings.
 - [x] A bounded post-install check using the permanent `Pi Wave` entry initializes Pi ACP with the main Pi installation without changing graph data, dispatching workers, or creating Herdr resources. Proof: `agent-output/air-permanent-configuration/startup-check.json` records protocol v1, unchanged graph table counts, zero Herdr resources, and zero stderr bytes.
 
+**Maintainer confirmation, 2026-09-16.** Air `262.834.44`, newer than the `262.579.44` the rehearsals above
+drove, has been used with the permanent `Pi Wave` entry in the maintainer's own Air installation, and the
+maintainer confirms the support works (reported 2026-09-20). The automated rehearsal has not driven that
+build, so the claim for it rests on the maintainer's own run; both READMEs state the two versions
+separately rather than presenting the later one as rehearsed.
+
 ### US-008: Preserve optional Herdr compatibility
 
 **Description:** As an existing user, I want Herdr presentation to remain available so that the new Air path does not remove proven workflows.
