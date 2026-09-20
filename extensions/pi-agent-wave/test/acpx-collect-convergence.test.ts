@@ -1,6 +1,6 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -48,8 +48,8 @@ async function toolIn(dir: string, models: string[] = ["openai-codex/gpt-5.6-sol
 }
 
 /** Registers the planning operation as running on a headless worker whose launcher directory is already on disk. */
-async function startDeadAttempt(dir: string, options: { cancelExit: number; state: "alive" | "no-session" }): Promise<{ tool: Record<string, any>; runId: string; operationId: string; privateRunDir: string; diagnosticsPath: string }> {
-	const { tool } = await toolIn(dir);
+async function startDeadAttempt(dir: string, options: { cancelExit: number; state: "alive" | "no-session" }, invocations?: { command: string; args: string[] }[]): Promise<{ tool: Record<string, any>; runId: string; operationId: string; privateRunDir: string; diagnosticsPath: string }> {
+	const { tool } = await toolIn(dir, undefined, invocations);
 	const init = parsed(await tool.execute("init", { op: "init", story: "dead-attempt", graph: "build", task: "Plan the wave" }, undefined, () => {}, {} as ExtensionContext));
 	if (init.error) throw new Error(`init failed: ${init.error}`);
 	const operation = init.next.operations[0];
@@ -158,6 +158,71 @@ describe("terminated attempt convergence", () => {
 			const after = parsed(await started.tool.execute("next", { op: "next", runId: started.runId }, undefined, () => {}, {} as ExtensionContext));
 			assert.equal(after.operations.find((candidate: Record<string, unknown>) => candidate.id === started.operationId)?.status, "running", "a refused cancellation must leave the operation untouched for the supervisor to resolve");
 
+		} finally {
+			Object.assign(process.env, saved);
+		}
+	});
+
+	/** The shape run_315dce09 (2026-09-20) was left in: the launcher's own timeout tore the attempt down with nobody collecting. */
+	function tearDownOnDisk(started: { privateRunDir: string; diagnosticsPath: string }): void {
+		writeFileSync(started.diagnosticsPath, `${JSON.stringify({ schemaVersion: 1, reason: "attempt aborted before cleanup", workerResult: {}, processExitCode: null })}\n`, { mode: 0o600 });
+		rmSync(join(started.privateRunDir, "acpx", "dg-dead-thinker"), { recursive: true, force: true });
+	}
+
+	test("collect settles from retained teardown evidence without waiting", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "collect-torn-down-"));
+		dirs.push(dir);
+		const saved = { agentDir: process.env.PI_CODING_AGENT_DIR, db: process.env.DELEGATE_GRAPH_DB, herdrEnv: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID };
+		try {
+			const invocations: { command: string; args: string[] }[] = [];
+			const started = await startDeadAttempt(dir, { cancelExit: 1, state: "alive" }, invocations);
+			tearDownOnDisk(started);
+			assert.equal(existsSync(join(started.privateRunDir, "acpx", "dg-dead-thinker")), false);
+			const collected = parsed(await started.tool.execute("collect", { op: "collect", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(collected.error, undefined, `collect must settle from the bundle, got ${JSON.stringify(collected)}`);
+			assert.equal(collected.settled, true);
+			assert.equal(collected.attempt.processState, "failed");
+			assert.equal(collected.reason, "attempt aborted before cleanup", "the launcher's recorded reason is the settled reason");
+			assert.equal(collected.diagnosticsPath, started.diagnosticsPath);
+			assert.equal(invocations.some((call) => call.args.some((arg) => arg.endsWith("delegate.ts"))), false, "no wait may be spawned for a torn-down attempt");
+			const again = parsed(await started.tool.execute("collect", { op: "collect", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(again.error, undefined, `a repeated collect must be a no-op, got ${JSON.stringify(again)}`);
+			assert.equal(again.attempt.processState, "failed");
+			const retried = parsed(await started.tool.execute("retry", { op: "retry", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(retried.error, undefined, `retry must be accepted after settlement, got ${JSON.stringify(retried)}`);
+			assert.notEqual(retried.operation.status, "running");
+		} finally {
+			Object.assign(process.env, saved);
+		}
+	});
+
+	test("a failure bundle beside a live attempt directory is not a teardown", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "collect-bundle-live-"));
+		dirs.push(dir);
+		const saved = { agentDir: process.env.PI_CODING_AGENT_DIR, db: process.env.DELEGATE_GRAPH_DB, herdrEnv: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID };
+		try {
+			const invocations: { command: string; args: string[] }[] = [];
+			const started = await startDeadAttempt(dir, { cancelExit: 1, state: "alive" }, invocations);
+			// Bundle present (startDeadAttempt writes one) and the attempt directory still on disk: the existing wait path must run.
+			const collected = parsed(await started.tool.execute("collect", { op: "collect", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(collected.error, undefined, JSON.stringify(collected));
+			assert.equal(invocations.some((call) => call.args.some((arg) => arg.endsWith("delegate.ts"))), true, "a live attempt directory keeps the wait path");
+		} finally {
+			Object.assign(process.env, saved);
+		}
+	});
+
+	test("cancel converges on a torn-down attempt and closes the run", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "cancel-torn-down-"));
+		dirs.push(dir);
+		const saved = { agentDir: process.env.PI_CODING_AGENT_DIR, db: process.env.DELEGATE_GRAPH_DB, herdrEnv: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, tab: process.env.HERDR_TAB_ID };
+		try {
+			const started = await startDeadAttempt(dir, { cancelExit: 1, state: "alive" });
+			tearDownOnDisk(started);
+			const cancelled = parsed(await started.tool.execute("cancel", { op: "cancel", runId: started.runId, operationId: started.operationId }, undefined, () => {}, {} as ExtensionContext));
+			assert.equal(cancelled.error, undefined, `cancel must converge once the launcher is gone, got ${JSON.stringify(cancelled)}`);
+			assert.equal(cancelled.operation.status, "cancelled");
+			assert.equal(cancelled.state.status, "cancelled");
 		} finally {
 			Object.assign(process.env, saved);
 		}

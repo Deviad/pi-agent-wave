@@ -31,9 +31,9 @@ describe("ACPX Herdr presentation", () => {
 			: args[0] === "pane"
 				? ({ exitCode: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "pane-worker", tab_id: "tab-worker" } } }), stderr: "" })
 				: ({ exitCode: 0, stdout: "", stderr: "" });
-		await assert.doesNotReject(() => focusRegisteredAgent([complete], "worker", true, exec));
-		await assert.rejects(() => focusRegisteredAgent([{ ...complete, acpx_state: "idle" }], "worker", true, exec), /expected alive/);
-		await assert.rejects(() => focusRegisteredAgent([{ ...complete, agentfs_db_path: null }], "worker", true, exec), /incomplete ACPX\/AgentFS identity/);
+		await assert.doesNotReject(() => focusRegisteredAgent([complete], "worker", true, exec, () => true));
+		await assert.rejects(() => focusRegisteredAgent([{ ...complete, acpx_state: "idle" }], "worker", true, exec, () => true), /expected alive/);
+		await assert.rejects(() => focusRegisteredAgent([{ ...complete, agentfs_db_path: null }], "worker", true, exec, () => true), /incomplete ACPX\/AgentFS identity/);
 		const calls: string[][] = [];
 		const mismatchExec = async (command: string, args: string[]) => {
 			calls.push([command, ...args]);
@@ -42,7 +42,7 @@ describe("ACPX Herdr presentation", () => {
 				? { exitCode: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "other-pane", tab_id: "other-tab" } } }), stderr: "" }
 				: { exitCode: 0, stdout: "", stderr: "" };
 		};
-		await assert.rejects(() => focusRegisteredAgent([complete], "worker", true, mismatchExec), /identity mismatch/);
+		await assert.rejects(() => focusRegisteredAgent([complete], "worker", true, mismatchExec, () => true), /identity mismatch/);
 		assert.ok(calls.some((args) => args[0] === "/tmp/cancel-worker.sh"));
 		assert.equal(calls.some((args) => args.join(" ").includes("pane send-keys")), false);
 	});

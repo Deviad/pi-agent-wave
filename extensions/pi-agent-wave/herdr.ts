@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 export interface ExecResult {
 	exitCode: number;
 	stdout: string;
@@ -64,8 +66,12 @@ export async function focusHerdrAgent(agent: string, exec: CommandExecutor): Pro
 	if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || `failed to focus Herdr agent ${agent}`);
 }
 
-async function cancelRegisteredAttempt(agent: FocusableAgent, exec: CommandExecutor): Promise<void> {
+async function cancelRegisteredAttempt(agent: FocusableAgent, exec: CommandExecutor, launcherExists: (path: string) => boolean = existsSync): Promise<void> {
 	if (typeof agent.acpx_cancel_script !== "string" || !agent.acpx_cancel_script) return;
+	// abort_acpx_attempt removes the launcher with the attempt directory after a completed teardown, so an
+	// absent launcher means there is nothing left to cancel; a repeat cancel converges instead of reporting it.
+	// (pi.exec spawns with shell:false, so a missing path surfaces as a generic code 1, not 127.)
+	if (!launcherExists(agent.acpx_cancel_script)) return;
 	const cancelled = await exec(agent.acpx_cancel_script, []);
 	if (cancelled.exitCode !== 0) throw new Error([cancelled.stdout, cancelled.stderr].filter(Boolean).join("\n") || `failed to cancel ACPX attempt ${agent.acpx_attempt_key ?? "unknown"}`);
 	let observed = false;
@@ -79,10 +85,10 @@ async function cancelRegisteredAttempt(agent: FocusableAgent, exec: CommandExecu
 }
 
 /** Cancels the exact persisted ACPX attempt without requiring a presentation capability. */
-export async function cancelRegisteredAgent(agents: FocusableAgent[], target: string, exec: CommandExecutor): Promise<void> {
+export async function cancelRegisteredAgent(agents: FocusableAgent[], target: string, exec: CommandExecutor, launcherExists: (path: string) => boolean = existsSync): Promise<void> {
 	const agent = agents.find((candidate) => candidate.name === target || candidate.node === target);
 	if (!agent) throw new Error(`unknown Delegate Graph agent or node: ${target}`);
-	await cancelRegisteredAttempt(agent, exec);
+	await cancelRegisteredAttempt(agent, exec, launcherExists);
 }
 
 /** Resolves a graph node/agent to Herdr and rejects focus outside Herdr explicitly. */
@@ -91,6 +97,7 @@ export async function focusRegisteredAgent(
 	target: string,
 	herdrEnabled: boolean,
 	exec: CommandExecutor,
+	launcherExists: (path: string) => boolean = existsSync,
 ): Promise<void> {
 	const agent = agents.find((candidate) => candidate.name === target || candidate.node === target);
 	if (!agent) throw new Error(`unknown Delegate Graph agent or node: ${target}`);
@@ -100,34 +107,34 @@ export async function focusRegisteredAgent(
 	const attemptIdentity = [agent.role, agent.tab_id, agent.herdr_pane_id, agent.acpx_cancel_script, agent.acp_agent, agent.acpx_session_id, agent.acpx_record_id, agent.acpx_attempt_key, agent.acpx_state, agent.agentfs_session_id, agent.agentfs_db_path];
 	if (attemptIdentity.some((value) => value !== undefined && value !== null)) {
 		if (attemptIdentity.some((value) => typeof value !== "string" || !value.trim())) {
-			await cancelRegisteredAttempt(agent, exec);
+			await cancelRegisteredAttempt(agent, exec, launcherExists);
 			throw new Error(`incomplete ACPX/AgentFS identity for ${target}`);
 		}
 		const attemptParts = agent.acpx_attempt_key!.split(":");
 		if (agent.acpx_record_id !== agent.acpx_session_id || agent.agentfs_session_id !== agent.acpx_session_id || attemptParts.length < 7 || attemptParts[2] !== agent.role || attemptParts.at(-1) !== agent.acp_agent) {
-			await cancelRegisteredAttempt(agent, exec);
+			await cancelRegisteredAttempt(agent, exec, launcherExists);
 			throw new Error(`ACPX attempt identity mismatch for ${target}`);
 		}
 		if (agent.acpx_state !== "alive") {
-			await cancelRegisteredAttempt(agent, exec);
+			await cancelRegisteredAttempt(agent, exec, launcherExists);
 			throw new Error(`ACPX session for ${target} is ${agent.acpx_state ?? "unknown"}, expected alive`);
 		}
 		const observed = await exec("herdr", ["pane", "get", agent.herdr_pane_id!]);
 		if (observed.exitCode !== 0) {
-			await cancelRegisteredAttempt(agent, exec);
+			await cancelRegisteredAttempt(agent, exec, launcherExists);
 			throw new Error(observed.stderr || `Herdr pane ${agent.herdr_pane_id} is unavailable`);
 		}
 		let pane: unknown;
 		try { pane = JSON.parse(observed.stdout); }
 		catch {
-			await cancelRegisteredAttempt(agent, exec);
+			await cancelRegisteredAttempt(agent, exec, launcherExists);
 			throw new Error(`invalid Herdr pane observation for ${target}`);
 		}
 		const record = typeof pane === "object" && pane !== null ? pane as Record<string, unknown> : {};
 		const result = typeof record.result === "object" && record.result !== null ? record.result as Record<string, unknown> : {};
 		const value = typeof result.pane === "object" && result.pane !== null ? result.pane as Record<string, unknown> : {};
 		if (value.pane_id !== agent.herdr_pane_id || value.tab_id !== agent.tab_id) {
-			await cancelRegisteredAttempt(agent, exec);
+			await cancelRegisteredAttempt(agent, exec, launcherExists);
 			throw new Error(`Herdr pane identity mismatch for ${target}`);
 		}
 	}
