@@ -281,6 +281,78 @@ reachable on this host, so this was a single-reviewer pass.
 Checked and found sound: the ledger command rejects unsupported outcomes and claim statuses, and a
 non-numeric aggregate fails the insert with no partial entry left behind.
 
+## 3c. Live measurement evidence (2026-09-20)
+
+Authorized live run at `e0d9575`, research graph, 1 repeat, model `alibaba/qwen3.8-flash` (Pi adapter),
+dispatched through the production tool headless. Exit 0, terminal, 156,150 ms, 4 dispatches,
+4 completions, 0 retries, 0 model fallbacks, 0 failures; operations `thinker_split` READY,
+`search` DONE, `search` DONE, `thinker_synthesize` DONE. Evidence:
+`agent-output/runtime-measure-2026-09-20/` (`summary.md`, `summary.json`, `run-runtime-v1-1.json`,
+`ledger-runtime-v1-1.json`); run root kept deliberately at `/tmp/pi-wave-measure-runtime-v1-Zm2a74`
+with `evidence/run_7d35cc20-.../` holding 4 settlement and 4 cleanup records.
+
+Two things this run proves that no fixture could:
+
+- **The US-003 endpoint works on a real dispatch.** Attached as an operator to the live attempt
+  directory's endpoint while a thinker was running: the per-attempt token was mode 600, a connection
+  presenting the wrong token received `unauthorized` and no worker output, and a connection presenting
+  the token received the worker's own rendered stream (assistant text plus the dimmed-thought and
+  prompt-rule rendering). This is US-003 verified end to end rather than against a fixture.
+- **Cleanup and the US-001 bound both held.** All 4 operation run directories were removed after
+  settlement, the 8 evidence records survived, and no `failures/` directory, no retained capture and no
+  failure bundle were produced, because every attempt settled with a candidate. The new candidate-less
+  branch therefore did not misfire on a healthy run.
+
+## 3d. Review findings after the live run (2026-09-20)
+
+- **High, needs a decision before merge - the headless live stream has no consumer, so the default
+  transport lost its live view.** The measurement driver always dispatches `transport: "headless"`
+  (`test/support/runtime-measure.ts:222`), so the driver's `op=watch` samples measure exactly this.
+  Today's run: 6 samples, 6 agent rows, **0 carrying any `lastActivity`**; every sample reports
+  `paneId: null`. Earlier headless runs recorded live activity from the stream file the display paths
+  then read: `runtime-measure-codex-build-20260912` 30/30 rows, `runtime-measure-watch-20260912` 12/12
+  (and 12/12 with `toolCalls`), `runtime-measure-codex-20260912` 10/10,
+  `runtime-measure-codex-operations-20260912` 10/10. So on the same transport, before this change the
+  watch view showed the worker's activity and now it shows nothing.
+  This is not a criterion violation: FR-5 requires saying so, and the views do say so, while US-003 only
+  requires the endpoint to exist and be reachable, which is now proven. But US-003 exists because
+  "headless has no live view at all", and it currently delivers an endpoint no in-product view reads, so
+  the problem it was written for is still the operator's experience on the default transport.
+  Fix (small, one increment): in `attemptDetail`/`watchRun`, when `herdr_pane_id` is null, derive the
+  attempt directory from `dirname(agent.acpx_cancel_script)`, read its `*.stream-endpoint.json` and
+  `*.stream-token`, and present a bounded subscriber read as `liveOutput`; otherwise record the gap
+  explicitly as an accepted follow-on with the operator-visible wording.
+- **Medium - a subscriber with no grace period is dropped on the first full socket buffer.** The review
+  fix drops on the first `BlockingIOError`. Verified both ways: a prompt reader loses nothing (5000 of
+  5000 lines, complete and in order) and a stalled reader no longer wedges the worker (0.5 s against a
+  60 s budget, versus a permanent stall before the fix). But a consumer that pauses longer than its
+  socket buffer holds loses the view silently and irrecoverably: there is no backlog resync and no
+  notice. Latent today because nothing consumes the endpoint; it must be settled when a consumer is
+  wired. Fix: keep a resync path (mark the subscriber behind, replay from the backlog when writable)
+  rather than dropping outright.
+- **Medium - a repeated `collect` still reports no `diagnosticsPath` for a candidate-less settle.** The
+  symmetry closed in US-005 holds for launcher-failure settlements, whose outcome error names the
+  bundle, but not for candidate-less clean settles: `finalizeRunDirectory` retains that bundle after the
+  outcome is recorded and the outcome's error text does not name it. No consequence today (the repeated
+  response is a no-op and the bundle is on disk), but the asymmetry is real. Fix: name the retained
+  bundle in the candidate-less outcome error, the way the launcher path does.
+- **Low - path containment is lexical, not symlink-aware.** `retainedDiagnosticFromOutcome` accepts a
+  path under `evidence/` via `resolve()`, which does not resolve symlinks, so a symlink placed inside the
+  evidence home pointing outside would pass. Requires write access to a mode-700 store directory. Fix:
+  check containment against `realpathSync`.
+- **Low - `_greet` can deliver the backlog after newer live lines.** The backlog string is captured under
+  the lock and sent after releasing it, so a publish racing in that window can append a live line first.
+  Cosmetic ordering for a live view, no loss. Fix: send the backlog before registering the subscriber.
+
+**Process finding, disclosed rather than buried.** Commits `d71e836` and `da9dfad` swept in work that was
+already dirty in the tree from a previous session - the schema v12 ledger tables (`store.ts`, `types.ts`),
+three test files, two task documents and the AGENTS.md/README edits - while their messages describe only
+US-001 to US-005. The swept-in work was checked and is sound: v12 is purely additive (0 `ALTER`/`DROP`/
+`RENAME` operations, so no table rebuild), the seeded v1-v5 migration tests migrate to
+`CURRENT_SCHEMA_VERSION` and preserve legacy rows (13/13 passing), and `ledger_entries` holds no foreign
+key to `runs`, so `prune` cannot cascade into a story's record. The provenance is still misreported by
+`git log` and the PR body must say so, or the commits must be split.
+
 ## 4. Functional Requirements
 
 - FR-1: A retained capture must be bounded by the diagnostic windows already used for failure bundles.
