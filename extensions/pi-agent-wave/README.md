@@ -31,9 +31,10 @@ This document is the reference for installing, configuring, and operating the pa
 | ACPX | `0.13.2` | Worker execution for Pi, Codex, and Claude |
 | Turso AgentFS | `0.6.4` | One copy-on-write sandbox per attempt |
 | pi-acp | `0.0.31` | Air's ACP bridge to Pi |
+| JetBrains Air | `262.579.44` in the recorded rehearsal | Drives Pi through `pi-acp` in headless mode; Herdr is not required |
 | Herdr | any current release | Optional visible worker tabs |
 
-ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them.
+ACPX `0.13.2` and AgentFS `0.6.4` are hard requirements: the package fails before registration when either is absent or mismatched. No compatibility is claimed outside this matrix. ACPX, AgentFS, `pi-acp`, Herdr, and the ACP adapter packages are external runtimes; pi-agent-wave bundles none of them. JetBrains Air is proven by the installed-application rehearsal recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md` and confirmed again by the maintainer in their own Air installation (2026-09-20); the architecture, including the per-attempt execution path and what a run retains, is documented in the repository root README.
 
 ## Install
 
@@ -385,6 +386,35 @@ Call `init`, then repeat `next -> dispatch -> collect -> [integrate] -> decide |
 
 ## Worker lifecycle
 
+### One attempt, end to end
+
+The picture below is what one `dispatch` creates and what one `collect` tears down. Every box is a process or a file this package owns; the graph database is the only thing that outlives the attempt.
+
+```mermaid
+flowchart TB
+    pi["Pi supervisor session<br/>extension host · delegate_graph tool"]
+    store[("GraphStore · SQLite schema v12<br/>runs · agents · operations · runtime_attempts<br/>events · ledger_entries · ledger_claims · ledger_aggregates")]
+    transport["scripts/delegate.ts<br/>headless_delegate.py · herdr_delegate.py"]
+    sup["headless_supervisor.py<br/>owns the PTY, the capture files, the live stream"]
+    pane["Herdr tab and pane<br/>the worker's own rendered output"]
+    overlay["agentfs run --session attempt-key<br/>copy-on-write overlay, mode-600 credential inside"]
+    acpx["scripts/acpx-worker.ts → ACPX → agent CLI<br/>Pi · Codex · Claude"]
+    view["/graph watch · --follow · the agent list"]
+
+    pi -->|"next operation, then decisions"| store
+    pi -->|"op=dispatch"| transport
+    transport --> sup
+    transport -->|"creates the tab"| pane
+    sup -->|"launcher argv, under a private PTY"| overlay
+    overlay --> acpx
+    acpx -->|"staged owned paths"| overlay
+    pane -.->|"herdr pane read"| view
+    sup -.->|"loopback stream, bearer token"| view
+    sup -->|"status, settlement and cleanup evidence"| pi
+```
+
+The repository root README carries the same picture at product level, together with what a run retains and where it is written.
+
 ### Transport
 
 Execution is ACPX-only. Headless runs without Herdr. `auto` selects Herdr only when the `herdr` executable and complete workspace and tab identity are present; explicit `herdr` fails closed without them, and explicit `headless` creates no Herdr resource. Both adapters share planning, launch, audit, cancellation, settlement, and cleanup, and both deliver the same frozen policy, model identity, role, and failover route.
@@ -423,7 +453,7 @@ The answer and the audited overlay changes are retained as content-addressed pri
 
 Cancellation, focus failure, abort, retry, and cleanup all run the same persisted `acpx-cancel.ts` boundary: it validates the ACPX session, record, attempt key, and AgentFS session cwd, requires structured cancel acknowledgement and the transition to `idle` or `no-session`, then requires `session_closed` and final `no-session`.
 
-Cleanup audits the queue owner, ACPX session files, AgentFS mount, server, database, and HOME, provider links, Herdr agent, pane, and tab, owned processes, and the attempt directory, and records that audit as `cleanup-<agent>.json` every time, including a repeat cleanup of an already torn-down attempt. Absence is the goal: a present resource is a failure, an already-absent one converges. `sessionClosed` is true only from an observed cancellation, an observed close, or a session absent from both session files and owned processes, and `sessionClosureEvidence` says which. Cleanup names credential targets by basename only.
+Cleanup audits the queue owner, ACPX session files, AgentFS mount, server, database, and HOME, provider links, Herdr agent, pane, and tab, owned processes, and the attempt directory, and records that audit as `cleanup-<agent>.json` every time, including a repeat cleanup of an already torn-down attempt. Absence is the goal: a present resource is a failure, an already-absent one converges. A settled Herdr worker's tab is closed as part of settling, after its ACPX session closes and before this audit, so a run that settles happily converges without an operator cleanup pass; a close that fails is reported with the audit's own failure rather than replacing it. `sessionClosed` is true only from an observed cancellation, an observed close, or a session absent from both session files and owned processes, and `sessionClosureEvidence` says which. Cleanup names credential targets by basename only.
 
 ### Watching a worker
 
@@ -431,7 +461,7 @@ The worker runs ACPX with `--format json --json-strict` because settlement needs
 
 The live views read that terminal, not the capture file. `/graph watch`, `op=watch` and the agent list run `herdr pane read <pane_id> --source recent` for each running worker, so what an operator sees is the worker's own output and deleting the capture file changes nothing. A worker whose transport has no terminal reports that plainly instead of falling back to a file. `/graph watch --follow` is the navigable form: the summary stays on screen above the editor, a number plus Enter opens a worker's details, and it closes on `q`. `/graph focus` is the only command that brings a Herdr tab forward.
 
-A headless worker has no pane, so its supervisor publishes the same output live on a loopback endpoint instead: a `127.0.0.1` listener on an ephemeral port, admitting only a connection that presents the per-attempt bearer token written mode 600 beside the run's other private files. A subscriber receives a bounded window of what was already emitted and then the live lines. The channel retains nothing: the listener, the token, and the endpoint descriptor are all gone once the supervisor exits. The bind is probed before dispatch, so an unavailable loopback is the named blocker `live worker stream unavailable: cannot bind a loopback listener on 127.0.0.1 (<code>)` rather than a worker that starts and cannot be watched.
+A headless worker has no pane, so its supervisor publishes the same output live on a loopback endpoint instead: a `127.0.0.1` listener on an ephemeral port, admitting only a connection that presents the per-attempt bearer token written mode 600 beside the run's other private files. A subscriber receives a bounded window of what was already emitted - the most recent output, capped in number of pieces and in total size, so a late subscriber is shown where the worker is and the channel's memory cannot grow with the worker - and then the live output as the worker writes it, whether or not it has ended a line. The channel retains nothing: the listener, the token, and the endpoint descriptor are all gone once the supervisor exits. The bind is probed before dispatch, so an unavailable loopback is the named blocker `live worker stream unavailable: cannot bind a loopback listener on 127.0.0.1 (<code>)` rather than a worker that starts and cannot be watched.
 
 The loopback backend is chosen because it behaves identically on macOS, Linux and Windows, but **Windows remains unsupported**, for three reasons this channel does not address: `scripts/headless_supervisor.py` requires the private PTY executable `script`, which Windows does not provide; `scripts/doctor.mjs` fails on any platform other than `darwin` or `linux`; and AgentFS v0.6.4, a hard requirement, needs FUSE and Linux mount namespaces. These are recorded gates, not solved problems.
 

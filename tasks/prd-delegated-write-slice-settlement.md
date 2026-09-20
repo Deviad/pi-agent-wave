@@ -80,9 +80,13 @@ purpose.
       naming the path. Proof: the first test asserts `violations` equals
       `["app/stray.txt", "stray-dir"]`; the second asserts staging throws
       `/unowned changes: app\/stray\.txt/`.
-- [ ] An owned directory with no owned file beneath it produces no staged change. The
-      directory filter makes this hold, but no dedicated test pins it, so it stays
-      unchecked rather than rounded up.
+- [x] An owned directory with no owned file beneath it produces no staged change. **Closed
+      2026-09-20** by US-005 of `tasks/prd-live-worker-stream-and-ledger-retirement.md`, which
+      carried this criterion and pinned it: `an owned directory the worker created but left empty
+      stages no change` in `test/runtime-staging.test.ts` runs a real mounted AgentFS worker that
+      does `mkdir -p app/topics` and nothing else, then asserts `staged.files` and `staged.changes`
+      are empty and the host tree untouched. Left unchecked when this slice closed because the
+      directory filter made it hold without a dedicated test.
 - [x] The gate reports no failure this change introduced. Proof: `node
       --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts` from the
       repository root reports 550 tests, 539 pass, 0 fail, 11 skipped, with `npm run
@@ -133,11 +137,12 @@ so that leaked mounts stop hanging reads and raising macOS dialogs.
 - [x] The macOS branch is used, where `agentfs prune mounts` refuses. Proof: the release
       uses `umount -f` and the test above runs against a real macOS mount, confirming the
       probe saw a mount and that none remained.
-- [ ] `agentFsMountAbsent` is true for a settled attempt. Proven indirectly only: the
-      mount-leak test asserts no mount remains for the attempt, and the inventory case
-      `rejects remaining agentfs-mount` pins `agentFsMountAbsent` false while mounted. No
-      test drives a full settle with a real mount to assert the field true, so it stays
-      unchecked.
+- [x] `agentFsMountAbsent` is true for a settled attempt. **Closed 2026-09-20** by US-005 of
+      `tasks/prd-live-worker-stream-and-ledger-retirement.md`: the mount-leak case in
+      `test/acpx-cleanup.test.ts` now asserts the field directly on both sides of the release
+      (`agentFsMountAbsentBeforeRelease` false, `agentFsMountAbsentAfterRelease` true) against a
+      real mount, so it is no longer inferred from "no mount remains". Left unchecked when this
+      slice closed because the field was proven only indirectly.
 - [x] Repeated teardown over an already-unmounted attempt converges. Proof: the existing
       `repeated teardown over a torn-down attempt converges with written absence evidence`
       still asserts `exits` of `[0, 0, 0]`.
@@ -204,13 +209,15 @@ entry to a configuration surface this repository enumerates explicitly (`PI_CODI
       `test/runtime-operations.test.ts` now read `CURRENT_SCHEMA_VERSION`, and that last file's
       `DELETE FROM schema_version WHERE version IN (9, 10, 11)` became `version >= 9`. Without this
       the bump cost thirteen failing assertions across five files.
-- [ ] `sequence` replaces the file lock under genuinely concurrent writers. Two connections are
-      exercised — `numbers entries per story, so the sequence replaces the file lock` asserts
-      per-story contiguity, independence across stories, and that a second connection on the same
-      database computes the same next number — but not simultaneous writers, so this stays
-      unchecked. What holds: SQLite's `BEGIN IMMEDIATE` serializes the read and the insert, and the
-      unique index on `(story, sequence)` refuses the loser rather than allowing a gap. What is
-      missing: a test that races two writers.
+- [x] `sequence` replaces the file lock under genuinely concurrent writers. **Closed 2026-09-20**
+      by US-005 of `tasks/prd-live-worker-stream-and-ledger-retirement.md`: `two writers racing on
+      one store take contiguous sequences, never the same one` in `test/story-ledger.test.ts` starts
+      two processes that spin until a shared start time, each writing 25 entries to one story, and
+      asserts the 50 sequences taken are exactly 1..50 with no gap and no duplicate. A manual run of
+      the same shape confirmed the writers genuinely interleave, so it does not pass by accidental
+      serialization. Left unchecked when this slice closed because only sequential connections had
+      been exercised; what held then — `BEGIN IMMEDIATE` serializing the read and the insert, with
+      the unique index on `(story, sequence)` refusing the loser — is what the racing test now pins.
 - [x] Pruning a run cannot delete the story's ledger entries. Proof:
       `pruning a run keeps the story's record, because the entry outlives its run` asserts the run
       is gone while the entry, its sequence and its `runId` survive; verified to fail alone (5/6)
@@ -234,11 +241,20 @@ and timestamp, which is what the record needs to be auditable on its own.
 
 **Acceptance Criteria (slice 3 — not started):**
 
-- [ ] The `delegate-ledger` CLI writes through the store, and no file ledger is written.
-      Proof: a test asserting ledger rows appear and that no
-      `agent-output/<story>/delegate-ledger/*.json` is created.
-- [ ] The wrapper and its package-resolution problem are gone, and the evidence-ledger rule
-      in `~/.pi/agent/AGENTS.md` names the store instead of a script path.
+- [x] The `delegate-ledger` CLI writes through the store, and no file ledger is written. **Closed
+      2026-09-20** by US-004 of `tasks/prd-live-worker-stream-and-ledger-retirement.md`:
+      `the command surface writes through the store and audits from it, creating no ledger file` in
+      `test/story-ledger.test.ts` runs `scripts/story-ledger.mjs`, reads the entry, its claims and
+      its aggregates back through `storyLedger`, and asserts no `delegate-ledger` directory and no
+      ledger JSON file exist beside the store.
+- [x] The wrapper and its package-resolution problem are gone, and the evidence-ledger rule
+      in `~/.pi/agent/AGENTS.md` names the store instead of a script path. **Closed 2026-09-20** by
+      US-004 of the same PRD. The wrapper `~/.pi/agent/scripts/delegate-ledger` resolves
+      `scripts/story-ledger.mjs` from the package `settings.json` loads and runs it with
+      `--experimental-strip-types`; the rule in `~/.pi/agent/AGENTS.md` names the store tables and no
+      script path. Independently re-checked on 2026-09-20 while reviewing the successor increment: the
+      wrapper run against a temporary `DELEGATE_GRAPH_DB` exited 0 with `action: ledger_read` and named
+      the store, and the package entry in `settings.json` is the tree that carries the script.
 
 **The 109 existing runs at the old path are documented, not moved.** Slice 1 changes the
 default and records the old location and the `DELEGATE_GRAPH_DB` escape hatch in the storage

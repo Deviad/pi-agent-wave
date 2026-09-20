@@ -162,7 +162,8 @@ file, on a mechanism that can support Windows later.
       test asserting no file is created for the endpoint beyond the token.
       Evidence: the test asserts the run directory after exit holds only the launcher, the fixture gate,
       and the capture path's `status.json`, `stderr` and `stdout`; the token and endpoint descriptor are
-      gone. A late subscriber gets a bounded in-memory window (`STREAM_BACKLOG_LINES`), never a replay file.
+      gone. A late subscriber gets a bounded in-memory window (`STREAM_BACKLOG_CHUNKS` entries, capped by
+      `STREAM_BACKLOG_BYTES`), never a replay file.
 - [x] The three Windows gates are recorded as gates, not solved here. Proof: this PRD's §5 and §6, plus a
       note in the package README that Windows is unsupported until they are addressed.
       Evidence: the "Watching a worker" section of `extensions/pi-agent-wave/README.md` names all three
@@ -309,8 +310,124 @@ merely exists.
       Evidence: section 3e - 10 of 10 agent rows carry activity, against 0 of 6 in the run that opened
       this finding.
 
-## 3b. Review findings fixed after implementation (2026-09-20)
+### US-007: A settled Herdr worker's tab is closed before the absence audit, and the live proof reports what it found
 
+**Description:** As an operator running the Herdr transport, I want a worker that settles happily to be
+closed down like any other, so that a successful run does not report a post-settlement failure and leave
+its tab depending on an operator cleanup pass; and as the reader of a live measurement, I want a
+post-settlement failure to appear in its summary, so that the standard proof cannot report zero failures
+while every operation failed its cleanup audit.
+
+**Context:** section 3d records this as an OPEN, pre-existing High finding: `close_settled_tab` is reached
+only from the two failure branches of `wait_for_settled_agent`, a runtime-v1 worker returns through an
+earlier branch, and `verify_cleanup_absence` then requires the tab absent. The 2026-09-20 Herdr run's
+evidence shows the consequence directly - 4 `runtime-settlement-*.json` and 0 `cleanup-*.json`, against 4
+of each in both headless runs - and the driver did not report it because it never read
+`postSettlementFailures`.
+
+**Acceptance Criteria:**
+
+- [x] The created tab is closed once the worker has settled and its ACPX session is closed, before the
+      cleanup absence audit, rather than only on the failure branches of `wait_for_settled_agent`. Proof:
+      a case in `test/runtime-lifecycle-python.test.ts` driving the shipped `settle_runtime_attempt` with
+      `ACTIVE_TRANSPORT='herdr'`, the real `verify_cleanup_absence`, and a stateful `herdr` stub whose
+      tab listing reflects the close: the recorded call order puts the close before the audit, the audit
+      passes, `cleanupEvidencePath` is returned, and `postSettlementFailures` is empty.
+      Evidence: case `a settled Herdr worker's tab is closed before the absence audit, and a close that
+      fails is still reported` in `test/runtime-lifecycle-python.test.ts`. The Herdr CLI is an executable on
+      `PATH` (`test/support/herdr-shim/herdr`) rather than a replaced Python `run()`, because replacing
+      `run()` bypasses the check that makes a failing `herdr` call a failure - the fixture was corrected for
+      exactly that reason. It records the calls
+      `tab close tab-fixture`, `tab list --workspace workspace-fixture`, `pane get pane-fixture`,
+      `agent get fixture-worker`, so the close precedes the audit and the audit is the shipped one. The
+      happy case asserts `postSettlementFailures` empty, `cleanupEvidencePath` present and resolving,
+      `closed_tabs` holding the tab, and the attempt directory removed. Verified to fail (5 of 6) with the
+      close reverted in `scripts/delegate_core.py` and to pass (6 of 6) with it restored.
+- [x] A tab close that genuinely fails is reported as a post-settlement failure and never passes the
+      audit. Proof: the same case with the `herdr tab close` stub exiting non-zero: `postSettlementFailures`
+      names the close failure, no cleanup evidence path is returned, and the audit's failure names the tab.
+      Evidence: with the shim's close exiting 1 the same case reports `postSettlementFailures` as
+      `command failed (1): ['herdr', 'tab', 'close', 'tab-fixture']\nherdr: tab is busy` followed by
+      `cleanup absence audit failed: tabAbsent; paneAbsent; agentAbsent`, with `cleanupEvidencePath` null and
+      the tab still listed. The close failure does not replace the audit's failure, which is the reason the
+      close is a separate step rather than another statement inside the audit's `try`.
+- [x] The measurement driver records each collect's `postSettlementFailures`, so a run whose cleanups
+      failed cannot report zero failures. Proof: mutation-checked live - with the close reverted (the
+      defect present) the authorized `--transport herdr` run reports the post-settlement failures in
+      `summary.json` and `summary.md` while its operations still settle; with the fix present it reports
+      none. Both summaries are recorded beside the run's evidence.
+      Evidence: section 3f - the defect phase reported 4 and the fixed phase 0, from the same tree, model
+      and graph, differing only in the close. The defect phase's `summary.md` carries `post-settle 4`
+      beside `failures 0`, which is the reporting gap closed: the run can no longer claim a clean teardown
+      while its audit failed 4 times.
+- [x] The finding is closed end to end on the transport it was opened on: an authorized `--transport
+      herdr` measurement whose retained evidence holds a cleanup record for every settlement and whose
+      worker tabs are gone by the time the run ends. Proof: the run's evidence directory carrying
+      `cleanup-*.json` beside `runtime-settlement-*.json` (the 2026-09-20 run retained 4 settlement
+      records and 0 cleanup records), and a `herdr tab list` taken after the run showing no tab for the
+      run's panes.
+      Evidence: section 3f - the fixed phase retained 4 cleanup records beside its 4 settlement records,
+      and `herdr tab list` listed no tab naming its run afterwards, while the reverted phase left 4 tabs
+      open until they were closed. Reproduce both directions with
+      `test/support/herdr-settle-mutation-proof.sh`; it spends provider credit and so needs the user's
+      authorization, and it restores the tree from a verified copy on every exit path.
+
+### US-008: The supervisor's drain reaches both sinks as the worker writes, newline or not
+
+**Description:** As the reader of a worker's live view or of its capture file, I want output to appear when
+the worker writes it, so that a worker printing without ever ending a line is visible while it runs instead
+of only once it exits.
+
+**Context:** section 3d records this as the Low finding opened by the US-007 review. `drain` in
+`scripts/headless_supervisor.py` reads with `readline`, so it waits for a line ending: output with no newline
+reaches neither the capture file nor the live channel, and a line that never ends stays invisible until the
+worker exits and is held in the reader meanwhile. It is not a regression from the behaviour that preceded
+US-003 - `read(size)` waited for 8 KB or EOF, which was worse - but it is the remaining half of the same
+defect, and the fix has to keep what the line-oriented read got right: a late subscriber still needs a bounded
+window of recent output rather than everything the worker ever wrote. Implementing it settled how: the drain
+publishes what arrives as it arrives, without reshaping it to look like lines, and the channel's window is
+bounded in bytes as well as in entries (`STREAM_BACKLOG_CHUNKS`, `STREAM_BACKLOG_BYTES`) so publishing every
+chunk cannot grow the supervisor's memory the way keeping every chunk would. The first attempt kept the
+drain line-shaped and flushed an unterminated remainder only past a size bound; the new case failed it,
+because a small line with no ending was still withheld from the view.
+
+**Acceptance Criteria:**
+
+- [x] The capture file advances with the worker's output as it arrives, not at a line ending. Proof: a case
+      in `test/stream-endpoint.test.ts` driving `test/support/partial-line-driver.py`, where the shipped
+      supervisor runs a launcher that prints text with no newline and then waits for a gate file: while the
+      gate is still closed the capture file already holds that text. Verified to fail when `drain` is
+      reverted to `readline`.
+      Evidence: `output with no newline reaches the capture and the channel while the worker is still running`
+      in `test/stream-endpoint.test.ts`. The gate makes the observation conclusive: the launcher cannot exit
+      until the gate file exists, and the case asserts the gate was still absent when the capture was seen to
+      hold the marker. Reverting `drain` to the pre-fix `readline` loop fails that assertion first, with
+      `the capture must advance as the worker writes, not at a line ending`, observed; restoring it passes.
+- [x] The live channel offers the same output while the worker runs, and its window stays bounded in entries
+      and in bytes as output arrives, so a worker that never ends a line is visible without the channel
+      growing with it. Proof: the same case asserts the subscriber received the text while the gate was
+      closed, and a window case publishing far more bytes than the cap asserts the subscriber sees the newest
+      piece and not the oldest.
+      Evidence: the same test - `channelWhileRunning` is the unterminated marker itself, read from a real
+      socket while the worker was gated. The drain is also driven directly over a real pipe: a 20,000-byte
+      run with no line ending arrives in parts (3 parts, largest 8,192 bytes, the read limit) instead of one
+      held-then-dumped chunk, and the parts concatenate to exactly the bytes the capture holds. The window
+      case publishes 50 chunks of 1,000 bytes into a 5,000-byte cap on a real listener and finds the newest
+      chunk in the subscriber's window, the oldest absent, and the window within one chunk of the cap.
+- [x] The capture keeps the newline shape it had before this change, so no consumer or existing assertion
+      sees a different file: the PTY's `\r\n` is still normalized to `\n`, including when that pair straddles
+      two reads. Proof: the drain case compares the capture byte-for-byte with the normalized input, and
+      `test/headless-pi-stdio.test.ts` and the endpoint driver's exact-content assertions pass unchanged.
+      Evidence: the driver writes a run, then a `\r` alone, waits until the capture holds the run **without**
+      that character - which is only true while it is held back for the next read - then writes the `\n`; the
+      capture and the channel's parts both equal `run + "\n" + "after\n"`, one newline and not two. The whole
+      gate passed unchanged, including `test/headless-pi-stdio.test.ts`'s exact capture assertion. One
+      deliberate difference: a byte sequence that is not valid UTF-8 is now replaced in the capture instead
+      of raising inside the drain thread, which is what the text-mode decoder did before.
+- [x] Gate. Proof: the completion gate's fresh counts for this change, recorded in section 3g.
+      Evidence: section 3g.
+
+## 3b. Review findings fixed after implementation (2026-09-20)
 An adversarial self-review of the implemented change found three defects, each proven against a real
 worker or a real hanging executable before and after the fix. No Astra reviewer was configured or
 reachable on this host, so this was a single-reviewer pass.
@@ -369,8 +486,9 @@ Two things this run proves that no fixture could:
   `lastActivity`**; earlier headless runs had recorded 30/30 and 12/12 from the capture file the display
   paths then read. On the default transport the live view therefore showed nothing. It now reads the
   published stream: section 3e records 10 of 10 rows carrying activity in a fresh headless run.
-- **High - a Herdr settlement leaves its tab open and reports a post-settlement failure. OPEN, and
-  pre-existing rather than a regression.** Observed in the Herdr run of section 3e: all 4 operations
+- **High - a Herdr settlement leaves its tab open and reports a post-settlement failure. FIXED and proven on
+  the transport it was opened on.** Pre-existing rather than a regression: observed in the Herdr run of
+  section 3e, all 4 operations
   settled with `postSettlementFailures: 1`, no cleanup evidence was retained (the headless run of the
   same shape retained four), and tabs `wT:t2`-`wT:t5` were still open after the run ended. Reproduced
   directly against real Herdr state, with no provider turn: `verify_cleanup_absence` for a resource whose
@@ -384,6 +502,12 @@ Two things this run proves that no fixture could:
   measurement driver records `record.failures` from collect errors and capture retention only, so a
   post-settlement failure is invisible in its run record. **Fix needed:** close the settled tab before
   the absence audit, and have the driver surface `postSettlementFailures` so the class cannot hide again.
+  **Fixed 2026-09-20:** `settle_runtime_attempt` now closes the settled tab after the ACPX session closes
+  and before the audit, and a close that fails is recorded beside the audit's own failure instead of
+  skipping it; the measurement driver records each collect's `postSettlementFailures` under a `post-settle`
+  column. See US-007 for the proof and section 3f for the live evidence: the mutation pair reported 4
+  post-settlement failures with the close reverted and 0 with it restored, and the tabs followed the same
+  way. The four tabs the reverted phase left were closed afterwards.
 - **Medium - a post-settlement failure replaces the candidate-less reason in the failure bundle.** The
   abort path writes the same `failure-<operationId>.json` the candidate-less path writes, so when a later
   step fails, the human-readable reason becomes "attempt aborted before cleanup". Observed and pinned by
@@ -394,6 +518,13 @@ Two things this run proves that no fixture could:
   from the previous review. The viewer now polls the backlog rather than holding a subscriber open, which
   is what keeps a view from losing its stream when it falls behind, but the policy itself is unchanged.
 - **Low - `_greet` can deliver the backlog after newer live lines.** Unchanged.
+- **Low - the supervisor's drain is line-oriented, so output without a newline waits. FIXED by US-008.**
+  `drain` in `scripts/headless_supervisor.py` read with `readline`, so output with no newline reached
+  neither the capture file nor the live channel until one arrived, and a line that never ended stayed
+  invisible until the worker exited. It now reads whatever is available and publishes it as it arrives,
+  with the channel's window bounded in bytes as well as entries (`STREAM_BACKLOG_CHUNKS`,
+  `STREAM_BACKLOG_BYTES`) so publishing every chunk cannot grow the supervisor's memory. Proof in section
+  3g. Not a regression when it was recorded: the pre-US-003 code waited for 8 KB or EOF, which was worse.
 - **Low - path containment is lexical, not symlink-aware.** Unchanged.
 
 ### Fixed during this increment
@@ -471,6 +602,60 @@ which is independent corroboration of the open Herdr tab finding above. The thre
 roots were preserved before removal: their evidence now lives under
 `agent-output/runtime-measure-2026-09-20*/evidence-<runId>/`. Nothing else was touched: no operator tab
 outside the Delegate Graph pattern, no non-worker workspace, and no directory another process referenced.
+
+## 3f. Live proof of US-007, both directions (2026-09-20)
+
+The two phases ran back to back on the same tree, the same model (`alibaba/qwen3.8-flash`) and the same
+graph, differing only in the close that US-007 adds. Both were authorized, both were driven by
+`test/support/herdr-settle-mutation-proof.sh` (its `--check` mode rehearses the mutation and the restore
+without provider spend), and both ran in the ambient Herdr workspace of the supervising session rather
+than a throwaway one.
+
+| phase | run id | terminal | settlements | cleanup records | post-settlement failures |
+| --- | --- | --- | --- | --- | --- |
+| defect (close reverted) | `run_08bf1ce6-599b-4ebc-b695-74998da97a06` | true, terminal, 138,832 ms | 4 | 0 | 4 |
+| fixed (close restored) | `run_dd90a3ea-5e18-4a6f-927f-7ca03f2b860e` | true, terminal, 172,000 ms | 4 | 4 | 0 |
+
+Evidence: `agent-output/runtime-measure-2026-09-20-herdr-defect/` and
+`agent-output/runtime-measure-2026-09-20-herdr-fixed/`, each holding the run record, the ledger, the
+summary and a `retained-evidence/<runId>/` copy of what the run retained. The defect phase retained 4
+`runtime-settlement-*.json` and no `cleanup-*.json`, and the failure it reported four times was
+`cleanup absence audit failed: tabAbsent; paneAbsent` - the tab and its pane, which is what a reverted
+close leaves behind. (The 2026-09-20 run of section 3e named four more items beside those two - the
+pane's queue owner, AgentFS server, owned processes and session - which this pair did not reproduce; the
+reason for the difference was not investigated.) The
+fixed phase retained 4 of each and reported none. `failures` stayed 0 in both phases, which is why the
+driver's new `post-settle` column rather than its failure count is what carries the signal.
+
+The tab inventory, read through the real CLI rather than from the audit's own report: after the defect
+phase `herdr tab list` still listed 4 tabs whose labels named its run (`wS:t8`, `wS:t9`, `wS:tA`, `wS:tB`),
+and after the fixed phase it listed none for that run. The defect phase's four were printed, recorded and
+closed, and re-listing after the close left none. The tree was restored byte-for-byte after the mutation
+(`delegate_core.py` sha256 `114ddcb62e3f8e1f82c82e62f0f03840f9c59fe2c8ebaf54f012bdc896da3874` before and
+after), and the run roots were removed once their retained records had been copied.
+
+## 3g. Gate for the drain change (2026-09-20)
+
+584 Node tests, 573 passed, 0 failed, 11 opt-in skips, run from the repository root on this tree, with
+`npm run typecheck` and `git diff --check` clean. The change adds one test (`output with no newline reaches
+the capture and the channel while the worker is still running`) and one test-support driver
+(`test/support/partial-line-driver.py`), and it ships nothing extra: `test/` is not in the package `files`
+list, and the package still packs 80 files. The gate log is
+`agent-output/runtime-completion-20260920-us007-us008/gate-us008-584-573-0-11.log`, beside the log for the
+US-007 increment (583/572/0/11) in the same directory.
+
+The mutation that proves the new case pins the fix: reverting `drain`'s read to the pre-fix `readline` loop
+fails the case on its first assertion (`the capture must advance as the worker writes, not at a line
+ending`) and restoring it passes. A driver that crashes before printing its report cannot hand its scratch
+root to the test that runs it, so this driver now removes its own root on exit; the four roots left by the
+reverted runs before that guard existed were removed by hand.
+
+**One flake observed, not root-caused.** One gate run of three in this increment reported
+`cmux-session.test.ts`'s `forwards session, prompt, and stop metadata when cmux is present` failing on
+`launchKind === "pi"` (584 tests, 572 passed, 1 failed), and the two other runs of the same tree were green
+at 573/0. The file passes when run alone (3 runs out of 3), and nothing in this increment touches the cmux
+companion, so it reads as a flake under the full parallel suite rather than a consequence of these changes.
+It is recorded rather than fixed, and the cause was not investigated.
 
 ## 4. Functional Requirements
 
