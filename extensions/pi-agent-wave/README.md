@@ -177,6 +177,7 @@ Apply moves conflicting loose extensions to `migration-backups/pi-agent-wave/`, 
 | `CODEX_HOME` | launcher, doctor | Codex credential and configuration home; default `~/.codex` |
 | `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` | extension, launcher | Set by Herdr in a workspace shell; complete identity selects the Herdr transport under `auto` |
 | `PI_DELEGATE_WAIT_TIMEOUT_MS` | launcher | Bound on waiting for a worker to settle; default `3600000` |
+| `PI_DELEGATE_HERDR_LIVENESS_INTERVAL_S` | launcher | How often a Herdr wait asks `herdr agent get` whether the worker still exists; the attempt directory is checked every tick; default `5` |
 | `PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS` | launcher | Bound on waiting for the worker process to exit after its result; default `30000` |
 | `PI_GRAPH_WATCH_INTERVAL_MS` | extension | Redraw interval of the agent list and of `/graph watch --follow`; default `2000`, minimum `50` |
 | `PI_ACPX_CONFIG`, `PI_ACPX_CANCEL_CONFIG`, `PI_RUNTIME_SETTLE_CONFIG` | worker scripts | Private per-attempt configuration paths set by the launcher; never set them yourself |
@@ -397,7 +398,7 @@ Ignored paths default to `.git/index`: a worker that inspects its work with `git
 
 An audit refusal (an unowned overlay change) is a permanent failure of the attempt, never an automatic retry or an accepted candidate. Changed immutable configuration is retained in the private run directory in mode-600 files with expected and observed checksums; these files may contain sensitive values and are private evidence. Overlay-command and host-read failures produce distinct `audit_error` entries and may retry under the frozen budget. Comparison and staging buffer whole files in memory.
 
-Staging reads a consistent SQLite backup of the closed delta with a 30-second budget; a failed backup fails the attempt and removes partial snapshots, with no raw DB/WAL/SHM fallback. Headless settlement waits for the worker process to exit after its result appears, bounded by `PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS` (default `30000`); a timeout fails the attempt.
+Staging reads a consistent SQLite backup of the closed delta with a 30-second budget; a failed backup fails the attempt and removes partial snapshots, with no raw DB/WAL/SHM fallback. Headless settlement waits for the worker process to exit after its result appears, bounded by `PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS` (default `30000`); a timeout fails the attempt. A Herdr wait fails as soon as the attempt directory is removed or Herdr no longer knows the agent (`PI_DELEGATE_HERDR_LIVENESS_INTERVAL_S`), so a worker torn down out of band costs seconds, not the full wait bound. When the launcher already tore an attempt down on its own (its `failure-<operationId>.json` exists and the attempt directory is gone), `op=collect` settles the attempt as failed from that bundle without spawning a wait, and `op=cancel` converges without a launcher to run.
 
 ### Settlement and cleanup
 

@@ -254,6 +254,25 @@ function retainedFailureDiagnostics(privateRunDir: string): string | undefined {
 }
 
 /**
+ * Evidence that the launcher already tore this attempt down without a listener: its failure bundle
+ * for this operation exists and the attempt directory (the launcher's parent) is gone. Either fact
+ * alone is not enough: a bundle beside a live attempt directory is a teardown still in progress.
+ */
+function retainedTeardown(privateRunDir: string, operationId: string, agent: AgentRow): { reason: string; diagnosticsPath: string } | undefined {
+	if (!agent.acpx_cancel_script) return undefined;
+	const diagnosticsPath = join(privateRunDir, `failure-${operationId}.json`);
+	if (!existsSync(diagnosticsPath) || existsSync(dirname(agent.acpx_cancel_script))) return undefined;
+	let reason = "worker attempt torn down before collection";
+	try {
+		const bundle: unknown = JSON.parse(readFileSync(diagnosticsPath, "utf8"));
+		if (isRecord(bundle) && typeof bundle.reason === "string" && bundle.reason.trim()) reason = bundle.reason.trim();
+	} catch {
+		// A bundle the launcher could not finish writing still proves the teardown; the default reason stands.
+	}
+	return { reason, diagnosticsPath };
+}
+
+/**
  * Settles an operation whose authorized command never started. There is no session to cancel, no
  * report to collect and no attempt to replay, so the operation is recorded instead of being
  * refused forever, and a repeated call is a no-op. Nothing is dispatched, so the frozen model
@@ -557,6 +576,15 @@ async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, r
 	let cleanupEvidencePath: string | undefined;
 	let settlementEvidencePath = registered.outcome ? undefined : runtimeSettlementFile(privateRunDir);
 	if (!registered.outcome && !settlementEvidencePath) {
+		// The launcher tears an attempt down on its own when its wait times out with nobody listening
+		// (abort_acpx_attempt: failure bundle written, attempt directory removed). That evidence is
+		// terminal; waiting again would poll a result file that can no longer appear.
+		const tornDown = retainedTeardown(privateRunDir, operationId, agent);
+		if (tornDown) {
+			const attempt = graphStore.settleRuntimeAttempt({ attemptKey, outcome: { kind: "failed", exitCode: null, error: `${tornDown.reason}\nretained worker diagnostics: ${tornDown.diagnosticsPath}` } });
+			progress("runtime_attempt_failed", { runId, operationId, agentName: agent.name, attemptKey, diagnosticsPath: tornDown.diagnosticsPath, via: "retained-teardown" });
+			return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: null, reason: tornDown.reason, diagnosticsPath: tornDown.diagnosticsPath, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
+		}
 		const execute = executor(pi);
 		const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
 		const waited = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", agent.transport, "--", "wait", privateRunDir, agent.name]);

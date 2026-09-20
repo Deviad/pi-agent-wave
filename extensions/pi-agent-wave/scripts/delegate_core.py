@@ -31,6 +31,8 @@ NODE = shutil.which("node") or "node"
 TMP_ROOT = Path("/tmp").resolve()
 RUN_PREFIX = "delegate-graph-herdr-"
 WAIT_TIMEOUT_MS = os.environ.get("PI_DELEGATE_WAIT_TIMEOUT_MS", "3600000")
+# How often a Herdr wait asks `herdr agent get` whether the worker still exists; the attempt directory is checked every tick.
+HERDR_LIVENESS_INTERVAL_S = float(os.environ.get("PI_DELEGATE_HERDR_LIVENESS_INTERVAL_S", "5"))
 START_READY_TIMEOUT_SECONDS = 10.0
 START_RETRY_SECONDS = 0.2
 STATE_LOCK_TIMEOUT_SECONDS = 10.0
@@ -1082,17 +1084,37 @@ def wait_for_worker_exit(resource: dict[str, Any], timeout_ms: int | None = None
     return observation
 
 
+def herdr_agent_registered(agent_name: str) -> bool:
+    """False only when Herdr positively reports the agent unknown; any other answer keeps the wait going."""
+    probe = run(["herdr", "agent", "get", agent_name], check=False)
+    try:
+        return json_path(probe.stdout or probe.stderr, "error", "code") != "agent_not_found"
+    except (ValueError, KeyError, TypeError):
+        return True
+
+
 def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
     agent_name = str(resource["agent"])
     if resource.get("execution") == "acpx-agentfs":
         result_path = Path(str(resource["worker_result"]))
+        attempt_dir = Path(str(resource.get("attempt_dir", "")))
         deadline = time.monotonic() + (int(WAIT_TIMEOUT_MS) / 1000)
+        next_liveness_probe = time.monotonic() + HERDR_LIVENESS_INTERVAL_S
         while time.monotonic() < deadline and not result_path.exists():
             worker_pid = resource.get("worker_pid")
             if not using_herdr() and isinstance(worker_pid, int) and not process_alive(worker_pid):
                 diagnostic_paths = [Path(str(resource.get("headless_stdout", ""))), Path(str(resource.get("headless_stderr", "")))]
                 diagnostic = "\n".join(path.read_text(encoding="utf-8").strip() for path in diagnostic_paths if path.exists()).strip() or "no diagnostic output"
                 raise DelegateError(f"headless worker exited before result: {diagnostic[-2000:]}")
+            if using_herdr():
+                # A Herdr worker has no pid to watch; its teardown is visible as the attempt directory
+                # disappearing (abort_acpx_attempt removes it) or Herdr forgetting the agent.
+                if str(attempt_dir) and not attempt_dir.exists():
+                    raise DelegateError(f"Herdr worker attempt directory removed before result: {attempt_dir}")
+                if time.monotonic() >= next_liveness_probe:
+                    next_liveness_probe = time.monotonic() + HERDR_LIVENESS_INTERVAL_S
+                    if not herdr_agent_registered(agent_name):
+                        raise DelegateError(f"Herdr worker no longer registered before result: {agent_name}")
             time.sleep(0.1)
         if not result_path.exists():
             raise DelegateError(f"ACPX worker result timed out: {result_path}")
