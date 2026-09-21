@@ -818,7 +818,13 @@ manifest-immutability trigger described in §1.4. `prepare` takes a `validate` c
 - refuses non-relative, backslash/`\0`/`.git` paths, unowned paths (outside `ownedPaths`),
   overlapping entries, symlinks, hard links, nested repositories, files over 16 MiB, and a staging
   root on a different filesystem;
-- retains each preimage with `RuntimeContentStore.retain` and writes the manifest.
+- reports a dirty preimage that an earlier `applied` integration in the same workspace wrote
+  (`appliedHere`) as uncommitted output of that integration, naming the duty to commit the previous
+  round's integrated files, rather than as a bare dirty-or-untracked refusal: the graph's rounds hand
+  their output to each other through the working tree, so the duty is the graph's to state;
+- retains each preimage with `RuntimeContentStore.retain`, records the caller's `overrideReason`
+  (nullable `override_reason`, added additively on open and outside the manifest so it never changes
+  the digest two identical candidates share), and writes the manifest.
 
 `advance` commits the recovery direction in one transaction before any filesystem mutation, then, in
 one transaction per step, verifies the base revision and every content reference, snapshots each
@@ -830,6 +836,18 @@ target it records `applied` or `rolled_back`. `finish` loops `advance` until the
 validate that the candidate settled, that it retains the manifest and every staged file, that the
 manifest matches the candidate's identity and base revision, that `realpath(workspace)` is
 unchanged, and that the operation is still current.
+
+**The live-sibling guard.** Creating an integration writes into the workspace that a still-running
+sibling worker's settlement audit reads, which fails that worker permanently with `AgentFS contains
+unowned changes` (2026-09-21 incident, `tasks/handoff-settlement-and-integration-races.md`).
+`store.ts:prepareIntegration` therefore refuses while `liveSiblingOperations` reports any other
+operation of the same run, node, round and fix iteration that is `running` and whose attempt has
+neither an outcome nor a supersession, naming those operations. The window is exactly "dispatched and
+not yet settled": a settled sibling has already run its audit, even though its operation stays
+`running` until `op=decide`, and an undispatched one builds its overlay from the integrated tree. The
+guard covers creation only, so re-reading an existing integration stays idempotent, and a rollback is
+never refused by it because rollback is the recovery route out of the state. An operator who knows a
+sibling is dead passes an override reason, which must be non-blank and is recorded on the row.
 
 ---
 
@@ -844,6 +862,18 @@ unchanged, and that the operation is still current.
   rendered output; a display path never opens the capture stream file.
 - **Without a terminal (headless):** the supervisor's loopback publisher is the source
   (`lib/live-stream.ts`). No view reads the capture file.
+- **Whether the turn has ended:** the worker's own result file is the source (`lib/turn-end.ts`).
+  Between the end of a worker's turn and `op=collect` the store still reads `running`, because the
+  process outcome is recorded at settlement; `scripts/acpx-worker.ts` renames `worker-result.json`
+  into the attempt directory when its prompt run is over, on both transports, so its presence is
+  exactly "the turn ended and nobody has collected it". `turnEndFor` stats that path beside the
+  registered `acpx_cancel_script`, refusing anything that is not a regular file so a FIFO or a hung
+  worker cannot block the UI thread, and takes the exit code from the nearest
+  `*.status.json` above it when the transport publishes one (`headless_supervisor.py`; Herdr
+  publishes none, so the label omits the code). `processLabel` renders this as
+  `process exited[ <code>], awaiting collect` for an unsettled attempt only: a settled attempt is
+  always described by what settlement recorded. Nothing here writes to the store, and acceptance
+  still belongs to `op=decide`.
 
 ### 6.2 Renderers
 

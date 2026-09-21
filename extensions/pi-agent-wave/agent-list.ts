@@ -4,6 +4,7 @@ import { LIVE_VIEW_PENDING, liveViewFor, refreshLiveView, streamRunDirectory } f
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import type { RuntimeAttempt } from "./lib/runtime-results.ts";
+import { awaitingCollectLabel, turnEndFor } from "./lib/turn-end.ts";
 import type { GraphStore } from "./store.ts";
 
 /**
@@ -119,10 +120,17 @@ function truncate(text: string, limit: number): string {
 	return single.length > limit ? `${single.slice(0, limit - 1)}…` : single;
 }
 
-/** A human label that distinguishes process outcome from task acceptance and never calls a settled attempt running. */
-export function processLabel(attempt: RuntimeAttempt): string {
+/**
+ * A human label that distinguishes process outcome from task acceptance and never calls a settled attempt
+ * running. An unsettled attempt whose worker already finished its turn says so rather than reading
+ * `running`, which is the state the store still holds until `op=collect` records the outcome.
+ */
+export function processLabel(attempt: RuntimeAttempt, cancelScript?: string | null): string {
 	if (attempt.supersededAt) return `superseded (${attempt.processState})`;
-	if (attempt.processState === "running") return "running";
+	if (attempt.processState === "running") {
+		const turnEnd = turnEndFor(cancelScript);
+		return turnEnd.ended ? awaitingCollectLabel(turnEnd) : "running";
+	}
 	const outcome = attempt.outcome;
 	if (!outcome) return `settled (${attempt.processState})`;
 	switch (outcome.kind) {
@@ -201,7 +209,7 @@ export function attemptDetail(store: GraphStore, entry: AgentListEntry): AgentDe
 		role: agent?.role ?? operation.node,
 		transport: agent?.transport ?? "?",
 		model: agent?.selected_model ?? "?",
-		processState: processLabel(attempt),
+		processState: processLabel(attempt, agent?.acpx_cancel_script),
 		acceptance: attempt.acceptance,
 		task: truncate(operation.task, TASK_LIMIT),
 		liveOutput,
@@ -219,7 +227,7 @@ export function listRows(store: GraphStore): AgentListRow[] {
 			const agent = attempt.agentId ? store.agents(entry.runId).find((row) => row.id === attempt.agentId) : undefined;
 			const live = liveViewForAgent(agent, entry.attemptKey, 1);
 			const activity = live.lines.at(-1) ?? live.note ?? "(no output yet)";
-			return { number: entry.number, agentName: agent?.name ?? entry.operationId, node: store.getOperation(entry.operationId).node, state: processLabel(attempt), model: shortModel(agent?.selected_model ?? null), activity, running: attempt.processState === "running" && !attempt.supersededAt };
+			return { number: entry.number, agentName: agent?.name ?? entry.operationId, node: store.getOperation(entry.operationId).node, state: processLabel(attempt, agent?.acpx_cancel_script), model: shortModel(agent?.selected_model ?? null), activity, running: attempt.processState === "running" && !attempt.supersededAt };
 		} catch (error) {
 			return { number: entry.number, agentName: entry.operationId, node: "?", state: `unavailable (${error instanceof Error ? error.message : String(error)})`, model: "?", activity: "", running: false };
 		}

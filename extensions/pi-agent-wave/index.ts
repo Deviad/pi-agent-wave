@@ -18,7 +18,7 @@ import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./sched
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
 import { GraphStore, roleForNode } from "./store.ts";
-import { attemptDetail, closeAgentList, decodePrefix, isKeyRepeat, noteRegisteredAttempt, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
+import { attemptDetail, closeAgentList, decodePrefix, isKeyRepeat, noteRegisteredAttempt, processLabel, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
@@ -208,6 +208,7 @@ const GraphParams = Type.Object({
 	operationId: Type.Optional(Type.String()),
 	decision: Type.Optional(Type.Union([Type.Literal("retry"), Type.Literal("defer"), Type.Literal("abort"), Type.Literal("escalate"), Type.Literal("accepted"), Type.Literal("rejected")])),
 	reason: Type.Optional(Type.String({ minLength: 1 })),
+	overrideRunningSiblings: Type.Optional(Type.Literal(true)),
 	deferredUntil: Type.Optional(Type.String({ minLength: 1 })),
 	status: Type.Optional(Type.Literal("cancelled")),
 	verdict: Type.Optional(Type.String()),
@@ -382,7 +383,7 @@ export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
 		const paneId = agent?.herdr_pane_id ?? null;
 		const rendered = paneId ? paneLines(paneId, WATCH_PANE_LINES) : liveViewFor(attempt?.attemptKey ?? "")?.lines ?? null;
-		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt?.processState ?? null, acceptance: attempt?.acceptance ?? null, paneId, lastActivity: rendered?.at(-1) ?? null, recent: rendered ?? [] });
+		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt ? processLabel(attempt, agent?.acpx_cancel_script) : null, acceptance: attempt?.acceptance ?? null, paneId, lastActivity: rendered?.at(-1) ?? null, recent: rendered ?? [] });
 	}
 	return { runId, status: state.status, node: state.currentNode, agents: rows };
 }
@@ -1003,8 +1004,11 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const manifest = attempt.observation?.manifest ?? null;
 					if (!manifest) throw new Error("integration requires a settled coding candidate with an observed staging manifest");
 					const direction = params.decision === "rejected" ? "rollback" : "apply";
-					const status = graphStore.applyRuntimeIntegration(attempt.attemptKey, manifest, direction);
-					progress("runtime_integration", { runId, operationId, attemptKey: attempt.attemptKey, direction, state: status.state });
+					// The override is the operator's statement that a still-running sibling is dead; it is never inferred
+					// from the reason a decision carries, so it is only read when explicitly supplied.
+					const overrideReason = params.overrideRunningSiblings === undefined ? undefined : required(params.reason, "reason");
+					const status = graphStore.applyRuntimeIntegration(attempt.attemptKey, manifest, direction, overrideReason);
+					progress("runtime_integration", { runId, operationId, attemptKey: attempt.attemptKey, direction, state: status.state, overrideReason: status.overrideReason });
 					return textResult({ runId, operationId, attemptKey: attempt.attemptKey, integration: status });
 				}
 				if (params.op === "decide") {

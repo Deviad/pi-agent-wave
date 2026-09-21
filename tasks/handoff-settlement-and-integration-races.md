@@ -98,13 +98,23 @@ tab's own state actively misleading, which is how this was noticed.
 
 ### 3.5 Acceptance criteria
 
-- [ ] With a worker whose process has exited and whose operation is unsettled, the agent list and the detail
-  view state that the process exited and that collection is pending. Proof: a test using the existing
-  fake-Acp supervisor driver that exits the worker without collecting, asserting the rendered row and
-  detail say so, and asserting the operation is still `running` in the same fixture.
-- [ ] No display path waits on the worker to settle, and no path blocks the terminal. Proof: the same test
-  asserts the render returns while the attempt is unsettled, with a hung-worker variant.
-- [ ] Nothing about settlement semantics changes: a candidate is still accepted only through `op=decide`.
+- [x] With a worker whose process has exited and whose operation is unsettled, the agent list and the detail
+  view state that the process exited and that collection is pending. Proof:
+  `test/turn-end-visibility.test.ts` cases 1 and 2. Case 1 asserts the detail view reads
+  `process exited 0, awaiting collect` while `store.getOperation(...).status` is still `running` and the
+  stored `processState` is still `running` in the same fixture; case 2 asserts the list row through
+  `listRows`, and covers the Herdr shape (no `status.json`, so the label omits the code). The signal is
+  the worker's own `worker-result.json`, not the supervisor status file §3.4 A proposed — see §5b and
+  §8's first open question, which this answers for both transports.
+- [x] No display path waits on the worker to settle, and no path blocks the terminal. Proof:
+  `test/turn-end-visibility.test.ts` case 3 puts a FIFO where the result file goes — opening it for read
+  would block forever — and asserts both `turnEndFor` and `attemptDetail` return inside 1 s with
+  `running`, plus the null and missing-path variants.
+- [x] Nothing about settlement semantics changes: a candidate is still accepted only through `op=decide`.
+  Proof: `lib/turn-end.ts` only stats and reads files; case 1 asserts the stored attempt is untouched and
+  case 4 asserts a settled attempt is still labelled from its recorded outcome (`settled (exited 0)`)
+  rather than from the leftover result file. Mutation-proven: forcing `turnEndFor` to report "not ended"
+  fails cases 1 and 2.
 
 ---
 
@@ -164,15 +174,23 @@ message names the file, not the interference.
 
 ### 4.5 Acceptance criteria
 
-- [ ] Integrating a slice while a sibling operation of the same node and round is `running` is refused with
-  an error that names the running operations, and the sibling's attempt is unaffected. Proof: a test
-  with two slices where one worker is held alive by a fake driver while the other is integrated;
-  assert the refusal, then release the worker and assert it settles `complete` with its candidate
-  intact.
-- [ ] The override path, if implemented, is explicit and recorded. Proof: a test asserting the override
-  requires a named reason and records it in the integration row.
-- [ ] A genuine unowned worker write is still permanent. Proof: the existing ownership tests continue to
-  fail closed (they must not be weakened by whichever option lands).
+- [x] Integrating a slice while a sibling operation of the same node and round is `running` is refused with
+  an error that names the running operations, and the sibling's attempt is unaffected. Proof:
+  `test/integration-sibling-race.test.ts` case 1, on a real two-slice build run with real AgentFS
+  overlays and a real Git workspace: it asserts the refusal names the live operation id, that
+  `product.md` still holds its preimage, that the sibling then settles with its `coding` candidate
+  intact, and that the same integration applies once both have settled. One correction to §4.4 A found
+  while building it: the guard cannot key on `status='running'`, because an operation stays `running`
+  until `op=decide`, so a sibling that had already settled would be refused needlessly. The hazard
+  window is "dispatched and not yet settled", which is what `liveSiblingOperations` asks.
+- [x] The override path is explicit and recorded. Proof: case 2 asserts a blank reason is refused
+  (`override requires a reason`), that the unqualified call is still refused, and that the stated reason
+  is returned as `overrideReason` and survives reopening the store from a new `GraphStore`. Case 3
+  asserts a rollback is never refused by the guard, because it is the recovery route out of the state.
+- [x] A genuine unowned worker write is still permanent. Proof: the guard is in
+  `store.ts:prepareIntegration` and touches neither the audit nor `retry.ts`; `agentfs-sandbox.test.ts`,
+  `owned-path-normalization.test.ts` and `runtime-candidate-integration.test.ts` are unchanged and pass
+  in the full gate below. Mutation-proven: disabling the guard fails cases 1 and 2.
 
 ---
 
@@ -200,10 +218,72 @@ moved `HEAD` away from their recorded base `50f05b5`. The graph's rounds therefo
 duty — commit between rounds — that is neither stated nor enforced, and it surfaces as an integration
 refusal with no guidance.
 
-- [ ] Acceptance criteria: either the graph states and enforces the duty (a named error telling the operator to
+- [x] Acceptance criteria: either the graph states and enforces the duty (a named error telling the operator to
 commit, before a round's candidates are wasted), or the integration can apply a candidate whose changed
-paths are only untracked *because a previous round created them*. Proof: a two-round fixture in which
-round 2 modifies round 1's new file; the run must either refuse with that guidance or apply cleanly.
+paths are only untracked *because a previous round created them*. Proof: the first branch, in
+`test/integration-sibling-race.test.ts` case 4. A round-1 candidate is applied and left uncommitted, and
+a later candidate touching that same path is refused with `uncommitted output of an earlier applied
+integration … commit the previous round's integrated files` instead of the bare
+`candidate preimage is dirty or untracked`. `lib/runtime-integration.ts:appliedHere` distinguishes the
+graph's own uncommitted output from an unrelated dirty file, so a genuinely dirty preimage still gets
+the original error. Mutation-proven: reverting the branch fails case 4.
+
+Partial, and stated as such: the criterion asked for the error "before a round's candidates are
+wasted", and §5b planned to check this at dispatch as well as at integration. Only the
+integration-time error is implemented. A candidate is still produced before the operator learns the
+tree needs committing; what changes is that the refusal now says what to do instead of reading as an
+unexplained dirty-preimage failure. A dispatch-time check remains open work.
+
+---
+
+## 5b. Chosen approach (2026-09-21, before implementation)
+
+Recorded here because this work order is the plan of record for this change. Baseline before any edit:
+584 Node tests, 573 passed, 0 failed, 11 opt-in skips at `157e87b` with a clean tree.
+
+- **Issue 1 → option A**, with one correction to its premise. §3.4 A proposed reading the headless
+  supervisor's `status.json`, and §8 asked what the Herdr equivalent is. There is a better record that
+  needs no per-transport answer: the worker itself writes `worker-result.json` into its attempt
+  directory, the same directory that holds `cancel-acpx.sh`
+  (`scripts/delegate_core.py:747` and `:786`), on both transports. Its existence *is* "the worker's turn
+  ended and nothing has collected it". The display paths read that, and read the headless
+  `status.json` only as an optional source of the exit code. No store state, no event, no contract change.
+- **Issue 2 → option A, plus option C's contract text.** `op=integrate` refuses while a sibling
+  operation of the same node, round and fix iteration is still `running`, naming them. Option B
+  (re-basing the audit off the recorded base revision) is deliberately not taken here: it changes the
+  audit's input and §4.4 says it needs its own plan entry and its own proof.
+- **Override:** explicit and recorded. A new `overrideRunningSiblings` parameter requires a reason, and
+  the reason is stored on the integration journal row (a new nullable `override_reason` column, added
+  additively where the journal already creates its own table) and emitted as a graph event.
+- **§5 → enforce the duty at dispatch, not only at integration.** The criterion asks for the named error
+  "before a round's candidates are wasted", so the check runs when the next round is dispatched: a
+  workspace still holding uncommitted files from this run's own applied integrations refuses the
+  dispatch with guidance to commit. The integration-time error carries the same guidance for a tree that
+  became dirty after dispatch.
+
+Not addressed, and left open: §8's question about whether `allCurrentComplete` should treat `cancelled`
+as settled. It changes join semantics for every graph and belongs in its own entry.
+
+---
+
+## 5c. Result (2026-09-21)
+
+Implemented on this tree, all three sections of acceptance criteria above checked with their evidence
+named. Changed: `lib/turn-end.ts` (new), `agent-list.ts`, `index.ts`, `store.ts`,
+`lib/runtime-integration.ts`, both the package README and `specification.md`, plus the two new test
+files. `op=integrate` gained an `overrideRunningSiblings` parameter that reads the `reason` it is given.
+
+Automated gate from the repository root, after the change: **592 Node tests, 581 passed, 0 failed, 11
+opt-in skips** (baseline before the change was 584/573/0/11; the 8 new tests are the difference).
+`npm run typecheck` and `git diff --check` clean. Bun package checks 46/46. Installation rehearsal 1/1.
+`npm pack --dry-run` reports **81 packed files**, one more than the recorded 80, which is
+`lib/turn-end.ts` arriving through the existing `lib` pattern; `npm publish --dry-run` agrees. Each of
+the three product changes is mutation-proven as recorded above, and every mutated file was restored and
+verified byte-identical with `diff -q`.
+
+Not done, and not claimed: no live provider run was made, so this is proven by the automated gate and by
+mutation, not by a measurement-driver run. The dispatch-time half of the §5 criterion is open, as is
+§8's `allCurrentComplete`/`cancelled` question.
 
 ---
 

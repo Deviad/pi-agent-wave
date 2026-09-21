@@ -1345,16 +1345,55 @@ export class GraphStore {
 	}
 
 	/** Reserves a checkpoint for a retained coding candidate; never applies or accepts it. */
-	prepareRuntimeIntegration(attemptKey: string, manifestReference: RuntimeContent): IntegrationStatus {
-		return this.prepareIntegration(attemptKey, manifestReference, false);
+	prepareRuntimeIntegration(attemptKey: string, manifestReference: RuntimeContent, overrideReason?: string): IntegrationStatus {
+		return this.prepareIntegration(attemptKey, manifestReference, false, overrideReason);
+	}
+
+	/**
+	 * The sibling operations of this attempt's own node, round and fix iteration whose worker is still live.
+	 *
+	 * Integrating writes into the shared workspace, and a live worker's settlement audit compares its overlay
+	 * against that same tree: a file the integration wrote is a change that worker does not own, which its
+	 * audit refuses permanently. The window is exactly "dispatched and not yet settled". A sibling that has
+	 * already settled has run its audit and cannot be harmed, even though its operation stays `running` until
+	 * `op=decide`; a sibling not yet dispatched will build its overlay from the integrated tree, so the file
+	 * is part of its base rather than an unowned change.
+	 */
+	liveSiblingOperations(operationId: string): OperationRow[] {
+		const operation = this.getOperation(operationId);
+		return this.db
+			.query<OperationRow, [string, string, number, number, string]>(
+				`SELECT operations.* FROM operations
+					JOIN runtime_attempts ON runtime_attempts.operation_id = operations.id
+					WHERE operations.run_id=? AND operations.node=? AND operations.round=? AND operations.fix_iteration=?
+						AND operations.status='running' AND operations.id!=?
+						AND runtime_attempts.outcome_json IS NULL AND runtime_attempts.superseded_at IS NULL
+					ORDER BY operations.created_at, operations.id`,
+			)
+			.all(operation.run_id, operation.node, operation.round, operation.fix_iteration, operation.id);
 	}
 
 	/** Only a rollback may touch a superseded attempt's integration: the historical recovery route after replacement. */
-	private prepareIntegration(attemptKey: string, manifestReference: RuntimeContent, historicalRollback: boolean): IntegrationStatus {
+	private prepareIntegration(attemptKey: string, manifestReference: RuntimeContent, historicalRollback: boolean, overrideReason?: string): IntegrationStatus {
 		const attempt = this.runtimeAttempt(attemptKey);
 		if (attempt.supersededAt && !historicalRollback) throw new Error("integration refused: the attempt was superseded by a replacement; only rollback remains available");
+		const override = overrideReason?.trim();
+		if (overrideReason !== undefined && !override) throw new Error("an integration override requires a reason");
 		const candidate = attempt.candidate;
 		if (!attempt.outcome || !candidate || (candidate.kind !== "coding" && candidate.kind !== "operational") || !attempt.candidateId) throw new Error("integration requires a settled coding or operational candidate");
+		// Only the act of creating an integration writes into the shared workspace, so that is what the guard
+		// covers: re-reading one that already exists stays idempotent, and a rollback restores the workspace
+		// rather than writing a candidate into it, which makes it the recovery route out of this state.
+		if (!historicalRollback && !override && !this.outstandingIntegrationFor(attempt.candidateId)) {
+			const live = this.liveSiblingOperations(attempt.operationId);
+			if (live.length) {
+				throw new Error(
+					`integration refused: ${live.length} sibling operation(s) of this node and round still have a live worker (${live.map((item) => item.id).join(", ")}); ` +
+					"integrating now writes into the workspace their settlement audits read, which fails them permanently as unowned changes; " +
+					"collect them first, or supply an override reason if you know they are dead",
+				);
+			}
+		}
 		if (!candidate.artifacts.some((item) => canonical(item) === canonical(manifestReference))) throw new Error("candidate does not retain this staging manifest");
 		const content = new RuntimeContentStore(this.dbPath);
 		const manifest = parseRuntimeStagingManifest(JSON.parse(content.read(manifestReference, 16 * 1024 * 1024).toString("utf8")));
@@ -1365,7 +1404,7 @@ export class GraphStore {
 		}
 		const journal = new RuntimeIntegration(this.dbPath);
 		try {
-			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding" }, () => {
+			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding", overrideReason: override ?? null }, () => {
 				const run = this.getRun(attempt.runId);
 				const operation = this.getOperation(attempt.operationId);
 				if (run.status !== "active" || operation.status === "cancelled") throw new Error(`runtime integration unavailable: ${run.status === "active" ? operation.status : run.status}`);
@@ -1379,8 +1418,8 @@ export class GraphStore {
 	}
 
 	/** Applies a prepared candidate integration to completion, or rolls it back; each file step is journaled. */
-	applyRuntimeIntegration(attemptKey: string, manifest: RuntimeContent, direction: "apply" | "rollback" = "apply"): IntegrationStatus {
-		const prepared = this.prepareIntegration(attemptKey, manifest, direction === "rollback");
+	applyRuntimeIntegration(attemptKey: string, manifest: RuntimeContent, direction: "apply" | "rollback" = "apply", overrideReason?: string): IntegrationStatus {
+		const prepared = this.prepareIntegration(attemptKey, manifest, direction === "rollback", overrideReason);
 		const journal = new RuntimeIntegration(this.dbPath);
 		try { return direction === "apply" ? journal.apply(prepared.id) : journal.rollback(prepared.id); }
 		finally { journal.close(); }
@@ -1389,19 +1428,19 @@ export class GraphStore {
 	/** An integration that has touched or reserved the workspace for this candidate and has not been rolled back. */
 	private outstandingIntegrationFor(candidateId: string): IntegrationStatus | null {
 		if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_integrations'").get()) return null;
-		const row = this.db.query<{ id: string; state: IntegrationStatus["state"]; direction: IntegrationStatus["direction"]; error: string | null }, [string]>(
-			"SELECT id,state,direction,error FROM runtime_integrations WHERE json_extract(manifest_json,'$.candidateId')=? AND state IN ('prepared','applying','applied','needs_reconciliation')",
+		const row = this.db.query<{ id: string; state: IntegrationStatus["state"]; direction: IntegrationStatus["direction"]; error: string | null; override_reason: string | null }, [string]>(
+			"SELECT id,state,direction,error,override_reason FROM runtime_integrations WHERE json_extract(manifest_json,'$.candidateId')=? AND state IN ('prepared','applying','applied','needs_reconciliation')",
 		).get(candidateId);
-		return row ? { id: row.id, state: row.state, direction: row.direction, error: row.error } : null;
+		return row ? { id: row.id, state: row.state, direction: row.direction, error: row.error, overrideReason: row.override_reason } : null;
 	}
 
 	private integrationStatusFor(workspace: string, candidateId: string): IntegrationStatus | null {
 		// The journal creates its own table on first use; before that nothing can have been prepared.
 		if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_integrations'").get()) return null;
-		const row = this.db.query<{ id: string; state: IntegrationStatus["state"]; direction: IntegrationStatus["direction"]; error: string | null }, [string, string]>(
-			"SELECT id,state,direction,error FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?",
+		const row = this.db.query<{ id: string; state: IntegrationStatus["state"]; direction: IntegrationStatus["direction"]; error: string | null; override_reason: string | null }, [string, string]>(
+			"SELECT id,state,direction,error,override_reason FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?",
 		).get(workspace, candidateId);
-		return row ? { id: row.id, state: row.state, direction: row.direction, error: row.error } : null;
+		return row ? { id: row.id, state: row.state, direction: row.direction, error: row.error, overrideReason: row.override_reason } : null;
 	}
 
 	/**

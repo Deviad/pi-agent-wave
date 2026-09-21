@@ -20,8 +20,15 @@ interface Manifest {
 }
 type State = "prepared" | "applying" | "applied" | "rolled_back" | "needs_reconciliation";
 type Direction = "apply" | "rollback";
-interface JournalRow { id: string; manifest_json: string; state: State; direction: Direction | null; error: string | null }
-export interface IntegrationStatus { readonly id: string; readonly state: State; readonly direction: Direction | null; readonly error: string | null }
+interface JournalRow { id: string; manifest_json: string; state: State; direction: Direction | null; error: string | null; override_reason: string | null }
+export interface IntegrationStatus {
+	readonly id: string;
+	readonly state: State;
+	readonly direction: Direction | null;
+	readonly error: string | null;
+	/** The operator's stated reason for integrating past a running sibling, or null when none was needed. */
+	readonly overrideReason: string | null;
+}
 export interface IntegrationInput {
 	readonly workspace: string;
 	readonly baseRevision: string;
@@ -30,6 +37,8 @@ export interface IntegrationInput {
 	readonly changes: readonly { readonly path: string; readonly after: RuntimeContent | null; readonly mode: number }[];
 	/** Default true. Coding candidates require the Git root, HEAD and clean tracked preimages; operational placement skips only those checks. */
 	readonly gitChecks?: boolean;
+	/** Recorded verbatim when the caller integrated past a running sibling; never inferred. */
+	readonly overrideReason?: string | null;
 }
 
 function relativePath(path: string): string {
@@ -107,6 +116,10 @@ export class RuntimeIntegration {
 				BEFORE UPDATE OF id,workspace,manifest_json ON runtime_integrations
 				BEGIN SELECT RAISE(ABORT, 'integration manifest is immutable'); END;
 		`);
+		// Additive: rows written before the sibling guard existed carry no override and read as null.
+		if (!this.db.query("SELECT 1 FROM pragma_table_info('runtime_integrations') WHERE name='override_reason'").get()) {
+			this.db.exec("ALTER TABLE runtime_integrations ADD COLUMN override_reason TEXT");
+		}
 	}
 
 	private transaction<T>(work: () => T): T {
@@ -122,9 +135,17 @@ export class RuntimeIntegration {
 		return row;
 	}
 
+	/** Whether an earlier integration in this workspace already applied this exact path. */
+	private appliedHere(workspace: string, path: string): boolean {
+		const rows = this.db.query<{ manifest_json: string }, [string]>("SELECT manifest_json FROM runtime_integrations WHERE workspace=? AND state='applied'").all(workspace);
+		return rows.some((row) => {
+			try { return parseManifest(row.manifest_json).entries.some((entry) => entry.path === path); } catch { return false; }
+		});
+	}
+
 	get(id: string): IntegrationStatus {
 		const row = this.row(id);
-		return { id, state: row.state, direction: row.direction, error: row.error };
+		return { id, state: row.state, direction: row.direction, error: row.error, overrideReason: row.override_reason };
 	}
 
 	private target(workspace: string, path: string): string {
@@ -190,6 +211,10 @@ export class RuntimeIntegration {
 				const before = this.snapshot(workspace, path, true);
 				if (gitChecks) {
 					const status = execFileSync("git", ["--literal-pathspecs", "-C", workspace, "status", "--porcelain", "--untracked-files=all", "--", path], { encoding: "utf8", timeout: 10_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+					// A path this journal already applied and nobody committed is the graph's own doing, not the
+					// operator's: rounds hand their output to each other through the workspace, so the duty to commit
+					// between them is named here rather than surfacing as a bare dirty-preimage refusal.
+					if (status.trim() && this.appliedHere(workspace, path)) throw new Error(`candidate preimage ${path} is uncommitted output of an earlier applied integration in this workspace; commit the previous round's integrated files before integrating this round`);
 					if (status.trim()) throw new Error("candidate preimage is dirty or untracked");
 					if (before) {
 						try { execFileSync("git", ["--literal-pathspecs", "-C", workspace, "ls-files", "--error-unmatch", "--", path], { stdio: "pipe", timeout: 10_000 }); }
@@ -202,7 +227,9 @@ export class RuntimeIntegration {
 			});
 			const manifest: Manifest = { version: 1, workspace, baseRevision: input.baseRevision, candidateId: text(input.candidateId), ownedPaths, entries, gitChecks };
 			const id = runtimeDigest(manifest);
-			this.db.query("INSERT INTO runtime_integrations(id,workspace,manifest_json,state) VALUES (?,?,?,'prepared')").run(id, workspace, canonical(manifest));
+			// The override is not part of the manifest: it records how this integration came to be prepared, not
+			// what it does, so it must not change the digest two identical candidates share.
+			this.db.query("INSERT INTO runtime_integrations(id,workspace,manifest_json,state,override_reason) VALUES (?,?,?,'prepared',?)").run(id, workspace, canonical(manifest), input.overrideReason ?? null);
 			return this.get(id);
 		});
 	}
