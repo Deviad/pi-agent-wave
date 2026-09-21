@@ -279,11 +279,48 @@ opt-in skips** (baseline before the change was 584/573/0/11; the 8 new tests are
 `npm pack --dry-run` reports **81 packed files**, one more than the recorded 80, which is
 `lib/turn-end.ts` arriving through the existing `lib` pattern; `npm publish --dry-run` agrees. Each of
 the three product changes is mutation-proven as recorded above, and every mutated file was restored and
-verified byte-identical with `diff -q`.
+verified byte-identical with `diff -q`. A live two-slice build run then proved the issue-2 fix on real
+workers; see §5d.
 
-Not done, and not claimed: no live provider run was made, so this is proven by the automated gate and by
-mutation, not by a measurement-driver run. The dispatch-time half of the §5 criterion is open, as is
-§8's `allCurrentComplete`/`cancelled` question.
+The dispatch-time half of the §5 criterion is open, as is §8's `allCurrentComplete`/`cancelled` question.
+
+### 5d. Live proof (2026-09-21, authorized, provider credit spent)
+
+The shipped measurement driver cannot prove either fix: its build graph ships one slice, so the sibling
+guard never fires, and it integrates inside its parallel collect loop, which is the ordering the guard
+now refuses. `test/support/sibling-race-proof.ts` (new, test-only, never packaged) drives the real
+`delegate_graph` tool through a two-slice build run and performs the incident's exact sequence. Only the
+corpus and the slice topology are fixture; the graph, the workers, the AgentFS overlays, the audit and
+the integration journal are the shipped code.
+
+Run `run_ac1f5e37-0c8a-459c-bbb1-5c9df499cab5`, headless, `alibaba/qwen3.8-flash`, **terminal** after
+1 490 418 ms (~24.8 min): 6 dispatches, 6 collects, 6 decides, **0 retries**, all six nodes
+(`thinker_plan`, two parallel `implement`, `review`, `test`, `audit`) completed. Evidence
+`agent-output/sibling-race-proof-2026-09-21/sibling-race-proof.json`; run root retained at
+`/tmp/pi-wave-race-proof-JB1okT`. No leaked worker processes and no leftover
+`/tmp/delegate-graph-herdr-run-ac1f5e37*` directories after the run.
+
+What the live run showed, each read from that record:
+
+- **The refusal fires on real workers and names the live sibling.** Integrating slice A while B's worker
+  was still live returned `integration refused: 1 sibling operation(s) … still have a live worker
+  (op_6d094e4b-fcb8-4fe5-aa97-f661acdf2c66)`. Before the fix this is precisely where B was destroyed.
+- **Nothing was written by the refused call**: A's owned file still held its committed preimage.
+- **The sibling survived and settled normally**: `processState=exited`, `candidate=coding`, and its
+  outcome carries no `unowned changes` failure — the permanent classification from the incident.
+- **The same integration applied once B settled**: `state=applied`, `overrideReason=null`, and B's own
+  candidate integrated afterwards (`state=applied`). Both documents are present in the final workspace.
+- **Issue 1's window was not observed live.** At the sample point B's worker had already settled
+  (`watch=settled (exited 0)`), so the run exercised the settled-attempt path rather than the
+  awaiting-collect one. The turn-end label therefore remains proven by `test/turn-end-visibility.test.ts`
+  and its mutation pair, not by this run. Stated as a gap rather than rounded up.
+
+One check reported FAIL on the first pass and it was a defect in the proof script, not the product: the
+assertion hardcoded `docs/product.md` while the planner had made `docs/specification.md` slice A. The
+script now reads the path from A's own manifest. Re-evaluating the corrected assertion against the same
+retained run's workspace gives PASS (`docs/specification.md`, 1272 bytes, preimage gone), so all eight
+checks hold for that run; the script's own re-run was not repeated, because doing so would spend another
+authorized run to re-derive a fact already in the retained evidence.
 
 ---
 
