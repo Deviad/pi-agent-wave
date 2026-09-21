@@ -171,17 +171,34 @@ function artifacts(root: string, sourceSha256: string): ProductionAuditBundle["a
 	});
 }
 
+/**
+ * The plan-of-record documents whose criteria this audit reports on.
+ *
+ * These were the production PRDs until 2026-09-21, when the PRD set was removed and replaced by
+ * `product.md`, `specification.md` and the handoff work orders; the removed documents' history is in git.
+ * Update this list when the plan record moves, and note that a listed document which is missing is
+ * reported as its own row rather than throwing, so moving the plan record cannot take the audit down.
+ */
+export const CHECKLIST_SOURCES = ["tasks/handoff-settlement-and-integration-races.md"];
+
 function checklist(root: string): ProductionAuditBundle["checklist"] {
-	const prds = ["tasks/prd-production-acpx-worker-backend.md", "tasks/prd-production-acpx-lifecycle-hardening.md", "tasks/prd-production-acpx-final-audit.md", "tasks/prd-production-acpx-final-source-hardening.md", "tasks/prd-air-controlled-editor-independent-orchestration.md"];
 	const result: ProductionAuditBundle["checklist"] = [];
-	for (const prd of prds) {
+	for (const plan of CHECKLIST_SOURCES) {
+		let text: string;
+		try {
+			text = readFileSync(join(root, plan), "utf8");
+		} catch {
+			result.push({ prd: plan, index: 0, checked: false, criterion: `plan document is missing: ${plan}`, evidence: [] });
+			continue;
+		}
 		let index = 0;
-		for (const line of readFileSync(join(root, prd), "utf8").split("\n")) {
+		for (const line of text.split("\n")) {
 			const match = /^- \[([ x])\] (.+)$/.exec(line);
 			if (!match) continue;
 			index += 1;
-			const evidence = prd.includes("lifecycle-hardening") ? ["agent-output/production-acpx-worker-backend/lifecycle-hardening-report.json", "agent-output/production-acpx-worker-backend/final-audit.json"] : prd.includes("final-audit") || prd.includes("final-source-hardening") ? ["agent-output/production-acpx-worker-backend/final-audit.json", "agent-output/production-acpx-worker-backend/final-review-bundle.md"] : ["agent-output/production-acpx-worker-backend/implementation-report.json", "agent-output/production-acpx-worker-backend/real-matrix-report.json", "agent-output/production-acpx-worker-backend/final-audit.json"];
-			result.push({ prd, index, checked: match[1] === "x", criterion: match[2], evidence });
+			// A criterion's proof is whatever it names in its own text; the historical per-PRD evidence
+			// mapping pointed at documents that no longer exist, so it is not carried over.
+			result.push({ prd: plan, index, checked: match[1] === "x", criterion: match[2], evidence: [] });
 		}
 	}
 	return result;

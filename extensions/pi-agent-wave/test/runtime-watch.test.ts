@@ -167,7 +167,7 @@ test("/graph watch --follow keeps the overview on screen, refreshes on r, opens 
 
 
 // ---------------------------------------------------------------------------------------------------------
-// The default numbered agent list (tasks/prd-default-agent-list.md).
+// The default numbered agent list (see product.md, the numbered agent list).
 // ---------------------------------------------------------------------------------------------------------
 
 type Exec = (command: string, args: string[]) => Promise<{ code: number; stdout: string; stderr: string; killed: boolean }>;
@@ -550,7 +550,7 @@ test("agent list refresh resources follow view lifetime", async () => {
 
 
 // ---------------------------------------------------------------------------------------------------------
-// Escape cancels the run's workers after confirmation (tasks/prd-cancel-run-from-list.md).
+// Escape cancels the run's workers after confirmation (see product.md, cancellation).
 // ---------------------------------------------------------------------------------------------------------
 
 /** A structured-cancel executor double: the cancel script of a registered worker answers as acpx-cancel.ts would. */

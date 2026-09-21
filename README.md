@@ -132,7 +132,7 @@ Retention comes first, so nothing after it can cost the work: the answer and the
 
 Every run uses one result contract, frozen at creation.
 
-- **`runtime-v1`** is the only result contract. The supervisor retains the worker's public answer and, for implementation and operational sources, its audited AgentFS changes as immutable content before anything is closed or cleaned up. An `exited` attempt with a candidate must then be accepted or rejected with a reason through `op=decide`; a `failed`, `interrupted` or candidate-less attempt is replaced through `op=retry` under a three-attempt same-model budget and the frozen model chain. Its status and remaining work are recorded in [the runtime-owned results issue](tasks/prd-runtime-owned-results.md). The earlier report contract, `legacy-v1`, was removed on 2026-09-12.
+- **`runtime-v1`** is the only result contract. The supervisor retains the worker's public answer and, for implementation and operational sources, its audited AgentFS changes as immutable content before anything is closed or cleaned up. An `exited` attempt with a candidate must then be accepted or rejected with a reason through `op=decide`; a `failed`, `interrupted` or candidate-less attempt is replaced through `op=retry` under a three-attempt same-model budget and the frozen model chain. Its status and remaining work are recorded in [`specification.md`](specification.md). The earlier report contract, `legacy-v1`, was removed on 2026-09-12.
 
 ## Requirements
 
@@ -295,11 +295,11 @@ Pi extensions run with your user account's full system access. Review the source
 | pi-acp | `0.0.31` |
 | JetBrains Air | `262.834.44` rehearsed 2026-09-20; `262.579.44` rehearsed 2026-09-01 |
 
-JetBrains Air support is proven by installed-application rehearsals recorded in `tasks/prd-air-controlled-editor-independent-orchestration.md`: Air starts and owns Pi as its ACP agent through `pi-acp` `0.0.31`, with no Herdr process, workspace, tab, pane or environment variable required and no Herdr resource created. The 2026-09-20 rehearsal ran on Air `262.834.44` with Pi `0.85.1` and covered a research run to terminal, a mid-flight cancellation, a recovery through retry exhaustion and an operator abort, a build run to `review PASS` → `test GREEN` → `audit PASS` with both implement operations integrated, and a **second Air task** reading the first task's run; its evidence is `agent-output/air-headless-orchestration/air-e2e.json` with the graph it was read from under `air-e2e-artifacts/v3-20260920/retained/`. ACP clients that expose no Pi slash commands drive the identical flows through the `delegate_graph` tool.
+JetBrains Air support is proven by installed-application rehearsals on 2026-09-01 and 2026-09-20 (their record was carried by the PRD set that `specification.md` replaced, whose history is in git): Air starts and owns Pi as its ACP agent through `pi-acp` `0.0.31`, with no Herdr process, workspace, tab, pane or environment variable required and no Herdr resource created. The 2026-09-20 rehearsal ran on Air `262.834.44` with Pi `0.85.1` and covered a research run to terminal, a mid-flight cancellation, a recovery through retry exhaustion and an operator abort, a build run to `review PASS` → `test GREEN` → `audit PASS` with both implement operations integrated, and a **second Air task** reading the first task's run; its evidence is `agent-output/air-headless-orchestration/air-e2e.json` with the graph it was read from under `air-e2e-artifacts/v3-20260920/retained/`. ACP clients that expose no Pi slash commands drive the identical flows through the `delegate_graph` tool.
 
 ## For contributors
 
-Package source is under [`extensions/pi-agent-wave/`](extensions/pi-agent-wave/). The development contract is [`AGENTS.md`](AGENTS.md). The canonical scope record is [`tasks/prd-package-delegate-graph.md`](tasks/prd-package-delegate-graph.md); the runtime-v1 work is tracked in [`tasks/prd-runtime-owned-results.md`](tasks/prd-runtime-owned-results.md).
+Package source is under [`extensions/pi-agent-wave/`](extensions/pi-agent-wave/). The development contract is [`AGENTS.md`](AGENTS.md). The plan of record is [`specification.md`](specification.md) with [`product.md`](product.md) as the product description.
 
 pi-agent-wave is available under the [MIT License](extensions/pi-agent-wave/LICENSE).
 

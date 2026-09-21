@@ -128,7 +128,7 @@ describe("headless live stream endpoint", () => {
 	});
 
 	test("an unbindable loopback is a named blocker before dispatch, not a worker that cannot be watched", () => {
-		// EPERM on a fresh loopback bind is what the restricted host in tasks/prd-runtime-owned-results.md
+		// EPERM on a fresh loopback bind is what a restricted host
 		// returns, so the probe is forced to meet exactly that error rather than a fabricated one.
 		const script = `
 import errno, json, socket, sys

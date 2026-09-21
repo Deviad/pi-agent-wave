@@ -1,6 +1,6 @@
 # Handoff: delegated write slices produce no files (AgentFS / Delegate Graph)
 
-**Status:** superseded by `tasks/prd-delegated-write-slice-settlement.md` — the staging defect is
+**Status:** superseded by the delegated-write-slice settlement work (its PRD was removed on 2026-09-21; history in git) — the staging defect is
 fixed there, and the two diagnoses below are corrected there
 **Recorded:** 2026-09-20
 **Corrected:** 2026-09-20 — two premises in this report were wrong and must not be repeated:

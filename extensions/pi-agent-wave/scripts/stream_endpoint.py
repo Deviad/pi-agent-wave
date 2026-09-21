@@ -65,7 +65,7 @@ def resolve_stream_backend(system: str | None = None) -> str:
 def probe_stream_endpoint(host: str = STREAM_HOST) -> None:
     """Fails with a named blocker when a loopback listener cannot be bound.
 
-    The restricted host in `tasks/prd-runtime-owned-results.md` returns EPERM for a fresh loopback bind,
+    A restricted host returns EPERM for a fresh loopback bind,
     so this is a checked prerequisite rather than an assumption, probed before dispatch the way
     `assertUsableRunRoot` probes the run root.
     """

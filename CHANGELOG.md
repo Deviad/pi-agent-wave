@@ -2,6 +2,8 @@
 
 All notable changes to `@dpugliese/pi-agent-wave` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package follows [Semantic Versioning](https://semver.org/). Each entry names the record that carries its evidence; nothing listed here is verified by this file alone.
 
+**The PRD set was removed on 2026-09-21.** Entries below that name a `tasks/prd-*.md` file refer to documents that are no longer in the tree; their history is in git. The plan of record is now `specification.md` with `product.md` as the product description, and open work orders live in `tasks/handoff-*.md`.
+
 ## [Unreleased]
 
 ### Fixed

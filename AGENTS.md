@@ -4,14 +4,14 @@ This repository develops `@dpugliese/pi-agent-wave`, a Pi package whose source l
 
 ## Plan of record
 
-`tasks/prd-package-delegate-graph.md` is the canonical issue and scope record. `tasks/prd-runtime-owned-results.md` governs the `runtime-v1` result contract, and `tasks/prd-air-controlled-editor-independent-orchestration.md` governs the transport-neutral Air/headless work. `tasks/prd-live-worker-stream-and-ledger-retirement.md` governs live stream visibility (the pane as the render source, a bounded retained capture, and the headless publish endpoint) and the retirement of the `delegate-ledger` file ledger; it also carries the criteria left open by `tasks/prd-delegated-write-slice-settlement.md`. Before changing behavior, architecture, approach, or acceptance criteria, update the governing PRD first, then implement only what it records. A documentation or maintenance edit the user asked for explicitly needs no separate issue.
+`specification.md` is the technical plan of record and `product.md` is the product record; together they replace the PRD set that was removed on 2026-09-21, whose history is in git. Open work orders live in `tasks/handoff-*.md`, and the PRD names still used elsewhere in this file refer to those removed documents. Before changing behavior, architecture, approach, or acceptance criteria, update the document that records it first, then implement only what it records. A documentation or maintenance edit the user asked for explicitly needs no separate issue.
 
 ## Product invariants
 
 Public surface:
 
 - Keep the `/delegate`, `/graph`, `/failover`, `delegate_graph`, and `questionnaire` contracts.
-- Keep graph topology, joins, retry budgets, evidence gates, and model-policy behavior unless a PRD changes them.
+- Keep graph topology, joins, retry budgets, evidence gates, and model-policy behavior unless the plan of record changes them.
 - Package exactly the graph extension plus the `questionnaire`, `cmux-session`, `model-failover`, and `claude-code-auth` entry points. The Claude auth provider is adapted from upstream MIT source; preserve its license in `lib/claude-auth-LICENSE` and maintain integration documentation in this package’s READMEs. Its pinned core and SDK are declared runtime dependencies. Herdr executables, Herdr-managed files, credentials, databases, and generated evidence never enter the npm artifact.
 
 Result contracts:
@@ -49,7 +49,7 @@ History:
 | `extensions/pi-agent-wave/test/` | All automated verification; `test/support/` holds the fake ACPX, lifecycle and cleanup drivers, the live probe, the measurement driver, and the test-only AgentFS export harness (`agentfs-export.ts`, never shipped) |
 | `extensions/pi-agent-wave/README.md` | User-facing installation, configuration, and operations reference |
 | `README.md` | Product overview and the install, Air, run, and uninstall journey |
-| `tasks/` | PRDs and acceptance records |
+| `tasks/` | Open work orders (`handoff-*.md`) and design notes; the plan of record is `specification.md` with `product.md` |
 | `agent-output/` | Generated evidence only; never packaged, never a substitute for a fresh run |
 
 When parallel workers are used, assign every writable path to exactly one worker; every other path is read-only to it.

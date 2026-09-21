@@ -4,7 +4,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
-import { artifactsCurrent, auditCommands, countAgentFsProcesses, EXPECTED_AUDIT_COMMANDS, EXPECTED_AUDIT_SUMMARIES, productionSourceDigest, readCleanup, runProductionAudit, summariesValid, summarizeAuditOutput, type AuditCommandRecord, type CleanupSnapshot, type Runner } from "../scripts/production-audit.ts";
+import { artifactsCurrent, auditCommands, CHECKLIST_SOURCES, countAgentFsProcesses, EXPECTED_AUDIT_COMMANDS, EXPECTED_AUDIT_SUMMARIES, productionSourceDigest, readCleanup, runProductionAudit, summariesValid, summarizeAuditOutput, type AuditCommandRecord, type CleanupSnapshot, type Runner } from "../scripts/production-audit.ts";
 import { packageRoot, repoRoot } from "./support/repoRoot.ts";
 
 const directories: string[] = [];
@@ -66,9 +66,11 @@ describe("production host audit bundle", () => {
 		mkdirSync(join(root, "extensions/pi-agent-wave/scripts"), { recursive: true });
 		mkdirSync(join(root, "extensions/pi-agent-wave/test"), { recursive: true });
 		copyFileSync(join(packageRoot, "retry.ts"), join(root, "extensions/pi-agent-wave/retry.ts"));
-		for (const prd of ["prd-production-acpx-worker-backend.md", "prd-production-acpx-lifecycle-hardening.md", "prd-production-acpx-final-audit.md", "prd-production-acpx-final-source-hardening.md", "prd-air-controlled-editor-independent-orchestration.md"]) {
-			mkdirSync(join(root, "tasks"), { recursive: true });
-			copyFileSync(join(repoRoot, "tasks", prd), join(root, "tasks", prd));
+		// The checklist sources are copied from the exported list rather than repeated here, so a plan
+		// record that moves cannot leave this fixture reading a document that no longer exists.
+		for (const plan of CHECKLIST_SOURCES) {
+			mkdirSync(join(root, dirname(plan)), { recursive: true });
+			copyFileSync(join(repoRoot, plan), join(root, plan));
 		}
 		const digest = productionSourceDigest(root);
 		const sourceBound = [
@@ -137,7 +139,7 @@ describe("production host audit bundle", () => {
 
 	// From either launch directory the exit code has to keep tracking what was reported: that is the
 	// contract the audit's cleanup-scan command reads. Leak detection itself is proven by the plant in
-	// tasks/prd-test-entrypoint-and-cwd-independence.md, not here, because planting a real path under
+	// that suite's own work order, not here, because planting a real path under
 	// /private/tmp would be seen by every test file running alongside this one.
 	test("the cleanup scanner keeps its contract from either launch directory", () => {
 		const script = join(packageRoot, "scripts/production-cleanup-scan.ts");

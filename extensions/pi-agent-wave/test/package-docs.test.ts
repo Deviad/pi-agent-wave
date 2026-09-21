@@ -7,20 +7,26 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY_ROOT = join(ROOT, "..", "..");
 const packageReadme = () => readFileSync(join(ROOT, "README.md"), "utf8");
 const rootReadme = () => readFileSync(join(REPOSITORY_ROOT, "README.md"), "utf8");
-const task = (name: string) => readFileSync(join(REPOSITORY_ROOT, "tasks", name), "utf8");
+const planRecord = (name: string) => readFileSync(join(REPOSITORY_ROOT, name), "utf8");
 
 describe("package documentation", () => {
-	test("scope records authorize Air/headless with optional Herdr while preserving safety invariants", () => {
-		const airPrd = "tasks/prd-air-controlled-editor-independent-orchestration.md";
-		for (const name of ["prd-package-delegate-graph.md", "prd-require-herdr.md", "prd-production-acpx-worker-backend.md"]) {
-			const text = task(name);
-			expect(text).toContain(airPrd);
-			expect(text.toLowerCase()).toContain("optional");
+	test("the plan record authorizes Air/headless with optional Herdr while preserving safety invariants", () => {
+		// These assertions used to read the production PRDs, which were removed on 2026-09-21 (their history
+		// is in git). The invariants and the public contracts they pinned are the same ones, now asserted
+		// against the two documents that replaced the PRD set.
+		const product = planRecord("product.md");
+		const specification = planRecord("specification.md");
+		for (const invariant of ["ACPX-only", "AgentFS", "frozen", "settlement", "evidence"]) expect(product).toContain(invariant);
+		for (const invariant of ["ACPX", "AgentFS", "frozen", "settlement", "evidence"]) expect(specification).toContain(invariant);
+		for (const text of ["optional", "Herdr", "headless", "Air"]) {
+			expect(product).toContain(text);
+			expect(specification).toContain(text);
 		}
-		const umbrella = task("prd-package-delegate-graph.md");
-		for (const invariant of ["ACPX-only", "AgentFS", "frozen", "graph", "settlement", "evidence"]) expect(umbrella).toContain(invariant);
-		const production = task("prd-production-acpx-worker-backend.md");
-		for (const contract of ["`/delegate`", "`/graph`", "`delegate_graph`", "transport-aware settlement"]) expect(production).toContain(contract);
+		for (const contract of ["/delegate", "/graph", "delegate_graph"]) {
+			// The plain command names, not the backticked forms: the two documents mark them differently.
+			expect(product).toContain(contract);
+			expect(specification).toContain(contract);
+		}
 	});
 	test("root README explains the product and user journey in plain sections", () => {
 		const readme = rootReadme();

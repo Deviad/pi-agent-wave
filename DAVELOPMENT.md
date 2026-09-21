@@ -10,10 +10,10 @@ The package is not copied, so normal development does not require reinstalling i
 
 ## Normal loop
 
-1. Update the PRD first for behavior or scope changes:
+1. Update the plan of record first for behavior or scope changes:
 
    ```text
-   tasks/prd-package-delegate-graph.md
+   specification.md
    ```
 
 2. Edit code under:
