@@ -30,7 +30,7 @@ its own process; every worker is a separate OS process tree. Ownership is:
 | the ACP agent CLI (`pi`, `codex`, `claude`) | `acpx` inside `acpx-worker.ts` | one model turn | `scripts/acpx-worker.ts:buildPromptArgv`, `lib/runtime-process.ts:runRuntimeProcess` |
 | Herdr tab/pane (optional) | `delegate_core.py` | presentation of the worker stream | `scripts/delegate_core.py:tab_create_argv`, `herdr.ts` |
 | `scripts/runtime-settle.ts` | `settle_runtime_attempt` via `subprocess.run([NODE, …RUNTIME_SETTLE])` | turning a finished worker into retained content + settlement evidence | `scripts/delegate_core.py:settle_runtime_attempt`, `scripts/runtime-settle.ts:settleRuntimeWorker` |
-| `scripts/deferred-runner.ts` (launchd) | `launchctl bootstrap` | one deferred resume | `scheduler.ts:writeDeferredJob`, `installDeferredJob`; `scripts/deferred-runner.ts:runDeferred` |
+| `scripts/deferred-runner.ts` (launchd) | `launchctl bootstrap` (only the unwired `index.ts:resolveUserDecision` installs it) | one deferred resume | `scheduler.ts:writeDeferredJob`, `installDeferredJob`; `scripts/deferred-runner.ts:runDeferred` |
 
 The supervisor drives the lifecycle through `pi.exec`: for `op=dispatch` it runs
 `node --experimental-strip-types scripts/delegate.ts --transport <t> -- init <label>`, then
@@ -177,9 +177,16 @@ and returns the label, plist path, runner path and time. `scheduler.ts:installDe
 parses its arguments, runs `pi -p <prompt>` once, then always `launchctl bootout gui/<uid>/<label>`
 and removes the plist.
 
-The operator path that reaches this is `index.ts:resolveUserDecision`'s "Defer" choice, which calls
+The only caller of `writeDeferredJob`/`installDeferredJob` is `index.ts:resolveUserDecision`
+(`index.ts:836`–`837`), whose "Defer" choice calls
 `store.resolveExhaustion(runId, operationId, "defer", …)`, `writeDeferredJob`, and
-`installDeferredJob`.
+`installDeferredJob`. That function is exported but has no production caller — a full-tree search
+finds only its definition and two direct test invocations (`test/commands.test.ts:201,236`) — so no
+command and no `delegate_graph` operation installs a deferred job. The shipped README records this
+(`extensions/pi-agent-wave/README.md`: "A terminal picker for that choice (`resolveUserDecision`)
+exists in the code but is not wired to any command or tool path."). The reachable recovery paths for
+a parked run are `delegate_graph op=resolve` and `/graph resume`, and neither writes a launchd plist;
+the launchd job is present code that is not on a dispatchable path.
 
 ---
 
@@ -472,8 +479,11 @@ and advance through decide`.
 transient retry and from `retryDelayMs(0, …)` for a chain fallback. `store.ts:resolveExhaustion`
 applies one of `defer` (sets the run `deferred`, stores no operation status change, emits a
 `deferral` event with `deferredUntil`), `abort` (operation and run `cancelled`), or `escalate`
-(operation and run `blocked`). A deferred operation is resumed by the launchd job or by
-`/graph resume` (`index.ts` resume branch calls `retryRuntimeAttempt({approved:true})`).
+(operation and run `blocked`). A deferred operation is resumed only through
+`retryRuntimeAttempt({approved:true})`: `delegate_graph op=resolve decision=retry` calls it directly
+(`index.ts:1033`) and `/graph resume` calls it and then sends a resume user message (`index.ts:1130`).
+No reachable path installs the launchd job described in §1.7, so a deferred run has no unattended
+resume: it is resumed by the operator, or it stays deferred until pruned.
 
 ---
 
@@ -610,7 +620,8 @@ generates an agent name matching `[a-z][a-z0-9_-]{0,31}` (`dg_<run8>_<role9>_<he
    `resolveAcpxPlan`/`createAcpxAttemptIdentity`), yielding `agent`, `sessionName`, `attemptKey`.
    `lib/acpx-types.ts:createAcpxAttemptIdentity` builds the attempt key from
    `runId:operationId:role:modelAttempt:transientAttempt:selectedModel:agent` and derives the session
-   name `dg-<role>-<modelAttempt>-<transientAttempt>-<sha256(coordinates)[:12]>`.
+   name `dg-<slug(role)>-<modelAttempt>-<transientAttempt>-<sha256(runId:operationId:modelAttempt:transientAttempt)[:12]>`
+   (`acpxAttemptKey`, `createAcpxAttemptIdentity`).
 2. Creates `<run>/acpx/<agent>/` (700) with `acpx-home/`, `agentfs-home/`, `providers/`.
 3. Builds the provider environment (`provider_runtime_environment`): preflight, then materialization
    (§5.3).
@@ -669,13 +680,14 @@ then calls `lib/runtime-staging.ts:stageRuntimeAgentFs`, which:
 - copies the snapshot to scratch and audits it with
   `lib/agentfs-sandbox.ts:auditAgentFsChanges`;
 - filters container directories out of `changes`, reads each owned file's bytes with
-  `agentfs fs cat <snapshot> /<path>`, retains them with `RuntimeContentStore.retain`, and retains a
+  `agentfs fs <snapshot> cat /<path>`, retains them with `RuntimeContentStore.retain`, and retains a
   canonical `RuntimeStagingManifest` (`{version:1, attemptKey, workspace, baseRevision,
   snapshotDigest, ownedPaths, changes[{path, after, mode}], readOnly}`).
 
 `lib/agentfs-sandbox.ts:agentFsChangeInventory` reads the AgentFS schema directly with a recursive
 CTE over `fs_inode`/`fs_dentry`, left-joins `fs_origin`, reads `fs_whiteout` as deletions, and
-compares each candidate to its host preimage via `agentfs fs cat`; a failed comparison is recorded
+compares each candidate to its host preimage (overlay bytes via `agentfs fs <db> cat /<path>` against
+`readFileSync(hostPath)`, plus the mode); a failed comparison is recorded
 as an `audit_error` rather than promoted to a change. `auditAgentFsChanges` normalizes owned and
 ignored paths with the symlink-aware `realpathExistingPrefix`, rejects whole-base ownership unless
 `ownWholeBase`, classifies each change as owned, ignored (explicit `ignoredPaths` or platform
