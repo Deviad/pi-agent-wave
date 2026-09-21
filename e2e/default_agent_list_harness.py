@@ -194,6 +194,9 @@ def main():
             ('DELEGATE_GRAPH_DB', str(temp / 'graph.db')), ('FAKE_SUPERVISOR_LOG', str(log)))) + 'exec ' + shlex.join(pi) + '\n')
         launcher.chmod(0o700)
         herdr('pane', 'run', pane, str(launcher))
+        # herdr 0.8.0's `pane run` types the command without submitting it, so the shell holds it at the
+        # prompt and nothing starts; the explicit Enter is what runs it.
+        herdr('pane', 'send-keys', pane, 'Enter')
         # The status bar names the model before startup finishes; input submitted while "Startup is still in
         # progress" is shown stays in the editor unsubmitted, so readiness also requires that banner to be gone.
         wait_for(lambda: (s := capture()) and 'scripted' in s and 'Startup is still in progress' not in s, 60, 'Pi fake model prompt not ready')
@@ -444,7 +447,9 @@ def main():
             evidence['privateRunDirectories'] = sorted({str(p) for p in run_dirs})
             for path in set(run_dirs):
                 if safe_to_remove:
-                    shutil.rmtree(path)
+                    # A settled operation removes its own run directory, so a path this loop collected can be
+                    # gone by the time it is reached; the check below still asserts they are all absent.
+                    shutil.rmtree(path, ignore_errors=True)
             cleanup['runDirectoriesRemoved'] = all(not p.exists() for p in run_dirs)
         try:
             sessions_result = command(['herdr', 'session', 'list', '--json'])
