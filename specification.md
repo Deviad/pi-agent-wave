@@ -993,6 +993,17 @@ The Claude auth provider is an adaptation of `@cgaravitoq/pi-claude-code-auth` 2
 is preserved at `lib/claude-auth-LICENSE` (`claude-code-auth.ts` header; package-artifact test
 requires the file) and the package README documents it rather than copying the upstream README.
 
+The supervisor provider must retain prompts and executable tool declarations on both the legacy
+Pi context API and the Pi 0.87 transcript API. When transcript replay helpers are available,
+resolve system prompt sections and tool additions/removals through those helpers before
+constructing the Anthropic request and mapping returned tool names. Preserve legacy top-level
+fields on older Pi releases. Verify this with the installed Pi loader in a temporary agent home,
+a synthetic token, captured HTTP responses, and a real harmless Bash execution; no paid request
+or live credentials are required. The focused regression reproduced missing Bash before the fix
+and passed after it on Pi 0.87.1; all 12 provider checks and package type checking passed
+on the working tree based on `67ea969e796d8f6d35b3439c73359db326b56c13`. Broader package
+release checks were not run for this focused tool-access repair.
+
 ---
 
 ## 9. Test surfaces

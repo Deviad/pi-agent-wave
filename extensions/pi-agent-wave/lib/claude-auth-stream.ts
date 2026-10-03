@@ -8,6 +8,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import * as piAi from "@earendil-works/pi-ai";
 import type {
 	ContentBlockParam,
  MessageParam, ToolResultBlockParam, Tool as AnthropicTool, ImageBlockParam, TextBlockParam,
@@ -215,11 +216,29 @@ function mapStopReason(reason: string): StopReason {
 	}
 }
 
+// Pi 0.87 moves prompt and tool declarations into transcript system messages.
+// Keep the legacy context API working on older Pi installations.
+function hasTranscriptHelpers(api: unknown): api is {
+	getCurrentTools(messages: Context["messages"]): Tool[];
+	getCurrentSystemPrompt(messages: Context["messages"]): string;
+} {
+	return typeof api === "object" && api !== null
+		&& "getCurrentTools" in api && typeof api.getCurrentTools === "function"
+		&& "getCurrentSystemPrompt" in api && typeof api.getCurrentSystemPrompt === "function";
+}
+
 export function streamClaudeCodeAnthropic(
 	model: Model<Api>,
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	if (hasTranscriptHelpers(piAi)) {
+		context = {
+			...context,
+			tools: context.tools ?? piAi.getCurrentTools(context.messages),
+			systemPrompt: context.systemPrompt ?? piAi.getCurrentSystemPrompt(context.messages),
+		};
+	}
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {

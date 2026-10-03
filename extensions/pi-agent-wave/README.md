@@ -620,3 +620,7 @@ The selected version controls both User-Agent and the existing billing system bl
 Version detection does not discover beta flags, billing algorithms or identity changes. Those remain tested source changes. Local request tests prove metadata construction and stream handling; they do not establish live API compatibility or that the reported “Unknown error” is fixed. Subscription acceptance remains controlled by the service.
 
 If a Claude model stops with `refusal`, Pi displays that exact reason plus the server's category and explanation when provided, preserving any partial answer and usage. An unknown stop reason is named explicitly. `model_context_window_exceeded` is treated as a truncated response. These diagnostics do not establish why a particular live request was refused; compare the actual server explanation rather than assuming a header, quota or authentication failure.
+
+### Claude provider tool access
+
+The bundled Claude provider supports legacy Pi contexts and Pi 0.87 transcript-based tool and prompt declarations. After updating the installed extension, run `/reload` in Pi so the current session loads the repaired provider.
