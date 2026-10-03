@@ -43,6 +43,22 @@ HEAD`; with no revision it is refused through `store.ts:retryRuntimeAttempt` wit
 `blocked: "precondition"`). Coding settlement needs the revision the launcher records there, so
 without the check the worker's whole turn would be discarded at `collect`.
 
+The same refusal covers declared ownership, for every node rather than only `implement`. A worker
+writes only inside the copy-on-write overlay rooted at the dispatch working directory (§5.3), so
+before `init` each entry of `owned_paths_json` is resolved against `realpath(dispatch cwd)` and
+classified by `lib/agentfs-sandbox.ts:ownedRelativePaths` — the same function the settlement audit
+uses, exported for this second call site so the two cannot disagree. An entry that escapes the base,
+or one that covers the whole base, is refused with a `[dispatch_precondition]` message naming the
+base directory, the offending paths and the remedy for each shape. An empty ownership list skips the
+check, so read-only research searches are unaffected. Without it the slice still fails, but only
+after a worker turn, as an `AgentFS audit error` carrying `[owned_path_escape]`, which §4.1 already
+classifies permanent `unclassified`. The precondition saves that turn and replaces a diagnosis-free
+reason with a named one and a remedy; it changes no retry budget.
+
+The check guards the `delegate_graph` dispatch path, which is the only way a run dispatches in
+production. `scripts/delegate_core.py`'s `start` subcommand remains reachable directly and is not
+covered; today only test drivers invoke it that way.
+
 ### 1.2 The detached supervisor process
 
 A headless worker is launched detached. `scripts/delegate_core.py:launch_headless_worker` calls

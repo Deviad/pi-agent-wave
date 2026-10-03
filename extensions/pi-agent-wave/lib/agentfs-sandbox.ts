@@ -193,7 +193,7 @@ export function realpathExistingPrefix(path: string): string {
 	return current;
 }
 
-interface RelativeOwnership {
+export interface RelativeOwnership {
 	readonly relative: string[];
 	readonly errors: AgentFsAuditError[];
 }
@@ -203,8 +203,13 @@ interface RelativeOwnership {
  * existing prefix so a symlinked workspace or owned entry resolves the way delegate_core does. An
  * entry that escapes the base is recorded per path instead of aborting the whole audit, and the
  * whole-base entry is refused unless the caller opted into it.
+ *
+ * Exported because the containment rule has two call sites that must never disagree: this audit,
+ * which runs at settlement, and the `op=dispatch` precondition in index.ts, which refuses the same
+ * slice before a worker is launched. test/dispatch-owned-path-precondition.test.ts pins the two
+ * against one real delta.
  */
-function ownedRelativePaths(realBase: string, ownedPaths: readonly string[], label: string, ownWholeBase: boolean): RelativeOwnership {
+export function ownedRelativePaths(realBase: string, ownedPaths: readonly string[], label: string, ownWholeBase: boolean): RelativeOwnership {
 	const relativePaths: string[] = [];
 	const errors: AgentFsAuditError[] = [];
 	for (const ownedPath of ownedPaths) {

@@ -21,7 +21,7 @@ import { GraphStore, roleForNode } from "./store.ts";
 import { attemptDetail, closeAgentList, decodePrefix, isKeyRepeat, noteRegisteredAttempt, processLabel, renderAgentDetail, renderCancelConfirmation, reopenAgentList, runningWorkerNames, type AgentListActions, type CancelConfirmation, type CancelRunReport } from "./agent-list.ts";
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
-import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
+import { DEFAULT_IGNORED_PATHS, ownedRelativePaths, realpathExistingPrefix } from "./lib/agentfs-sandbox.ts";
 import { ORPHAN_RECOVERY, runLiveness } from "./lib/liveness.ts";
 import { selectTransport } from "./scripts/delegate.ts";
 import type { AgentRow, VisibleTransport } from "./store.ts";
@@ -233,6 +233,22 @@ function required(value: string | undefined, name: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The operator-facing text of an owned-path dispatch refusal. The two rejected shapes have different
+ * remedies, so they are named separately; the verdict itself comes from `ownedRelativePaths`, and only
+ * the wording is built here. The `[dispatch_precondition]` prefix is what makes the failure permanent
+ * (`retry.ts:classifyFailure`), so it must stay at the start of the message.
+ */
+function ownedPathPreconditionReason(baseDir: string, offending: readonly string[]): string {
+	const wholeBase = offending.filter((path) => { try { return realpathExistingPrefix(path) === baseDir; } catch { return false; } });
+	const escaped = offending.filter((path) => !wholeBase.includes(path));
+	const parts = [`[dispatch_precondition] a worker writes only inside the AgentFS copy-on-write overlay rooted at its working directory; base_dir ${baseDir}.`];
+	if (escaped.length) parts.push(`These owned paths resolve outside it and can never be written: ${escaped.join(", ")}. Remedy: declare owned paths under ${baseDir} (relative entries resolve against it), or dispatch this operation from the directory that contains them.`);
+	if (wholeBase.length) parts.push(`These owned paths cover the whole working directory, which ownership refuses: ${wholeBase.join(", ")}. Remedy: declare the specific files or subdirectories the slice writes.`);
+	parts.push("Then resolve this operation with retry, or abort the run.");
+	return parts.join(" ");
 }
 
 /**
@@ -954,6 +970,22 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						if (isRecord(command) && typeof command.cwd === "string" && command.cwd) dispatchCwd = command.cwd;
 					}
 					const execute = executor(pi, dispatchCwd);
+					const declaredOwnership: unknown = operation.owned_paths_json ? JSON.parse(operation.owned_paths_json) : [];
+					if (Array.isArray(declaredOwnership) && declaredOwnership.length) {
+						// A worker writes only inside the copy-on-write overlay rooted at this directory, so a slice
+						// that owns anything outside it is unsatisfiable. Settlement would reject it as an
+						// `AgentFS audit error`, which retry.ts classifies transient: without this check one malformed
+						// slice spends three worker turns and reports a provider-shaped failure naming neither cause nor fix.
+						const baseDir = realpathSync(dispatchCwd ?? process.cwd());
+						const declared = declaredOwnership.map((entry) => resolve(baseDir, String(entry)));
+						const containment = ownedRelativePaths(baseDir, declared, "owned", false);
+						if (containment.errors.length) {
+							const reason = ownedPathPreconditionReason(baseDir, containment.errors.map((error) => error.path));
+							const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
+							progress("dispatch_refused_by_precondition", { runId, operationId, baseDir, status: refused.state.status });
+							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, baseDir, state: refused.state, operation: refused.operation });
+						}
+					}
 					if (operation.node === "implement") {
 						// Coding settlement diffs against the HEAD the launcher records in this directory; without one the
 						// worker's whole turn would be discarded at collect, so the refusal happens before anything exists.
