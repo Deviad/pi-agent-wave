@@ -123,6 +123,16 @@ core['wait_for_worker_exit'] = lambda resource: None
 		assert.ok((observed.calls as string[][]).every((argv) => argv[3] === "wZ:p9"), `probe must query the pane, got ${JSON.stringify(observed.calls)}`);
 	});
 
+	test("no wait path uses pane or agent status as its settle condition", () => {
+		// `herdr agent wait --until idle` never fires for a healthy worker: its status stays `working` for the
+		// whole turn. Pane status is only an advisory liveness probe; the settle condition is the result file.
+		const core = readFileSync(fileURLToPath(new URL("../scripts/delegate_core.py", import.meta.url)), "utf8");
+		assert.equal(/"agent",\s*"wait"/.test(core), false, "no `herdr agent wait` invocation");
+		assert.equal(/agent_status/.test(core), false, "no settle decision reads `agent_status`");
+		const wait = core.slice(core.indexOf("def wait_for_settled_agent"), core.indexOf("def run_acpx_again"));
+		assert.match(wait, /while time\.monotonic\(\) < deadline and not result_path\.exists\(\):/);
+	});
+
 	test("the worker publishes its result atomically, so a poll can never read a half-written file", () => {
 		// The observed intermittent failure was `invalid ACPX worker result: Expecting value: line 1
 		// column 1 (char 0)`: the waiter polls for the path and parses it, and the worker used to create

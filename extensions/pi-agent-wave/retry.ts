@@ -57,6 +57,9 @@ const NEVER_LAUNCHED_PATTERN = /no worker was registered|command never started|w
 /** Classifies infrastructure-shaped failures without treating semantic verdicts as retryable. */
 export function classifyFailure(message: string, semanticVerdict = false): FailureClassification {
 	if (semanticVerdict) return { kind: "permanent", reason: "semantic-verdict" };
+	// A refusal at dispatch replays identically until the operator changes the working directory; it names
+	// a path, so it is matched before the transient scan can mistake that path for provider text.
+	if (/^\[dispatch_precondition\]/.test(message)) return { kind: "permanent", reason: "dispatch-precondition" };
 	// Ownership failures stay permanent even when their path names resemble provider errors.
 	if (/\[owned_path_escape\]|AgentFS (?:contains unowned changes|export failed[^\n]*: unowned changes)/i.test(message)) return { kind: "permanent", reason: "unclassified" };
 	if (APPROVAL_BLOCK_PATTERN.test(message)) return { kind: "permanent", reason: "approval-block" };

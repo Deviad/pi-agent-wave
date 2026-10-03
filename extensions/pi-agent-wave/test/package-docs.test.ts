@@ -122,6 +122,27 @@ describe("package documentation", () => {
 		expect(rootReadme()).toContain("README.md#operational-search-delegation");
 	});
 
+	test("states the wait contract once, in watch's own wording", () => {
+		const packageText = packageReadme();
+		expect(packageText.split("**Wait contract.**").length - 1).toBe(1);
+		const contract = packageText.slice(packageText.indexOf("**Wait contract.**")).split("\n")[0];
+		for (const text of ["own result file", "`process exited[ <code>], awaiting collect`", "not a settle signal", "advisory liveness probe"]) expect(contract).toContain(text);
+		const watchRow = packageText.split("\n").find((line) => line.startsWith("| `watch` |")) ?? "";
+		for (const text of ["`process exited[ <code>], awaiting collect`", "worker's own result file"]) expect(watchRow).toContain(text);
+	});
+
+	test("documents which status call returns a bounded task and which returns it in full", () => {
+		const statusRow = packageReadme().split("\n").find((line) => line.startsWith("| `status` |")) ?? "";
+		for (const text of ["optional `operationId`", "`task sha256=<hex> bytes=<n>", "full task", "`blocker=`"]) expect(statusRow).toContain(text);
+		expect(planRecord("product.md")).toContain("`commands.ts:taskSummary`");
+		expect(rootReadme()).toContain("pass an `operationId` to get that operation's full task");
+	});
+
+	test("documents how a ledger wrapper discovers the story-ledger script", () => {
+		const packageText = packageReadme();
+		for (const text of ["`scripts/story-ledger.mjs`", "each absolute or relative to the agent directory", "`PI_AGENT_WAVE_ROOT`"]) expect(packageText).toContain(text);
+	});
+
 	test("ships the approved MIT license text", () => {
 		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 		const license = readFileSync(join(ROOT, "LICENSE"), "utf8");

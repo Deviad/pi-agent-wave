@@ -36,6 +36,12 @@ The supervisor drives the lifecycle through `pi.exec`: for `op=dispatch` it runs
 `node --experimental-strip-types scripts/delegate.ts --transport <t> -- init <label>`, then
 `-- start …`; for `op=collect` it runs `-- wait <run-dir> <agent>` (`index.ts`, dispatch and collect
 branches). The extension's own `delegate_graph` tool is the only mutation surface (`index.ts`).
+Before `init`, an `implement` dispatch runs `git -C <realpath(dispatch cwd)> rev-parse --verify
+HEAD`; with no revision it is refused through `store.ts:retryRuntimeAttempt` with a
+`[dispatch_precondition]` error naming that `base_dir` and the remedy, so the operation is
+`failed`, the run `awaiting_user`, and no agent, attempt or run directory exists (`dispatched: false`,
+`blocked: "precondition"`). Coding settlement needs the revision the launcher records there, so
+without the check the worker's whole turn would be discarded at `collect`.
 
 ### 1.2 The detached supervisor process
 
@@ -153,18 +159,42 @@ A headless worker has no pane, so its supervisor publishes its output live over 
   reads the descriptor and the sibling `*.stream-token`. The poll-and-disconnect model is deliberate
   (module comment): a long-lived subscriber that fell behind would be dropped and lose its view.
 
+### 1.5a Read-time worker liveness (`lib/liveness.ts`)
+
+`runLiveness(store, runId)` classifies each current `running` operation whose attempt is registered,
+unsettled and not superseded, in this order: `worker-result.json` in the attempt directory
+(`dirname(agents.acpx_cancel_script)`) → `awaiting-collect`; attempt directory absent → `orphaned`
+(`attempt-directory-missing`); within `LAUNCH_GRACE_MS` (60 s) of `agents.last_activity_at` →
+`alive`; `ps -Ao command=` unreadable → `unknown` (`process-table-unreadable`); no line containing
+`agents.agentfs_session_id` or the attempt directory → `orphaned` (`worker-process-gone`); else
+`alive`. `acpx_state` is not read. The table is read at most once per call and only when a worker
+needs it. `op=next` overlays `status: "orphaned"`, `storedStatus`, `orphanReason`, `recovery`;
+`renderStatus` shows `orphaned (<reason>)` and an `orphaned workers: <n>` line; `watchRun` shows it as
+the process state. None of them writes the store. `collectRuntimeAttempt` settles an unsettled attempt
+whose private run directory is gone as `failed` (`worker orphaned: private run directory … no longer
+exists`) without invoking the launcher; `retry` then classifies it permanent (`unclassified`) and the
+run parks for `resolve`; that orphan path also calls `herdr.ts:closeRunTabs` for the worker and retains
+`evidence/<runId>/tab-cleanup-<operationId>.json`. `index.ts:closeEndedRunTabs` runs after `decide`,
+`resolve`, `cancel` and `cancelRunWorkers` when the run is `cancelled` or `terminal`: it lists tabs once
+(`herdr tab list`), and closes each `agents.tab_id` of a `herdr` agent of the run whose listed label
+starts with `<runId>-`; a reused id under another label is `not-owned`, a missing one `absent`. The
+report is retained as `tab-cleanup-<status>.json`. No stall bound exists: `last_activity_at` is written only at registration
+and settlement, so it serves only as the launch grace.
+
 ### 1.6 Herdr IPC
 
 Herdr is driven only through its CLI with direct argv, never a shell. The commands used are:
 `herdr tab create` and `herdr tab close` (`scripts/delegate_core.py:tab_create_argv`,
 `close_created_tab`), `herdr pane run`, `herdr pane get`, `herdr pane report-agent`,
 `herdr pane release-agent` (`scripts/delegate_core.py`), `herdr pane read`
-(`lib/pane-read.ts:readPane`), `herdr agent get`, `herdr agent focus`, `herdr agent wait`
-(`scripts/delegate_core.py:herdr_agent_registered`, `wait_for_settled_agent`;
-`herdr.ts:focusHerdrAgent`), `herdr tab list`, `herdr integration status|install`
+(`lib/pane-read.ts:readPane`), `herdr agent get`, `herdr agent focus`
+(`scripts/delegate_core.py:herdr_agent_registered`; `herdr.ts:focusHerdrAgent`), `herdr tab list` (also
+`herdr.ts:closeRunTabs`, which closes with `herdr tab close`), `herdr integration status|install`
 (`scripts/delegate_core.py:integration_status`, `ensure_pi_integration`). The pane reader runs
 `herdr pane read <pane> --source recent --lines <n> --format text` with a 1000 ms timeout and
-`SIGKILL` (`lib/pane-read.ts:PANE_READ_TIMEOUT_MS`, `readPane`).
+`SIGKILL` (`lib/pane-read.ts:PANE_READ_TIMEOUT_MS`, `readPane`). No settle decision reads a pane's agent
+status: `wait_for_settled_agent` settles only on the worker's result file and refuses a resource
+that has none; `herdr agent get <pane>` is an advisory liveness probe that can only end a wait early.
 
 ### 1.7 The launchd deferred resume
 
@@ -495,6 +525,8 @@ resume: it is resumed by the operator, or it stays deferred until pruned.
 "permanent", reason}` and applies these checks in order:
 
 1. `semanticVerdict === true` → permanent `semantic-verdict`.
+1a. A message starting `[dispatch_precondition]` → permanent `dispatch-precondition`, before
+   anything else can read the path it names as provider text.
 2. Ownership failures matching `\[owned_path_escape\]|AgentFS (contains unowned changes|export
    failed[^\n]*: unowned changes)` → permanent `unclassified` (checked before anything that could
    look provider-shaped).

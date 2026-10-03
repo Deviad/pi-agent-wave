@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { isKeyRelease, matchesKey, parseKey } from "@earendil-works/pi-tui";
 import { parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, type RuntimeAttempt, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import { resolveAcpxPlan } from "./scripts/acpx-plan.ts";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { liveViewFor, refreshLiveView, streamRunDirectory } from "./lib/live-stream.ts";
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
@@ -13,7 +13,7 @@ import { renderLog, renderStatus } from "./commands.ts";
 import delegationIdentityExtension from "./delegation-identity.ts";
 import { supervisorContract } from "./contract.ts";
 import { BUILD_GRAPH, OPERATIONS_GRAPH, RESEARCH_GRAPH } from "./graph-core.ts";
-import { cancelRegisteredAgent, focusRegisteredAgent, type CommandExecutor } from "./herdr.ts";
+import { cancelRegisteredAgent, closeRunTabs, focusRegisteredAgent, type CommandExecutor, type TabCleanup } from "./herdr.ts";
 import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./scheduler.ts";
 import routePicker from "./route-picker.ts";
 import { requireRuntime } from "./require-runtime.ts";
@@ -22,6 +22,7 @@ import { attemptDetail, closeAgentList, decodePrefix, isKeyRepeat, noteRegistere
 import { parseAcpAgent } from "./lib/acpx-types.ts";
 import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS } from "./lib/agentfs-sandbox.ts";
+import { ORPHAN_RECOVERY, runLiveness } from "./lib/liveness.ts";
 import { selectTransport } from "./scripts/delegate.ts";
 import type { AgentRow, VisibleTransport } from "./store.ts";
 import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, ResolvedPolicy } from "./types.ts";
@@ -376,6 +377,7 @@ export async function refreshWatchLiveViews(graphStore: GraphStore, runId: strin
 export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 	const state = graphStore.getState(runId);
 	const agents = graphStore.agents(runId);
+	const liveness = runLiveness(graphStore, runId);
 	const rows: WatchedAgent[] = [];
 	for (const operation of graphStore.operations(runId, true)) {
 		if (operation.status !== "running") continue;
@@ -383,7 +385,9 @@ export function watchRun(graphStore: GraphStore, runId: string): WatchView {
 		const attempt = graphStore.runtimeAttemptByOperation(operation.id);
 		const paneId = agent?.herdr_pane_id ?? null;
 		const rendered = paneId ? paneLines(paneId, WATCH_PANE_LINES) : liveViewFor(attempt?.attemptKey ?? "")?.lines ?? null;
-		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState: attempt ? processLabel(attempt, agent?.acpx_cancel_script) : null, acceptance: attempt?.acceptance ?? null, paneId, lastActivity: rendered?.at(-1) ?? null, recent: rendered ?? [] });
+		const live = liveness.get(operation.id);
+		const processState = live?.state === "orphaned" ? `orphaned (${live.reason})` : attempt ? processLabel(attempt, agent?.acpx_cancel_script) : null;
+		rows.push({ operationId: operation.id, node: operation.node, agentName: agent?.name ?? null, transport: agent?.transport ?? null, processState, acceptance: attempt?.acceptance ?? null, paneId, lastActivity: rendered?.at(-1) ?? null, recent: rendered ?? [] });
 	}
 	return { runId, status: state.status, node: state.currentNode, agents: rows };
 }
@@ -424,6 +428,7 @@ export async function cancelRunWorkers(graphStore: GraphStore, pi: ExtensionAPI,
 	}
 	const reason = failed.length ? `operator cancelled the run; ${failed.map((item) => item.agentName).join(", ")} could not be confirmed stopped` : "operator cancelled the run";
 	const result = graphStore.cancelRunningOperations(runId, reason);
+	await closeEndedRunTabs(graphStore, pi, runId);
 	return { runId, cancelled, failed, status: result.state.status };
 }
 
@@ -625,12 +630,37 @@ export function finalizeRunDirectory(graphStore: GraphStore, runId: string, priv
 	rmSync(privateRunDir, { recursive: true, force: true });
 }
 
+/**
+ * Closes a run's worker tabs once the run is cancelled or terminal, and retains what happened under the
+ * run's evidence. Returns null when there was nothing to close. Never throws: the transition it follows
+ * has already been recorded.
+ */
+async function closeEndedRunTabs(graphStore: GraphStore, pi: ExtensionAPI, runId: string): Promise<{ tabCleanup: TabCleanup[]; tabCleanupEvidencePath: string } | null> {
+	const status = graphStore.getState(runId).status;
+	if (status !== "cancelled" && status !== "terminal") return null;
+	const tabs = await closeRunTabs(runId, graphStore.agents(runId), executor(pi));
+	if (!tabs.length) return null;
+	const path = graphStore.retainRunEvidence(runId, `tab-cleanup-${status}.json`, `${JSON.stringify({ runId, status, at: new Date().toISOString(), tabs }, null, 2)}\n`);
+	return { tabCleanup: tabs, tabCleanupEvidencePath: path };
+}
+
 async function collectRuntimeAttempt(graphStore: GraphStore, pi: ExtensionAPI, runId: string, operationId: string, agent: AgentRow, privateRunDir: string, progress: (kind: string, details: Record<string, unknown>) => void): Promise<Record<string, unknown>> {
 	const attemptKey = agent.acpx_attempt_key;
 	if (!attemptKey) throw new Error(`operation ${operationId} has no runtime attempt key`);
 	const registered = graphStore.runtimeAttempt(attemptKey);
 	const postSettlementFailures: string[] = [];
 	const configurationSelfWrites: Record<string, unknown>[] = [];
+	if (!registered.outcome && !existsSync(privateRunDir)) {
+		// Nothing can write a result or settlement into a directory that no longer exists (a reboot or /tmp
+		// sweep took it with the worker), so the attempt is settled failed here instead of waiting on it.
+		const reason = `worker orphaned: private run directory ${privateRunDir} no longer exists, so no result can appear`;
+		const attempt = graphStore.settleRuntimeAttempt({ attemptKey, outcome: { kind: "failed", exitCode: null, error: reason } });
+		progress("runtime_attempt_failed", { runId, operationId, agentName: agent.name, attemptKey, diagnosticsPath: null, via: "orphaned" });
+		// The launcher that would have closed the worker's tab is gone with its directory.
+		const tabCleanup = await closeRunTabs(runId, [agent], executor(pi));
+		const cleanup = tabCleanup.length ? graphStore.retainRunEvidence(runId, `tab-cleanup-${operationId}.json`, `${JSON.stringify({ runId, operationId, reason, at: new Date().toISOString(), tabs: tabCleanup }, null, 2)}\n`) : null;
+		return { runId, operationId, agentName: agent.name, attempt, settled: true, candidate: null, reason, diagnosticsPath: null, cleanupEvidencePath: cleanup, tabCleanup, state: graphStore.getState(runId), operation: graphStore.getOperation(operationId) };
+	}
 	let captureRetainedPath: string | undefined;
 	let diagnosticsPath: string | undefined;
 	let cleanupEvidencePath: string | undefined;
@@ -886,13 +916,19 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 				graphStore.getRun(runId);
 				if (params.op === "next") {
 					const next = graphStore.next(runId);
-					progress("operations_ready", { runId, operationCount: next.operations.length, status: next.state.status });
-					return textResult(next);
+					const liveness = runLiveness(graphStore, runId);
+					// The stored status stays `running`; a worker that is provably gone is reported as what it is.
+					const operations = next.operations.map((operation) => {
+						const live = liveness.get(operation.id);
+						return live?.state === "orphaned" ? { ...operation, status: "orphaned" as const, storedStatus: operation.status, orphanReason: live.reason, recovery: ORPHAN_RECOVERY } : operation;
+					});
+					progress("operations_ready", { runId, operationCount: next.operations.length, orphaned: operations.filter((operation) => operation.status === "orphaned").length, status: next.state.status });
+					return textResult({ ...next, operations });
 				}
 				if (params.op === "status") {
 					const state = graphStore.getState(runId);
 					progress("status", { runId, status: state.status, node: state.currentNode });
-					return textResult(renderStatus(graphStore, runId));
+					return textResult(renderStatus(graphStore, runId, { taskOf: params.operationId }));
 				}
 				if (params.op === "watch") {
 					// One-shot operators read this immediately, so read the live views first: the renderer
@@ -918,6 +954,18 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						if (isRecord(command) && typeof command.cwd === "string" && command.cwd) dispatchCwd = command.cwd;
 					}
 					const execute = executor(pi, dispatchCwd);
+					if (operation.node === "implement") {
+						// Coding settlement diffs against the HEAD the launcher records in this directory; without one the
+						// worker's whole turn would be discarded at collect, so the refusal happens before anything exists.
+						const baseDir = realpathSync(dispatchCwd ?? process.cwd());
+						const head = await execute("git", ["-C", baseDir, "rev-parse", "--verify", "--quiet", "HEAD"]);
+						if (head.exitCode !== 0 || !head.stdout.trim()) {
+							const reason = `[dispatch_precondition] coding operation requires a Git working directory with a HEAD revision; base_dir ${baseDir} has none. Remedy: start the Pi session in the Git repository being edited, then resolve this operation with retry, or abort the run.`;
+							const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
+							progress("dispatch_refused_by_precondition", { runId, operationId, baseDir, status: refused.state.status });
+							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, baseDir, state: refused.state, operation: refused.operation });
+						}
+					}
 					const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
 					const initialized = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "init", `${runId}-${operationId}`]);
 					if (initialized.exitCode !== 0) throw new Error(initialized.stderr || initialized.stdout || "headless init failed");
@@ -1019,7 +1067,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const decision = parseRuntimeDecisionKind(params.decision);
 					const decided = graphStore.decideRuntimeCandidate({ attemptKey: attempt.attemptKey, decision, reason: required(params.reason, "reason"), verdict: params.verdict, payload: params.payload });
 					progress("runtime_candidate_decided", { runId, operationId, decision, status: decided.state.status, node: decided.state.currentNode });
-					return textResult({ runId, operationId, ...decided, next: decided.state.status === "active" ? graphStore.next(runId) : null });
+					return textResult({ runId, operationId, ...decided, next: decided.state.status === "active" ? graphStore.next(runId) : null, ...(await closeEndedRunTabs(graphStore, pi, runId)) });
 				}
 				if (params.op === "retry") {
 					const operationId = required(params.operationId, "operationId");
@@ -1040,7 +1088,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					}
 					const state = graphStore.resolveExhaustion(runId, operationId, decision, params.deferredUntil);
 					progress("recovery_resolved", { runId, operationId, decision, status: state.status });
-					return textResult({ state, operation: graphStore.getOperation(operationId) });
+					return textResult({ state, operation: graphStore.getOperation(operationId), ...(await closeEndedRunTabs(graphStore, pi, runId)) });
 				}
 				if (params.op === "cancel") {
 					const operationId = required(params.operationId, "operationId");
@@ -1059,7 +1107,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					}
 					const result = graphStore.record({ runId, operationId, status: "cancelled", agentId: agent.id, agentName: agent.name, transport: agent.transport });
 					progress("cancelled", { runId, operationId, agentName: agent.name, status: result.state.status });
-					return textResult(result);
+					return textResult({ ...result, ...(await closeEndedRunTabs(graphStore, pi, runId)) });
 				}
 
 				throw new Error(`op=record accepts only status=cancelled (use op=cancel); ${params.op === "record" ? `status=${params.status ?? "missing"}` : `op=${params.op}`} is not a runtime-v1 transition`);

@@ -52,30 +52,29 @@ print(json.dumps({'state':state,'mode':oct((run_dir / 'state.json').stat().st_mo
 		assert.equal(proof.lock, false);
 	});
 
-	test("lets a blocked agent proceed to report audit instead of rejecting before cleanup", () => {
+	test("refuses a resource without an ACPX result file instead of settling on pane status", () => {
 		const probe = String.raw`
 import json, pathlib, runpy, sys, tempfile
 module = runpy.run_path(sys.argv[1])
 run_dir = pathlib.Path(tempfile.mkdtemp(prefix='herdr-blocked-report-'))
 module['write_state'](run_dir, {'caller_tab':'caller','closed_tabs':[],'resources':[],'run_label':'test','run_slug':'test'})
-class Result:
-    def __init__(self, returncode, stdout=''):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = ''
-def fake_run(argv, check=True):
-    if argv[1:3] == ['agent','wait']:
-        return Result(1)
-    return Result(0, json.dumps({'result':{'agent':{'agent_status':'blocked'}}}))
-closed = []
+calls = []
+def fake_run(argv, check=True, **_kwargs):
+    calls.append(argv)
+    raise AssertionError('no Herdr call is a settle signal')
 module['wait_for_settled_agent'].__globals__['run'] = fake_run
-module['wait_for_settled_agent'].__globals__['close_created_tab'] = lambda run_dir, tab: closed.append(tab)
-module['wait_for_settled_agent'](run_dir, {'agent':'worker','tab':'worker-tab'})
-print(json.dumps({'closed':closed}))
+error = None
+try:
+    module['wait_for_settled_agent'](run_dir, {'agent':'worker','tab':'worker-tab'})
+except Exception as caught:
+    error = str(caught)
+print(json.dumps({'error':error,'calls':calls}))
 `;
 		const result = spawnSync("python3", ["-c", probe, script], { encoding: "utf8", timeout: 10_000 });
 		assert.equal(result.status, 0, result.stderr);
-		assert.deepEqual(JSON.parse(result.stdout), { closed: [] });
+		const observed = JSON.parse(result.stdout);
+		assert.match(String(observed.error), /settlement waits only on an ACPX worker result file/);
+		assert.deepEqual(observed.calls, []);
 	});
 
 	test("recovers an orphaned state lock owned by a dead process", () => {

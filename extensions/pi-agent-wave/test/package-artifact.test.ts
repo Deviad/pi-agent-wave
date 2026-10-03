@@ -1,5 +1,6 @@
 import { describe, expect, test } from "./test-api.mjs";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,9 +12,17 @@ function npmJson(args: string[]): any {
 	return JSON.parse(result.stdout);
 }
 
+const PACKAGE_NAME: string = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).name;
+
+/**
+ * The file list of one npm dry-run report. `pack` answers with an array; `publish` answered with the bare
+ * report before npm 11.19 and with `{ "<package name>": report }` from it on. Any other shape throws rather
+ * than reading as an empty artifact.
+ */
 function artifactFiles(result: any): string[] {
-	const item = Array.isArray(result) ? result[0] : result;
-	return (item.files ?? []).map((entry: any) => String(entry.path)).sort();
+	const item = Array.isArray(result) ? result[0] : Array.isArray(result?.files) ? result : result?.[PACKAGE_NAME];
+	if (!Array.isArray(item?.files)) throw new Error(`unrecognized npm dry-run report: ${JSON.stringify(result).slice(0, 200)}`);
+	return item.files.map((entry: any) => String(entry.path)).sort();
 }
 
 describe("npm package artifact", () => {

@@ -140,3 +140,60 @@ export async function focusRegisteredAgent(
 	}
 	await focusHerdrAgent(agent.herdr_agent, exec);
 }
+
+/** What happened to one worker tab a run recorded: closed now, already gone, kept because its label is not this run's, or a failed close. */
+export interface TabCleanup {
+	readonly agentName: string;
+	readonly tabId: string;
+	readonly outcome: "closed" | "absent" | "not-owned" | "failed";
+	readonly detail?: string;
+}
+
+interface ListedTab {
+	readonly tab_id: string;
+	readonly label: string;
+}
+
+function listedTabs(stdout: string): ListedTab[] {
+	const value: unknown = JSON.parse(stdout);
+	const root = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+	const container = typeof root.result === "object" && root.result !== null ? (root.result as Record<string, unknown>) : root;
+	const tabs = Array.isArray(container.tabs) ? container.tabs : [];
+	return tabs.flatMap((tab: unknown) => {
+		if (typeof tab !== "object" || tab === null) return [];
+		const { tab_id, label } = tab as Record<string, unknown>;
+		return typeof tab_id === "string" ? [{ tab_id, label: typeof label === "string" ? label : "" }] : [];
+	});
+}
+
+/**
+ * Closes the Herdr worker tabs a run's agent rows recorded and that are still open. A tab is closed only
+ * when its current label still starts with `<runId>-`, the run label every worker tab is created with,
+ * because Herdr reuses tab ids: a recorded id may now name an unrelated tab, which is reported, not closed.
+ */
+export async function closeRunTabs(runId: string, agents: readonly Pick<FocusableAgent, "name" | "transport" | "tab_id">[], exec: CommandExecutor): Promise<TabCleanup[]> {
+	const recorded = agents.filter((agent): agent is typeof agent & { tab_id: string } => agent.transport === "herdr" && typeof agent.tab_id === "string" && agent.tab_id.length > 0);
+	if (!recorded.length) return [];
+	let tabs: ListedTab[];
+	try {
+		const listed = await exec("herdr", ["tab", "list"]);
+		if (listed.exitCode !== 0) throw new Error(listed.stderr || listed.stdout || "herdr tab list failed");
+		tabs = listedTabs(listed.stdout);
+	} catch (error) {
+		const detail = `tab list unavailable: ${error instanceof Error ? error.message : String(error)}`;
+		return recorded.map((agent) => ({ agentName: agent.name, tabId: agent.tab_id, outcome: "failed", detail }));
+	}
+	const report: TabCleanup[] = [];
+	for (const agent of recorded) {
+		const tab = tabs.find((candidate) => candidate.tab_id === agent.tab_id);
+		if (!tab) { report.push({ agentName: agent.name, tabId: agent.tab_id, outcome: "absent" }); continue; }
+		if (!tab.label.startsWith(`${runId}-`)) { report.push({ agentName: agent.name, tabId: agent.tab_id, outcome: "not-owned", detail: `label ${JSON.stringify(tab.label)}` }); continue; }
+		try {
+			const closed = await exec("herdr", ["tab", "close", agent.tab_id]);
+			report.push(closed.exitCode === 0 ? { agentName: agent.name, tabId: agent.tab_id, outcome: "closed" } : { agentName: agent.name, tabId: agent.tab_id, outcome: "failed", detail: (closed.stderr || closed.stdout).trim() });
+		} catch (error) {
+			report.push({ agentName: agent.name, tabId: agent.tab_id, outcome: "failed", detail: error instanceof Error ? error.message : String(error) });
+		}
+	}
+	return report;
+}

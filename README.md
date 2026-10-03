@@ -224,7 +224,7 @@ Ask Pi to use `delegate_graph`:
 Use delegate_graph to implement tenant-scoped API keys. Keep me updated and ask before resolving blocked recovery choices.
 ```
 
-Air receives structured tool progress and final results. Because not every ACP client exposes Pi slash commands, Air workflows use the equivalent `delegate_graph` operations: `op=init` to initialize, `op=status` and `op=watch` to inspect, `op=cancel` to cancel, `op=retry` and `op=resolve` to recover, and `op=next` to continue a parked run. The structured question tool renders as native pickers in Air, with explicit Back, Cancel, and Submit steps.
+Air receives structured tool progress and final results. Because not every ACP client exposes Pi slash commands, Air workflows use the equivalent `delegate_graph` operations: `op=init` to initialize, `op=status` and `op=watch` to inspect, `op=cancel` to cancel, `op=retry` and `op=resolve` to recover, and `op=next` to continue a parked run. `op=status` shows each task as a digest, size and one-line preview so repeated polling stays small; pass an `operationId` to get that operation's full task. The structured question tool renders as native pickers in Air, with explicit Back, Cancel, and Submit steps.
 
 For structured source-command workflows, see [operational search delegation](extensions/pi-agent-wave/README.md#operational-search-delegation).
 

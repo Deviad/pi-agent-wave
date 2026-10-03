@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "./harness.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,6 +155,26 @@ describe("supervisor UX", () => {
 		expect(log).toContain("runtime_attempt_registered");
 		expect(store.runtimeAttempt(attemptKey).processState).toBe("running");
 		expect(log).toContain("message=Build UX");
+		store.close();
+	});
+
+	test("status bounds a large task to a digest and preview, and returns it in full only on request", () => {
+		const { store } = fixture();
+		const task = `# Story\n\n${"Repair the failing suite and record every decision. ".repeat(200)}`;
+		assert.ok(Buffer.byteLength(task) >= 8 * 1024);
+		const state = store.initRun("large-task", "build", task, fallbackPolicy());
+		const operation = store.next(state.runId).operations[0]!;
+		const stored = store.getOperation(operation.id).task;
+		const digest = createHash("sha256").update(stored).digest("hex");
+		store.registerAgent({ runId: state.runId, name: "thinker-1", node: "thinker_plan", role: "thinker", transport: "headless", policyDigest: store.policy(state.runId).digest, selectedModel: SOL_MODEL, modelAttempt: 0, currentTask: stored });
+		const status = renderStatus(store, state.runId);
+		assert.ok(Buffer.byteLength(status) < 4096, `status is ${Buffer.byteLength(status)} bytes`);
+		assert.ok(status.includes(`task sha256=${digest} bytes=${Buffer.byteLength(stored)}`), status);
+		assert.equal(status.includes(stored), false);
+		const full = renderStatus(store, state.runId, { taskOf: operation.id });
+		assert.ok(full.startsWith(status), "the opt-in only appends");
+		assert.ok(full.endsWith(`task ${operation.id} sha256=${digest}:\n${stored}`));
+		assert.throws(() => renderStatus(store, state.runId, { taskOf: "op_missing" }), /unknown operation|does not belong/);
 		store.close();
 	});
 

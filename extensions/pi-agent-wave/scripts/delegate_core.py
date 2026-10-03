@@ -1176,26 +1176,8 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
                 )
             raise DelegateError(f"ACPX worker failed: exit={exit_code} terminal={terminal_kind}")
         return
-    wait_result = run(
-        ["herdr", "agent", "wait", agent_name, "--timeout", WAIT_TIMEOUT_MS],
-        check=False,
-    )
-    if wait_result.returncode != 0:
-        diagnostic = run(["herdr", "agent", "get", agent_name], check=False)
-        detail = (diagnostic.stdout or diagnostic.stderr).strip()
-        error = DelegateError(f"Herdr agent wait failed: {agent_name}\n{detail}")
-        try:
-            status = str(json_path(diagnostic.stdout, "result", "agent", "agent_status"))
-        except DelegateError:
-            status = "unknown"
-        if status == "blocked":
-            return
-        close_settled_tab(run_dir, resource, error)
-
-    agent_result = run(["herdr", "agent", "get", agent_name]).stdout
-    status = str(json_path(agent_result, "result", "agent", "agent_status"))
-    if status not in {"idle", "done", "blocked"}:
-        close_settled_tab(run_dir, resource, DelegateError(f"Herdr agent settled in unsupported state {status!r}: {agent_name}"))
+    # A pane's agent status stays `working` for a whole turn, so it is never a settle signal.
+    raise DelegateError(f"unsupported worker resource {agent_name}: settlement waits only on an ACPX worker result file")
 
 
 

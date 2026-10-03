@@ -1,5 +1,18 @@
+import { createHash } from "node:crypto";
 import type { GraphStore } from "./store.ts";
 import { modelPolicyLabel } from "./herdr.ts";
+import { ORPHAN_RECOVERY, readProcessTable, runLiveness } from "./lib/liveness.ts";
+
+const TASK_PREVIEW_CHARS = 120;
+
+/** A fixed-size stand-in for a task: its SHA-256 over the stored UTF-8 text, its size, and a one-line preview. */
+export function taskSummary(task: string | null | undefined): string {
+	if (!task) return "-";
+	const digest = createHash("sha256").update(task).digest("hex");
+	const line = task.replace(/\s+/g, " ").trim();
+	const preview = line.length > TASK_PREVIEW_CHARS ? `${line.slice(0, TASK_PREVIEW_CHARS)}…` : line;
+	return `task sha256=${digest} bytes=${Buffer.byteLength(task)} "${preview.replaceAll("|", "/")}"`;
+}
 
 function cell(value: unknown): string {
 	return value === null || value === undefined || value === "" ? "-" : String(value);
@@ -23,8 +36,11 @@ function eventPolicy(payload: Record<string, unknown>): PolicyEvent | undefined 
 	return "selectedModel" in payload || "policyDigest" in payload ? (payload as PolicyEvent) : undefined;
 }
 
-/** Renders the on-demand supervisor dashboard without starting timers or polling. */
-export function renderStatus(store: GraphStore, runId: string): string {
+/**
+ * Renders the on-demand supervisor dashboard without starting timers or polling. Its size follows the
+ * run's progress, not its tasks: each task is a `taskSummary`, and `taskOf` appends one operation's full text.
+ */
+export function renderStatus(store: GraphStore, runId: string, options: { taskOf?: string; processes?: () => readonly string[] | null } = {}): string {
 	const state = store.getState(runId);
 	const frozen = store.policy(runId);
 	const policy = modelPolicyLabel(frozen.input);
@@ -62,7 +78,7 @@ export function renderStatus(store: GraphStore, runId: string): string {
 				model,
 				chainLength ? `${attempt + 1}/${chainLength}` : "-",
 				agent.status,
-				agent.current_task,
+				taskSummary(agent.current_task),
 				agent.last_activity_at,
 			]
 				.map(cell)
@@ -70,11 +86,23 @@ export function renderStatus(store: GraphStore, runId: string): string {
 		);
 	}
 	if (operations.length > 0) {
+		const liveness = runLiveness(store, runId, options.processes ?? readProcessTable);
+		let orphaned = 0;
 		lines.push("", "current operations:");
 		for (const operation of operations) {
 			const route = store.routeForNode(runId, operation.node);
-			lines.push(`${operation.id} | ${operation.node} | ${operation.status} | policy=${policy} | tier=${cell(route?.tier)} | chain=${cell(route?.chain.join(","))} | ${operation.task}`);
+			const blocker = (operation.status === "failed" || operation.status === "blocked") && operation.last_error ? ` | blocker=${operation.last_error}` : "";
+			const live = liveness.get(operation.id);
+			if (live?.state === "orphaned") orphaned += 1;
+			const shown = live?.state === "orphaned" ? `orphaned (${live.reason})` : operation.status;
+			lines.push(`${operation.id} | ${operation.node} | ${shown}${blocker} | policy=${policy} | tier=${cell(route?.tier)} | chain=${cell(route?.chain.join(","))} | ${taskSummary(operation.task)}`);
 		}
+		if (orphaned) lines.push(`orphaned workers: ${orphaned}; ${ORPHAN_RECOVERY}`);
+	}
+	if (options.taskOf) {
+		const operation = store.getOperation(options.taskOf);
+		if (operation.run_id !== runId) throw new Error(`operation ${options.taskOf} does not belong to run ${runId}`);
+		lines.push("", `task ${operation.id} sha256=${createHash("sha256").update(operation.task).digest("hex")}:`, operation.task);
 	}
 	return lines.join("\n");
 }
