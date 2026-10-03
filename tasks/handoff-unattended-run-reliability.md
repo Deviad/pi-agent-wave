@@ -406,9 +406,15 @@ from `settings.json`.
   through `lib/safe-write.mjs` (a created file as `existed: false`), and `rollback --manifest` restores
   the previous bytes and mode or removes a created launcher. It is separate from `pi-agent-wave-init`
   because that command's `--force` would also overwrite `model-routing.jsonc`.
-- Out of scope here: applying it to the real `~/.pi/agent` (needs explicit authorization per
-  `AGENTS.md`), and retiring the `~/.pi/agent` copy and its test (commit `6c85ec3` on that repository's
-  `delegate-ledger-relative-roots` branch).
+- Applied to the real `~/.pi/agent` on 2026-10-03 with the operator's explicit authorization:
+  `install-ledger.mjs apply --force` replaced `main`'s committed wrapper (SHA-256 `ec1485e10776…`, mode
+  755), backed up in `migration-backups/pi-agent-wave-init/2026-10-03T04-55-16-970Z/manifest.json`
+  (status `applied`, same SHA-256). After it, `delegate-ledger read us-000-repair-suite-failures`
+  exits 0 with 6 entries and empty stderr, `audit` exits 0, and a second `apply` reports `no-change`.
+  Output: `agent-output/unattended-run-reliability-20261003/install-ledger-apply-real-agent.json`.
+- The `~/.pi/agent` copy is retired: its `delegate-ledger-relative-roots` branch (commit `6c85ec3`,
+  the relative-root fix and `tests/delegate-ledger-wrapper.test.ts`) was deleted and that repository
+  returned to `main`.
 
 Acceptance criteria:
 
