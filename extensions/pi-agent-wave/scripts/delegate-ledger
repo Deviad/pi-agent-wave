@@ -1,0 +1,9 @@
+#!/bin/sh
+# The story ledger command: `write`, `read` and `audit` against the graph store (`DELEGATE_GRAPH_DB`, or
+# the default graph home). Run it by its own path; `pi-agent-wave-install-ledger` installs a launcher
+# that does so from the agent directory.
+#
+# Usage: delegate-ledger <write|audit|read> <story> [topic] [options]
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+exec node --experimental-strip-types "$here/story-ledger.mjs" "$@"

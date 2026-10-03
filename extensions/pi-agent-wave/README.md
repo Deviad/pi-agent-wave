@@ -101,12 +101,13 @@ Windows PowerShell: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.de
 
 Pi resolves its agent directory from `PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent`. Route inspection and failover also honor `PI_MODEL_ROUTING` (an explicit `model-routing.jsonc` path) and `PI_MODEL_CATALOG` (an explicit `models.json` path).
 
-A local-path install loads the extension but adds no shell commands, so run the scripts through Node. After npm publication, the package binaries will be `pi-agent-wave-init`, `pi-agent-wave-doctor`, and `pi-agent-wave-migrate` (for example `pi-agent-wave-init apply`):
+A local-path install loads the extension but adds no shell commands, so run the scripts through Node. After npm publication, the package binaries will be `pi-agent-wave-init`, `pi-agent-wave-doctor`, `pi-agent-wave-migrate` and `pi-agent-wave-install-ledger` (for example `pi-agent-wave-init apply`):
 
 ```text
 pi-agent-wave-init [dry-run|apply|rollback] [options]
 pi-agent-wave-doctor [--json] [--agent-dir <path>] [--routing <path>] [--models <path>]
 pi-agent-wave-migrate [preflight|dry-run|apply|rollback] [options]
+pi-agent-wave-install-ledger [dry-run|apply|rollback] [--agent-dir <path>] [--force] [--backup-id <id>] [--manifest <path>]
 ```
 
 ### Initializer
@@ -217,11 +218,20 @@ did. And a recorded aggregate is not trusted: reading a story back recomputes
 disagree, which is the check the retired file-ledger audit performed. This is not `/graph ledger`,
 which renders one run from the store's operational facts and is consulted by no gate.
 
-The story ledger's command line is `scripts/story-ledger.mjs` (`write`, `read`, `audit`). A supervisor
-wrapper such as `~/.pi/agent/scripts/delegate-ledger` finds it through the `packages` entries of the
-agent's `settings.json`, each absolute or relative to the agent directory; `PI_AGENT_WAVE_ROOT`
-overrides the lookup. A resolution warning from the wrapper means no registered package carries the
-script, not that ledger rows were lost: the runtime writes them into the store either way.
+The story ledger's command is the package's `scripts/delegate-ledger` (`write`, `read`, `audit`),
+which runs `scripts/story-ledger.mjs` beside it. Install it into the agent directory once, and again
+after moving the package:
+
+```bash
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/install-ledger.mjs          # dry-run
+node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/install-ledger.mjs apply
+```
+
+That writes `<agent dir>/scripts/delegate-ledger` (agent dir from `--agent-dir`, `PI_CODING_AGENT_DIR`,
+then `~/.pi/agent`), a mode-755 launcher that `exec`s the package's wrapper by absolute path, so nothing
+is looked up in `settings.json`. A second `apply` reports `no-change`. A differing file is refused
+unless `--force`, which backs it up under `migration-backups/pi-agent-wave-init/<id>/` first;
+`rollback --manifest <path>` restores it byte-for-byte, or removes a launcher the installer created.
 
 All of these are private, mode 600 or 700, and may contain sensitive values. None is packaged.
 

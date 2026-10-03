@@ -138,9 +138,10 @@ describe("package documentation", () => {
 		expect(rootReadme()).toContain("pass an `operationId` to get that operation's full task");
 	});
 
-	test("documents how a ledger wrapper discovers the story-ledger script", () => {
+	test("documents the ledger command and its install step", () => {
 		const packageText = packageReadme();
-		for (const text of ["`scripts/story-ledger.mjs`", "each absolute or relative to the agent directory", "`PI_AGENT_WAVE_ROOT`"]) expect(packageText).toContain(text);
+		for (const text of ["`scripts/delegate-ledger`", "scripts/install-ledger.mjs apply", "<agent dir>/scripts/delegate-ledger", "nothing\nis looked up in `settings.json`", "pi-agent-wave-install-ledger [dry-run|apply|rollback]"]) expect(packageText).toContain(text);
+		expect(packageText.includes("PI_AGENT_WAVE_ROOT")).toBe(false);
 	});
 
 	test("ships the approved MIT license text", () => {

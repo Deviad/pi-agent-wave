@@ -38,7 +38,7 @@ export function defaultBackupId(now = new Date()) {
 	return now.toISOString().replace(/[.:]/g, "-");
 }
 
-const ALLOWED_BACKUP_PATHS = new Set(["model-routing.jsonc", "fzf.json"]);
+const ALLOWED_BACKUP_PATHS = new Set(["model-routing.jsonc", "fzf.json", "scripts/delegate-ledger"]);
 
 function assertSafeRelativePath(relativePath) {
 	if (typeof relativePath !== "string" || relativePath.length === 0) {

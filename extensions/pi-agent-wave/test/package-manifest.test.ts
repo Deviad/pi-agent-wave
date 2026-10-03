@@ -19,15 +19,16 @@ describe("package manifest", () => {
 		});
 		expect(typeof manifest.description).toBe("string");
 		expect(manifest.description.trim()).not.toBe("");
-		expect(manifest.files).toEqual(["*.ts", "lib", "scripts/*.ts", "scripts/*.mjs", "scripts/*.py", "README.md", "LICENSE"]);
+		expect(manifest.files).toEqual(["*.ts", "lib", "scripts/*.ts", "scripts/*.mjs", "scripts/*.py", "scripts/delegate-ledger", "README.md", "LICENSE"]);
 		expect(manifest.pi?.extensions).toEqual(["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts", "claude-code-auth.ts"]);
 	});
 
-	test("declares the migrate, init, and doctor bins", () => {
+	test("declares the migrate, init, doctor and ledger-install bins", () => {
 		expect(manifest.bin).toEqual({
 			"pi-agent-wave-migrate": "scripts/migrate.mjs",
 			"pi-agent-wave-init": "scripts/init.mjs",
 			"pi-agent-wave-doctor": "scripts/doctor.mjs",
+			"pi-agent-wave-install-ledger": "scripts/install-ledger.mjs",
 		});
 	});
 

@@ -388,7 +388,52 @@ it will attempt manual ledger recovery that is not needed.
 
 Decision on §12 question 3: the wrapper stays in the Pi agent scaffold (`~/.pi/agent`, its own Git
 repository), fixed in place; it parses `packages` as JSON and resolves each local entry against the
-agent directory.
+agent directory. **Superseded 2026-10-03 by the operator:** the wrapper lives in pi-agent-wave with an
+install step (§7.6).
+
+### 7.6 Follow-up: the wrapper moves into the package (2026-10-03)
+
+The package ships the wrapper and installs a launcher for it, so nothing has to discover the package
+from `settings.json`.
+
+- `scripts/delegate-ledger` (shipped; added to `files`): a POSIX `sh` script that runs
+  `node --experimental-strip-types <its own directory>/story-ledger.mjs "$@"`.
+- `scripts/install-ledger.mjs` (bin `pi-agent-wave-install-ledger`): installs
+  `<agent dir>/scripts/delegate-ledger`, a mode-755 launcher that `exec`s the package's wrapper by its
+  single-quoted absolute path. Agent dir from `--agent-dir`, `PI_CODING_AGENT_DIR`, then `~/.pi/agent`.
+  `dry-run` is the default and writes nothing; `apply` creates the launcher, is a no-op when the bytes
+  already match, and refuses a differing file unless `--force`; every write first records a backup
+  through `lib/safe-write.mjs` (a created file as `existed: false`), and `rollback --manifest` restores
+  the previous bytes and mode or removes a created launcher. It is separate from `pi-agent-wave-init`
+  because that command's `--force` would also overwrite `model-routing.jsonc`.
+- Out of scope here: applying it to the real `~/.pi/agent` (needs explicit authorization per
+  `AGENTS.md`), and retiring the `~/.pi/agent` copy and its test (commit `6c85ec3` on that repository's
+  `delegate-ledger-relative-roots` branch).
+
+Acceptance criteria:
+
+- [x] A focused test in a temporary agent directory: `dry-run` writes nothing; `apply` creates an
+  executable launcher that runs the package's `story-ledger.mjs` against a temporary
+  `DELEGATE_GRAPH_DB` (`read` exits 0 with the store's JSON); a second `apply` reports no change; a
+  differing file is refused without `--force`, replaced with `--force`, and `rollback` restores its exact
+  bytes and mode; `rollback` of a fresh install removes the launcher.
+  Evidence: `test/ledger-install.test.ts`, 3/3 pass; all three failed before the installer existed.
+  The first apply also exposed that `lib/safe-write.mjs` refused to back up any path outside
+  `model-routing.jsonc` and `fzf.json`; `scripts/delegate-ledger` was added to that restore allowlist.
+- [x] The packed artifact contains `scripts/delegate-ledger` and `scripts/install-ledger.mjs`, and the
+  manifest declares the new bin. Proof: `package-artifact.test.ts` and `package-manifest.test.ts`.
+  Evidence: both pass; `npm pack --dry-run` lists 84 entries with `scripts/delegate-ledger`,
+  `scripts/install-ledger.mjs` and `scripts/story-ledger.mjs` at mode 755.
+- [x] The package README documents the install step and replaces the `settings.json` discovery text.
+  Proof: `package-docs.test.ts`.
+  Evidence: "documents the ledger command and its install step" passes and asserts
+  `PI_AGENT_WAVE_ROOT` no longer appears.
+- [x] A dry run against the real `~/.pi/agent` shows the planned replacement without writing. Proof:
+  recorded output, and the file's hash unchanged.
+  Evidence: `agent-output/unattended-run-reliability-20261003/install-ledger-dry-run-real-agent.json`
+  (`action: "replace"`, `ok: true`); SHA-256 `8f892067…1f59706` before and after; no backup created.
+  Gate on this tree: 610 Node tests, 599 pass, 0 fail, 11 skips; typecheck, `git diff --check` clean;
+  Bun package checks 49/49.
 
 ## 8. Issue 6 — orphaned Herdr tabs survive a run that never settles
 

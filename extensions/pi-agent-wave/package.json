@@ -16,13 +16,15 @@
     "scripts/*.ts",
     "scripts/*.mjs",
     "scripts/*.py",
+    "scripts/delegate-ledger",
     "README.md",
     "LICENSE"
   ],
   "bin": {
     "pi-agent-wave-migrate": "scripts/migrate.mjs",
     "pi-agent-wave-init": "scripts/init.mjs",
-    "pi-agent-wave-doctor": "scripts/doctor.mjs"
+    "pi-agent-wave-doctor": "scripts/doctor.mjs",
+    "pi-agent-wave-install-ledger": "scripts/install-ledger.mjs"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

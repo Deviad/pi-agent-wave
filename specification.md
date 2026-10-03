@@ -996,13 +996,16 @@ with the optional `local-fast`; the roles are `DELEGATE_GRAPH_ROLES =
 
 - `"name": "@dpugliese/pi-agent-wave"`, `"version": "0.2.0"`, `"type": "module"`,
   `"license": "MIT"`.
-- `"files": ["*.ts", "lib", "scripts/*.ts", "scripts/*.mjs", "scripts/*.py", "README.md",
-  "LICENSE"]`.
+- `"files": ["*.ts", "lib", "scripts/*.ts", "scripts/*.mjs", "scripts/*.py",
+  "scripts/delegate-ledger", "README.md", "LICENSE"]`.
 - `"pi".extensions`: `["index.ts","questionnaire.ts","cmux-session.ts","model-failover.ts",
   "claude-code-auth.ts"]` (the graph extension plus the questionnaire, cmux-session, model-failover
   and claude-code-auth entry points).
 - `"bin"`: `pi-agent-wave-migrate → scripts/migrate.mjs`, `pi-agent-wave-init → scripts/init.mjs`,
-  `pi-agent-wave-doctor → scripts/doctor.mjs`.
+  `pi-agent-wave-doctor → scripts/doctor.mjs`, `pi-agent-wave-install-ledger →
+  scripts/install-ledger.mjs` (installs `<agent dir>/scripts/delegate-ledger`, a launcher that `exec`s
+  the shipped `scripts/delegate-ledger`; dry-run default, backups through `lib/safe-write.mjs`, whose
+  restore allowlist is `model-routing.jsonc`, `fzf.json` and `scripts/delegate-ledger`).
 - `"dependencies"`: `@anthropic-ai/sdk@0.91.1` and `@cgaravitoq/claude-code-core@0.1.0`;
   `"peerDependencies"`: `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`,
   `@earendil-works/pi-tui`, `typebox`; `"devDependencies"` pin Pi `0.84.1` for typechecking.
