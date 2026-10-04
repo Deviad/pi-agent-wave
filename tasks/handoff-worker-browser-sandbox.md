@@ -141,8 +141,14 @@ browser tests in the supervisor session after integration, where a throwaway `he
 
 ## 7. Draft upstream report (option 4, not filed)
 
-Filing is externally visible and needs the operator. Where to file is not established here: find AgentFS's issue
-tracker from the installed package's metadata first.
+Filing is externally visible and needs the operator. Tracker: `https://github.com/tursodatabase/agentfs/issues`, the
+repository the package README cites for `v0.6.4`; on 2026-10-04 it had issues enabled, was not archived, held 75
+open issues and was last pushed 2026-06-03. Duplicate check the same day (GitHub issue search in that repository):
+nothing for `IORegisterForSystemPower`, `chrome`, `IOKit`, `puppeteer` or `playwright`; `chromium` and `browser`
+match only unrelated issues (#322, #94, #245). Related: #178, "agentfs run: Use macOS Sandbox for filesystem
+isolation", which introduced the profile. Not filed: `gh` is not authenticated on this host, and filing needs the
+operator's explicit go. To file: `gh auth login`, then `gh issue create --repo tursodatabase/agentfs --title
+"<title below>" --body-file <the quoted body>`.
 
 > **macOS sandbox denies `IORegisterForSystemPower`; every Chromium-based browser segfaults inside `agentfs run`**
 >
