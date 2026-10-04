@@ -128,3 +128,34 @@ print(json.dumps(out))
 		assert.equal(out["claude-code/claude-opus-5"]["settings.json"].selfWrites, "tolerated");
 	});
 });
+
+describe("Codex runs inside AgentFS without its own sandbox", () => {
+	test("only a Codex worker starts in codex-acp's agent-full-access mode", () => {
+		const home = realpathSync(mkdtempSync(join(tmpdir(), "codex-mode-")));
+		dirs.push(home);
+		const script = `
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import delegate_core as core
+home = Path(sys.argv[2])
+(home / '.codex').mkdir()
+(home / '.codex' / 'auth.json').write_text(json.dumps({'OPENAI_API_KEY': 'offline-fixture-not-a-credential'}))
+(home / '.claude').mkdir()
+(home / '.claude' / '.credentials.json').write_text(json.dumps({'claudeAiOauth': {'accessToken': 'offline-fixture-not-a-credential'}}))
+os.environ['CODEX_HOME'] = str(home / '.codex')
+os.environ.pop('PI_CLAUDE_OAUTH_TOKEN_FILE', None)
+out = {}
+for model in ('openai-codex/gpt-5.6-luna', 'claude-code/claude-opus-5'):
+    attempt = home / ('attempt-' + model.split('/')[0])
+    attempt.mkdir()
+    (attempt / 'acpx-home').mkdir()
+    environment, _ = core.provider_runtime_environment(attempt, attempt / 'acpx-home', home, model)
+    out[model] = environment.get('INITIAL_AGENT_MODE')
+print(json.dumps(out))
+`;
+		const result = spawnSync("python3", ["-c", script, SCRIPTS, home], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } });
+		assert.equal(result.status, 0, result.stderr);
+		assert.deepEqual(JSON.parse(result.stdout), { "openai-codex/gpt-5.6-luna": "agent-full-access", "claude-code/claude-opus-5": null });
+	});
+});
