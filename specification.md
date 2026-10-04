@@ -758,8 +758,9 @@ generates an agent name matching `[a-z][a-z0-9_-]{0,31}` (`dg_<run8>_<role9>_<he
    name `dg-<slug(role)>-<modelAttempt>-<transientAttempt>-<sha256(runId:operationId:modelAttempt:transientAttempt)[:12]>`
    (`acpxAttemptKey`, `createAcpxAttemptIdentity`).
 2. Creates `<run>/acpx/<agent>/` (700) with `acpx-home/`, `agentfs-home/`, `providers/`.
-3. Builds the provider environment (`provider_runtime_environment`): preflight, then materialization
-   (§5.3).
+3. Builds the provider environment (`provider_runtime_environment`): preflight, then materialization; for a Codex
+   worker it also sets `INITIAL_AGENT_MODE=agent-full-access`, the `codex-acp` mode without Codex's own Seatbelt
+   sandbox, which macOS refuses inside AgentFS (§5.3; `tasks/handoff-codex-full-access.md`).
 4. Builds the prompt: the task text, the operational instruction when `--command-json` is present
    (`operational_instruction`, which resolves the command's `cwd` against the worker's working
    directory and refuses a mismatch), the runtime-answer contract text, the `VERDICT:` line

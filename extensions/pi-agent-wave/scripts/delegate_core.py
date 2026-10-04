@@ -867,6 +867,11 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
     }
     if claude_token_link:
         environment["PI_CLAUDE_OAUTH_TOKEN_FILE"] = str(claude_token_link)
+    if agent == "codex":
+        # macOS refuses a sandbox inside the AgentFS sandbox, so Codex's own Seatbelt wrapper fails every command
+        # (`sandbox_apply: Operation not permitted`). codex-acp reads its starting mode from this variable;
+        # agent-full-access runs commands unsandboxed, confined by AgentFS like Pi and Claude workers.
+        environment["INITIAL_AGENT_MODE"] = "agent-full-access"
     return environment, links
 
 
