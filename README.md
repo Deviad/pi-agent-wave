@@ -105,6 +105,8 @@ flowchart TB
 
 A running worker is therefore watchable two ways, and both read the worker's own output rather than a summary of it: a Herdr pane is read directly, and a headless worker's supervisor publishes what the worker writes to a loopback listener the view polls. Neither path is a gate. Nothing is retained by the channel itself, and the capture files a view never reads are what settlement retains as evidence.
 
+Some tools cannot run inside the overlay: on macOS no browser starts there. Such a tool can run as a **host service** beside the worker instead. You register it once in `~/.pi/agent/host-services.jsonc`, the supervisor attaches it to one dispatch (`hostServices: ["browser"]`), and it runs on the host, outside the overlay, for that attempt only, reachable from the worker through a loopback port named in an environment variable. Register only tools whose writes are disposable, such as a browser or a database: what a service writes is not audited. Details: the package README, "Host services".
+
 ### What a run keeps, and what it tears down
 
 ```mermaid
@@ -284,6 +286,8 @@ Removing pi-agent-wave does not remove optional Herdr, routing configuration, mi
 ## Security
 
 Pi extensions run with your user account's full system access. Review the source before installation, especially the worker-launch and migration scripts. pi-agent-wave packages no external runtimes, credentials, user settings, databases, or generated evidence.
+
+Workers are confined by AgentFS, which limits writes to the overlay but not reads, and not writes to `/tmp`; the package README lists the gaps. Codex workers run without Codex's own sandbox, because macOS refuses a sandbox inside AgentFS, so they have the same confinement as Pi and Claude workers, network access included. A host service runs outside the sandbox, and its loopback port has no authentication: any local process can reach it while the attempt runs.
 
 ## Compatibility
 
