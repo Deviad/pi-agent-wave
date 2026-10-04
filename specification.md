@@ -869,8 +869,10 @@ compares each candidate to its host preimage (overlay bytes via `agentfs fs <db>
 `readFileSync(hostPath)`, plus the mode); a failed comparison is recorded
 as an `audit_error` rather than promoted to a change. `auditAgentFsChanges` normalizes owned and
 ignored paths with the symlink-aware `realpathExistingPrefix`, rejects whole-base ownership unless
-`ownWholeBase`, classifies each change as owned, ignored (explicit `ignoredPaths` or platform
-metadata `._*`/`.DS_Store`), a container of an owned path, or a violation, and returns the errors.
+`ownWholeBase`, classifies each change as owned, ignored (platform metadata `._*`/`.DS_Store`,
+checked first so it is ignored inside ownership too, or explicit `ignoredPaths`), a container of an
+owned path, or a violation, and returns the errors. Platform metadata is never work in any mode: the
+macOS overlay writes `._*` beside the files a worker creates (`tasks/handoff-repository-sidecars.md`).
 `stageRuntimeAgentFs` fails on any audit error for a non-read-only attempt and on any violation
 (`AgentFS contains unowned changes: …`).
 
@@ -907,8 +909,8 @@ Git-internal paths.
 For a home run the configuration carries `ownWholeBase: true` (coding only;
 `delegate_core.py:runtime_settle_config`), and `runtime-settle.ts` passes it to
 `lib/runtime-staging.ts:stageRuntimeAgentFs` with the graph home as an excluded root. Staging then owns
-every changed path except paths with a `.git` segment, platform sidecars (`._*`, `.DS_Store`, which the
-NFS mount writes beside every file) and paths under the graph home, and records the staged paths
+every changed path except paths with a `.git` segment and paths under the graph home (platform sidecars
+never reach staging: the audit ignores them in every mode), and records the staged paths
 themselves as the manifest's `ownedPaths`, because the whole base has no relative spelling.
 
 `scripts/delegate_core.py:settle_runtime_attempt` wraps this: it waits for the worker

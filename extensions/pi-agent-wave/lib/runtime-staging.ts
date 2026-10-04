@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, copyFileSync, existsSync, lstatSync, openSync, readSync, realpathSync, rmSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { makeScratchDir } from "./agent-paths.mjs";
-import { DEFAULT_IGNORED_PATHS, auditAgentFsChanges, agentFsAuditErrorMessage, platformMetadata } from "./agentfs-sandbox.ts";
+import { DEFAULT_IGNORED_PATHS, auditAgentFsChanges, agentFsAuditErrorMessage } from "./agentfs-sandbox.ts";
 import { RuntimeContentStore } from "./runtime-content.ts";
 import { canonical, parseRuntimeContent, type RuntimeContent } from "./runtime-results.ts";
 
@@ -41,9 +41,10 @@ export interface RuntimeStagingInput {
 	readonly ownedPaths: readonly string[];
 	readonly readOnly: boolean;
 	/**
-	 * A home run owns its whole working directory. Paths inside a `.git` directory, platform sidecars and
-	 * paths under `excludedRoots` (the graph home) are dropped rather than staged: the journal refuses the
-	 * first, the second would litter the home, and the third must never be placed over the live store.
+	 * A home run owns its whole working directory. Paths inside a `.git` directory and paths under
+	 * `excludedRoots` (the graph home) are dropped rather than staged: the journal refuses the first, and the
+	 * second must never be placed over the live store. Platform sidecars never reach staging in any mode
+	 * (`auditAgentFsChanges` ignores them).
 	 */
 	readonly ownWholeBase?: boolean;
 	readonly excludedRoots?: readonly string[];
@@ -75,7 +76,7 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 		const excluded = (input.excludedRoots ?? [])
 			.map((root) => { try { return relative(workspace, realpathSync(root)); } catch { return relative(workspace, resolve(root)); } })
 			.filter((path) => path && !path.startsWith("..") && !isAbsolute(path));
-		const staged = (path: string): boolean => !ownWholeBase || !(path.split("/").includes(".git") || platformMetadata(path) || excluded.some((root) => path === root || path.startsWith(`${root}/`)));
+		const staged = (path: string): boolean => !ownWholeBase || !(path.split("/").includes(".git") || excluded.some((root) => path === root || path.startsWith(`${root}/`)));
 		const errors = input.readOnly ? audit.errors.filter((error) => error.kind !== "audit_error") : audit.errors;
 		if (errors.length) throw new Error(agentFsAuditErrorMessage(errors));
 		if (!input.readOnly && audit.violations.length) throw new Error(`AgentFS contains unowned changes: ${audit.violations.map((item) => item.path).join(", ")}`);

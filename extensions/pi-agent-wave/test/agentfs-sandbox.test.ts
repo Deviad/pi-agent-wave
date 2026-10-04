@@ -361,13 +361,13 @@ describe("AgentFS operation-attempt sandbox", () => {
 
 		const allowed = auditAgentFsChanges(db, f.base, [f.base], { ownWholeBase: true });
 		assert.deepEqual(allowed.errors, []);
-		// macOS may add AppleDouble `._*` entries inside the overlay; under whole-base ownership they are owned too.
-		assert.deepEqual(allowed.owned.map((change) => change.path).filter((path) => !path.startsWith("._")).sort(), ["other.txt", "owned.txt"]);
+		// macOS may add AppleDouble `._*` entries inside the overlay; they are never owned, even under whole-base ownership.
+		assert.deepEqual(allowed.owned.map((change) => change.path).sort(), ["other.txt", "owned.txt"]);
 		assert.equal(runExport({ schemaVersion: 1, agentFsExecutable: "agentfs", dbPath: db, baseDir: f.base, ownedPaths: [f.base], ignoredPaths: [], discardAllChanges: false, resultPath, ownWholeBase: true }), 0);
 		assert.equal(readFileSync(join(f.base, "other.txt"), "utf8"), "new\n");
 	});
 
-	test("platform metadata is discarded outside ownership and exported inside it", () => {
+	test("platform metadata is discarded inside and outside ownership, and only the owned work is exported", () => {
 		const f = fixture("platform-metadata");
 		mkdirSync(join(f.base, "out"));
 		const owned = [join(f.base, "out")];
@@ -376,14 +376,12 @@ describe("AgentFS operation-attempt sandbox", () => {
 		assert.deepEqual(audit.errors, []);
 		assert.deepEqual(audit.violations, [], "unowned Finder metadata must be discarded rather than refused");
 		const ignored = audit.ignored.map((change) => change.path);
-		assert.ok(ignored.includes(".DS_Store") && ignored.includes("._owned.txt"), JSON.stringify(ignored));
+		for (const path of [".DS_Store", "._owned.txt", "out/.DS_Store", "out/._standalone"]) assert.ok(ignored.includes(path), JSON.stringify(ignored));
 		assert.ok(ignored.every((path) => /(^|\/)(\._|\.DS_Store$)/.test(path)), "only platform metadata may be silently ignored");
-		const ownedPaths = audit.owned.map((change) => change.path);
-		for (const path of ["out/.DS_Store", "out/._standalone", "out/result.txt"]) assert.ok(ownedPaths.includes(path), JSON.stringify(ownedPaths));
-		assert.ok(ownedPaths.every((path) => path.startsWith("out/")), JSON.stringify(ownedPaths));
+		assert.deepEqual(audit.owned.map((change) => change.path).filter((path) => path !== "out"), ["out/result.txt"], "sidecars under an owned path are not work");
 		exportOwnedAgentFsChanges("agentfs", db, f.base, audit);
-		assert.equal(readFileSync(join(f.base, "out", ".DS_Store"), "utf8"), "kept\n");
-		assert.equal(readFileSync(join(f.base, "out", "._standalone"), "utf8"), "fork\n");
+		assert.equal(existsSync(join(f.base, "out", ".DS_Store")), false);
+		assert.equal(existsSync(join(f.base, "out", "._standalone")), false);
 		assert.equal(readFileSync(join(f.base, "out", "result.txt"), "utf8"), "result\n");
 		assert.equal(existsSync(join(f.base, ".DS_Store")), false);
 		assert.equal(existsSync(join(f.base, "._owned.txt")), false);

@@ -6,7 +6,8 @@ implement `op_5a9bc175-7e61-4c59-bb6e-120b66d67da6`; evidence `agent-output/live
 **Affects:** repository-mode coding and operational candidates on macOS. Home runs already drop sidecars.
 **Not a PRD.** This file is a work order. Read it with `specification.md` §5.3–§5.4.
 
-**Status:** opened 2026-10-04, not implemented. The decision in §3 is open.
+**Status:** opened 2026-10-04. Decision the same day (operator): option 1, implemented the same day; every criterion
+is checked below.
 
 ## 1. Observation
 
@@ -47,10 +48,20 @@ intent; option 2 only if a real tracked `._*` file turns up.
 
 ## 4. Acceptance criteria (for option 1; revise if another option is chosen)
 
-- [ ] A repository-mode candidate whose overlay holds `._x` and `.DS_Store` under an owned path stages neither, and
-  its owned file is staged. Proof: a case with real AgentFS in the staging or audit tests, red before the change.
-- [ ] Home mode is unchanged. Proof: the existing home-workspace staging case keeps passing.
-- [ ] The comment at `lib/agentfs-sandbox.ts:267`, `specification.md` §5.4 and the README "Sandbox and staging"
-  describe the rule.
-- [ ] Gate: `node --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts` and `git diff --check`
-  green, with counts from the run made.
+- [x] A repository-mode candidate whose overlay holds `._x` and `.DS_Store` under an owned path stages neither, and
+  its owned file is staged. Proof: `test/agentfs-sandbox.test.ts` "platform metadata is discarded inside and outside
+  ownership, and only the owned work is exported" (real AgentFS; `out/.DS_Store` and `out/._standalone` ignored and
+  absent after export, `out/result.txt` exported). Red on `6f25e89`. The whole-base case
+  ("whole-base ownership is refused unless ownWholeBase is set") also went red there, and showed real AgentFS
+  writing `._other.txt` and `._owned.txt` beside the worker's two files; it now asserts exactly the two files.
+  The change is the order in `auditAgentFsChanges`: platform metadata is checked before ownership.
+- [x] Home mode is unchanged. Proof: `test/home-workspace.test.ts` passes unchanged. Staging's own sidecar check
+  became unreachable and was removed (`lib/runtime-staging.ts`), so the rule lives in the audit only.
+- [x] The comment at `lib/agentfs-sandbox.ts:267`, `specification.md` §5.4 and the README "Sandbox and staging"
+  describe the rule. Proof: the comment above the classification loop, spec §5.4 (audit and home staging
+  paragraphs), README "Sandbox and staging" and "Home runs".
+- [x] Gate: `node --experimental-strip-types --test extensions/pi-agent-wave/test/*.test.ts` and `git diff --check`
+  green, with counts from the run made. 2026-10-04 on `6f25e89` plus this change: 678 tests, 667 passed, 0 failed,
+  11 skipped; `git diff --check` clean; typecheck exit 0. Bun package checks not run: `bun` is not installed on
+  this host. A live rerun of the new-directory integration was not made; the real-AgentFS cases above exercise the
+  same audit.
