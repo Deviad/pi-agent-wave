@@ -9,6 +9,7 @@ import { analyzeCatalog, isLocalModel, loadCatalog } from "../lib/catalog.mjs";
 import { parseJsonc } from "../lib/jsonc.mjs";
 import { detectPiFzf, fzfCommandTargets, packageRoutePicker } from "../lib/pi-fzf.mjs";
 import { DELEGATE_GRAPH_ROLES, REQUIRED_TIERS } from "../lib/routing-template.mjs";
+import { loadHostServices, resolveHostServicesPath } from "../lib/host-services.mjs";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PACKAGE_ENTRY_POINTS = ["index.ts", "questionnaire.ts", "cmux-session.ts", "model-failover.ts", "claude-code-auth.ts"];
@@ -141,6 +142,18 @@ export function runDoctor(argv = process.argv.slice(2)) {
 	if (!existsSync(agentDir)) checks.push(check("agent-dir", "fail", `agent directory '${agentDir}' does not exist`));
 	else if (!statSync(agentDir).isDirectory()) checks.push(check("agent-dir", "fail", `agent path '${agentDir}' is not a directory`));
 	else checks.push(check("agent-dir", "ok", agentDir));
+
+	// Operator-registered host services; optional, so every problem is a warning
+	try {
+		const services = loadHostServices(resolveHostServicesPath(agentDir));
+		const here = services.filter((service) => service.start[process.platform]);
+		const missing = here.filter((service) => !existsSync(service.start[process.platform].executable)).map((service) => service.name);
+		if (!services.length) checks.push(check("host-services", "ok", "none registered"));
+		else if (missing.length) checks.push(check("host-services", "warn", `executable missing on this host for: ${missing.join(", ")}`));
+		else checks.push(check("host-services", "ok", `${services.length} registered, ${here.length} with a start entry for ${process.platform}`));
+	} catch (error) {
+		checks.push(check("host-services", "warn", error instanceof Error ? error.message : String(error)));
+	}
 
 	// Model catalog readability
 	let catalog = null;

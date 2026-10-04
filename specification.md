@@ -764,11 +764,17 @@ generates an agent name matching `[a-z][a-z0-9_-]{0,31}` (`dg_<run8>_<role9>_<he
    (`operational_instruction`, which resolves the command's `cwd` against the worker's working
    directory and refuses a mismatch), the runtime-answer contract text, the `VERDICT:` line
    requirement for `RUNTIME_VERDICT_NODES` (`review`, `test`, `audit`, `source_search`), a
-   no-terminal note when `--no-terminal`, and the read-only note when read-only.
+   no-terminal note when `--no-terminal`, the read-only note when read-only, and the host-services
+   paragraph when `--host-services-json` attaches any (§5.3).
 5. Writes `worker-config.json` (schema 1; `resultContract: runtime-v1`; `attemptKey`;
    `hostReadOnly`/`discardAllChanges` equal to `read_only`; `noTerminal`), mode 600.
 6. Writes `launch-acpx.sh` (700): `exec <agentfs> run --session <sessionName> --no-default-allows
-   --allow <run-dir> <node> --experimental-strip-types <acpx-worker.ts>`.
+   --allow <run-dir> <node> --experimental-strip-types <acpx-worker.ts>`, the same with or without host
+   services. With host services it also writes `launch-with-host-services.sh` (700): `exec <python>
+   host_service_launcher.py --spec <attempt>/host-services.json --state-root <attempt>/host-services --
+   <attempt>/launch-acpx.sh`, recorded as `service_launcher`. Only the first launch uses it
+   (`first_launcher`, both transports); `run_acpx_again`, which closes the session after settlement,
+   runs `launch-acpx.sh` and so starts no service a second time.
 7. Writes `cancel-config.json` and `cancel-acpx.sh` (700), the latter setting
    `PI_ACPX_CANCEL_CONFIG` and execing `scripts/acpx-cancel.ts`.
 8. Resolves `owned_paths` and `ignored_paths` (relative to `cwd`), the Git `base_revision`
@@ -811,6 +817,35 @@ whatever `TMPDIR` is set to; the run directory is host-writable by design (`--al
 writes elsewhere under `$HOME` are refused. Every host file is readable, including the graph database
 and `~/.pi/agent/auth.json`. `agentfs run` 0.6.4 has no option that denies `/tmp` or reads. Run directories made by a version before 2026-10-04 still live under `/tmp`, where any worker can
 write into them; current run directories are under the graph home (§5.1).
+
+What the sandbox denies that a worker may need (verified 2026-10-04, macOS 26.7.1, `agentfs v0.6.4`;
+`tasks/handoff-worker-browser-sandbox.md`): `IORegisterForSystemPower` returns 0 inside `agentfs run`,
+with or without `--no-default-allows`, and every Chromium-family browser then segfaults at startup in
+`IONotificationPortGetRunLoopSource`. No `agentfs run` option grants it; a worker that needs a browser
+gets one as a host service (below). A plain background process started by a worker's bash tool call
+survives into the next call; Pi's bash tool kills a call's process tree only on abort or timeout.
+
+**Host services** (`tasks/handoff-host-services.md`). A tool a worker needs but cannot run inside the
+sandbox runs on the host beside it. The operator registers it in `host-services.jsonc` (agent directory, or
+`PI_HOST_SERVICES`), parsed and validated only by `lib/host-services.mjs` (`loadHostServices`,
+`attachHostServices`); `op=dispatch` takes `hostServices: string[]`, refuses an unknown, repeated or
+unavailable name before `init` as a parameter error, and passes the entries resolved for `process.platform`
+to `start --host-services-json`. `prepare_acpx_attempt` then writes `<attempt>/host-services.json` and
+`launch-with-host-services.sh`, which runs `scripts/host_service_launcher.py` around the unchanged
+`launch-acpx.sh` for the first launch only (§5.2 step 6), records `host_services`, `host_services_root` and
+`service_launcher` on the resource, and appends `host_services_instruction`, which names each service, its description and its
+variables but no path or port. The wrapper runs on the host for both transports: for each service it
+expands `{port}` (a free loopback port) and `{stateDir}` (`<attempt>/host-services/<name>/`), starts it in
+its own process group with its log beside the directory, records `{name, pid, started, executable}` in
+`running.json` (`started` is `ps -o lstart=`), and waits until the port accepts a connection; a service
+that exits or times out stops every started service and exits 70 before the worker starts. The worker runs
+as a child with the expanded `env`; SIGTERM, SIGINT and SIGHUP are forwarded to it, and when it exits each
+group gets SIGTERM, then SIGKILL after 5 s. `delegate_core.stop_host_services` is the backstop for a wrapper
+killed outright: from `abort_acpx_attempt` and before a settled attempt's directory is removed, it stops each
+recorded group whose start time still matches, so a reused pid is never signalled, and reports one still
+running. A leaked service whose arguments name its `{stateDir}` also fails the absence audit's
+`ownedProcessesAbsent`, which matches any process naming the attempt directory. The wrapper's process
+handling is POSIX; a `win32` registry entry is accepted, but running it needs a Windows process path there.
 
 ### 5.4 Audit and staging
 
@@ -1103,7 +1138,7 @@ synchronous so a worker, socket or `herdr` process cannot block the terminal.
 ## 7. Configuration and environment variables
 
 The following environment variables are read. The `read by` column names the entry point and
-symbol; `PI_CODING_AGENT_DIR`, `PI_MODEL_ROUTING` and `PI_MODEL_CATALOG` are the documented
+symbol; `PI_CODING_AGENT_DIR`, `PI_MODEL_ROUTING`, `PI_MODEL_CATALOG` and `PI_HOST_SERVICES` are the documented
 configuration overrides and tests use temporary agent directories.
 
 | Variable | Read by | Meaning | Source |
@@ -1111,6 +1146,7 @@ configuration overrides and tests use temporary agent directories.
 | `PI_CODING_AGENT_DIR` | extension, scripts, provider | Pi agent directory; default `~/.pi/agent` | `route-picker.ts:resolveAgentDir`, `lib/agent-paths.mjs:resolveAgentDir`, `lib/claude-auth-config.ts:claudeAgentDir`, `model-failover.ts:agentDirectory`, `scripts/policy-resolver.mjs:AGENT_DIR` |
 | `PI_MODEL_ROUTING` | resolver, doctor, picker, failover | explicit `model-routing.jsonc` path | `route-picker.ts:resolveRoutingPath`, `lib/agent-paths.mjs:resolveRoutingPath`, `scripts/policy-resolver.mjs`, `model-failover.ts:routingPath` |
 | `PI_MODEL_CATALOG` | resolver, doctor, picker | explicit `models.json` path | `route-picker.ts:resolveCatalogPath`, `lib/agent-paths.mjs:resolveCatalogPath`, `scripts/policy-resolver.mjs` |
+| `PI_HOST_SERVICES` | extension, doctor | explicit `host-services.jsonc` path; default `<agent dir>/host-services.jsonc` | `lib/host-services.mjs:resolveHostServicesPath` |
 | `DELEGATE_GRAPH_DB` | store, settlement | graph DB path; default `~/.local/share/delegate-graph/delegate-graph.db` | `store.ts:DEFAULT_DB_PATH` (and `GraphStore` constructor), `scripts/runtime-settle.ts:settleRuntimeWorker` |
 | `PI_CLAUDE_OAUTH_TOKEN_FILE` | launcher, doctor, matrix | mode-600 raw Claude token | `scripts/delegate_core.py:preflight_agent_credentials`, `provider_runtime_environment` |
 | `CODEX_HOME` | launcher, doctor | Codex credential/config home | `scripts/delegate_core.py:preflight_agent_credentials`, `provider_runtime_environment` |
@@ -1241,7 +1277,9 @@ The test tree (top-level `test/*.test.ts`) covers, by area:
   `approval-block-routing.test.ts`, `owned-path-normalization.test.ts`, `agentfs-sandbox.test.ts`,
   `claude-code-auth.test.ts`, `acpx-permissions.test.ts`, `acpx-routing.test.ts`,
   `acpx-requirement.test.ts`, `agentfs-requirement.test.ts`, `herdr-requirement.test.ts`,
-  `headless-requirement.test.ts`.
+  `headless-requirement.test.ts`, `host-services.test.ts` (registry, dispatch refusal, launch
+  preparation, doctor), `host-service-launcher.test.ts` (the wrapper around real `agentfs run`, the
+  backstop, and a browser driven over CDP from inside the sandbox).
 - **Failure and recovery:** `retry.test.ts`, `acpx-failover.test.ts`, `model-failover.test.ts`,
   `acpx-event-mapping.test.ts`, `acpx-events.test.ts`.
 - **Views:** `live-view.test.ts`, `runtime-watch.test.ts` (TUI agent-list and follow view,
