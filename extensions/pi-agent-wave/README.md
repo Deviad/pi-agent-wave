@@ -153,7 +153,7 @@ node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs
 node ./pi-agent-wave-new-design/extensions/pi-agent-wave/scripts/doctor.mjs --json
 ```
 
-It checks agent-directory resolution, catalog readability, routing JSONC, the six required tiers and roles, non-empty chains, catalog membership, local-model loopback validity, pi-fzf targets, package entry points, and real `policy-resolver` and `route-picker` execution. Its `route-credentials` section names the executing agent for every routed model and whether that agent's credential store is structurally usable. It exits nonzero only on a required failure; absent pi-fzf is a warning. Output redacts credential-bearing fields.
+It checks agent-directory resolution, catalog readability, routing JSONC, the six required tiers and roles, non-empty chains, catalog membership, local-model loopback validity, pi-fzf targets, package entry points, and real `policy-resolver` and `route-picker` execution. Its `route-credentials` section names the executing agent for every routed model and whether that agent's credential store is structurally usable. It also validates the host-services registry (`host-services`) and checks that each registered executable for this platform exists. It exits nonzero only on a required failure; absent pi-fzf and every host-services problem are warnings. Output redacts credential-bearing fields.
 
 ### Migration from a loose install
 
@@ -174,6 +174,7 @@ Apply moves conflicting loose extensions to `migration-backups/pi-agent-wave/`, 
 | --- | --- | --- |
 | `PI_CODING_AGENT_DIR` | extension, scripts | Pi agent directory; default `~/.pi/agent` |
 | `PI_MODEL_ROUTING`, `PI_MODEL_CATALOG` | resolver, doctor, picker | Explicit `model-routing.jsonc` and `models.json` paths |
+| `PI_HOST_SERVICES` | extension, doctor | Explicit `host-services.jsonc` path; default `<agent dir>/host-services.jsonc` (see **Host services**) |
 | `DELEGATE_GRAPH_DB` | extension, settlement | Graph database path; default `~/.local/share/delegate-graph/delegate-graph.db`. Tests and the measurement driver point it at a temporary file |
 | `PI_CLAUDE_OAUTH_TOKEN_FILE` | launcher, doctor, matrix | Mode-600 raw Claude token for `claude-code/*` workers |
 | `CODEX_HOME` | launcher, doctor | Codex credential and configuration home; default `~/.codex` |
@@ -308,7 +309,7 @@ Exact-model locks cannot be unlocked; they remain authoritative.
 | `next` | `runId`. Current-phase operations with their frozen route, `modelPolicy`, `policyDigest`, attempt counters, `retry_not_before`, and the active attempt. A `running` operation whose worker is provably gone is reported as `status: "orphaned"` with `storedStatus: "running"`, an `orphanReason` (`attempt-directory-missing` or `worker-process-gone`) and a `recovery` hint; see **Orphaned workers**. |
 | `status` | `runId`, optional `operationId`. Read-only rendered status whose size follows the run's progress, not its tasks: every task, in the worker rows and in `current operations`, is shown as `task sha256=<hex> bytes=<n> "<first 120 characters>"`, the digest taken over the stored UTF-8 text. A failed or blocked operation carries its error as `blocker=`. With `operationId`, that one operation's full task follows the table under `task <operationId> sha256=<hex>:`. |
 | `watch` | `runId`. Read-only view of every running worker: agent, node, process and acceptance state, the pane its live output is read from, its last rendered line, and the most recent lines. A worker that finished its turn and has not been collected reads `process exited[ <code>], awaiting collect` rather than `running`, read from the worker's own result file; the stored attempt is untouched until `collect`. Emits a `watch` progress event, so ACP clients such as Air show the same summary. Consulted by no gate. |
-| `dispatch` | `runId`, `operationId`, optional `transport`. Preflights, materializes the run evidence for the worker, launches one worker, and registers the agent and the attempt under its frozen identity. |
+| `dispatch` | `runId`, `operationId`, optional `transport` and `hostServices` (see **Host services**). Preflights, materializes the run evidence for the worker, launches one worker, and registers the agent and the attempt under its frozen identity. |
 | `collect` | `runId`, `operationId`. Waits for the worker's own result file and settles the attempt from durable evidence: process outcome, retained candidate, observed session. Collecting again returns the same settlement. The result also carries what the supervisor needs to decide: `answer` (the retained answer, first 16 KiB, with `answerBytes` and `answerTruncated`), `verdict` (the answer's final `VERDICT:` line, or null), a `decide` template with this operation's id and the fields its node takes (`verdict` for review, test, audit and source_search, read from the answer; `verdict: DONE` for thinker_synthesize on the operations graph, supplied by the supervisor; `payload.slices` for thinker_plan and thinker_split), and a `note` naming the next step, read from the candidate's own staging manifest (`op=integrate` first when it records file changes, decide directly when it records none, reject-then-retry for an empty candidate, `op=retry` when no candidate was retained). |
 | `integrate` | `runId`, `operationId`, optional `decision: "rejected"` to roll back, optional `overrideRunningSiblings: true` with a `reason`. Applies a coding or operational candidate's audited changes through the journal. On a home run, `decision: "rejected"` also undoes a placement that was already applied, even after the run moved on or ended. Refused while a sibling operation of the same node, round and fix iteration still has a live worker, naming those operations; the override records the stated reason on the integration row. |
 | `decide` | `runId`, `operationId`, `decision` (`accepted` or `rejected`), `reason`, optional `verdict` and `payload`. The only way an operation completes. `retry`, `defer`, `abort` and `escalate` are refused here with a message naming `resolve`, which applies only to a parked run. A thinker on the build or research graph is accepted only with `payload.slices` (`id`, `name`, `task`, and `ownedPaths` on the build graph). |
@@ -482,6 +483,35 @@ A run initialized with `workspaceRoot` set to `$HOME` or a directory under it (`
 
 Limits: symlinked or hard-linked targets (for example stow-managed dotfiles) and files over 16 MiB are refused by the journal, and two slices running in parallel that edit the same file conflict at integration rather than merging.
 
+### Host services
+
+Some tools a worker needs cannot run inside its sandbox: on macOS no browser starts there (see **Known limitations**). The operator registers such a tool once in `~/.pi/agent/host-services.jsonc` (or the file named by `PI_HOST_SERVICES`), and the supervisor attaches it to one dispatch with `hostServices: ["browser"]`. The service then runs on the host, outside the sandbox, for that attempt only:
+
+```jsonc
+{
+  "services": {
+    "browser": {
+      "description": "Throwaway headless Chromium; connect over CDP at $BROWSER_CDP_URL",
+      "start": {
+        "darwin": {
+          "executable": "/opt/chromium/chrome-mac/headless_shell",
+          "args": ["--remote-debugging-address=127.0.0.1", "--remote-debugging-port={port}", "--user-data-dir={stateDir}", "--no-first-run", "about:blank"]
+        }
+      },
+      "env": { "BROWSER_CDP_URL": "http://127.0.0.1:{port}" },
+      "readyTimeoutSeconds": 30
+    }
+  }
+}
+```
+
+- `start` is keyed by platform (`darwin`, `linux`, `win32`) and takes an absolute executable. The launcher expands `{port}` to a free loopback port and `{stateDir}` to a fresh private directory; no other placeholder is accepted.
+- The worker gets each `env` entry as an environment variable and one line in its instructions naming the service, its description and those variables, never a path or port. Variable names are upper case and must not start with `PI_` or be `HOME`, `PATH` or `TMPDIR`.
+- The worker's first launch starts each service in its own process group, waits until its port accepts connections (`readyTimeoutSeconds`, default 30), and only then starts the worker. A service that exits or never listens ends the attempt before the worker starts, with `host service <name> did not become ready` and the last line of its log. When the worker exits or is cancelled, every service is stopped; if the launcher itself was killed, settlement and cleanup stop what it left. The session close that follows settlement runs without the services.
+- An unknown name, a repeated name, an invalid registry or a service with no entry for this platform makes `dispatch` fail as a parameter error: nothing is launched or recorded. `doctor` reports the registry as `host-services`.
+
+Register only tools whose writes are disposable, such as a browser, a database or an emulator. Anything a service writes bypasses the sandbox and the ownership audit, so a tool that produces the files a worker hands in (a build tool, a code generator, a formatter) must stay inside the sandbox. Only the supervisor attaches a service; nothing a worker says starts a host process. A loopback port has no authentication: any local process can reach the service while it runs.
+
 ### Settlement and cleanup
 
 The answer and the audited overlay changes are retained as content-addressed private files and the settlement record is published before the worker session closes, the provider boundary is verified, or anything is cleaned up; a failure after that point is reported as a post-settlement failure and never discards the candidate. When capture is incomplete or produced no candidate, the raw worker stream is retained beside the record as private evidence.
@@ -604,6 +634,7 @@ Only an explicit `--execute` spends credits. It needs a private `PI_CLAUDE_OAUTH
 - **Quality is not measured.** The measurement driver accepts candidates automatically; review, test and audit verdicts come from the workers, and independent review of a candidate remains the caller's decision.
 - **Capture.** One Pi synthesis turn in the operations smokes exited with an incomplete capture and no answer; the retry replaced it and the raw stream is now retained whenever that happens, but the cause is not yet known.
 - **Dispatch identity is reserved at registration, not before launch.** A crash between the launcher's start and the attempt's registration leaves a launched worker with no attempt row; it is settled through `cancel`. Reserving the identity before launch is recorded as open.
+- **No browser inside a worker on macOS.** With `agentfs v0.6.4` on macOS, the sandbox denies `IORegisterForSystemPower`, and Chromium, Chrome and Playwright's headless shell crash at startup. Attach a browser as a host service (see **Host services**), or run browser tests in the supervisor session after integration.
 - **Live proofs need a capable host**: AgentFS loopback binding and mounting, process inspection, provider credentials, and explicit authorization to spend credits.
 
 ## Security

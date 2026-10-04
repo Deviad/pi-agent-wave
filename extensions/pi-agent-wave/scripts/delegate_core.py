@@ -12,6 +12,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -32,6 +33,7 @@ RESOLVER = SCRIPT_DIR / "resolve-model.mjs"
 ACPX_WORKER = SCRIPT_DIR / "acpx-worker.ts"
 RUNTIME_SETTLE = SCRIPT_DIR / "runtime-settle.ts"
 HEADLESS_SUPERVISOR = SCRIPT_DIR / "headless_supervisor.py"
+HOST_SERVICE_LAUNCHER = SCRIPT_DIR / "host_service_launcher.py"
 ACPX_CANCEL = SCRIPT_DIR / "acpx-cancel.ts"
 ACPX_PLAN = SCRIPT_DIR / "acpx-plan.ts"
 NODE = shutil.which("node") or "node"
@@ -465,6 +467,91 @@ HOME_WORKSPACE_INSTRUCTION = (
 )
 
 
+def parsed_host_services(raw: str | None) -> list[dict[str, Any]]:
+    """Services `op=dispatch` resolved from the operator's registry (lib/host-services.mjs:attachHostServices)."""
+    if not raw:
+        return []
+    try:
+        services = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise DelegateError(f"--host-services-json is not JSON: {error}") from error
+    if not isinstance(services, list):
+        raise DelegateError("--host-services-json must be a JSON array")
+    for service in services:
+        if not (
+            isinstance(service, dict)
+            and isinstance(service.get("name"), str)
+            and isinstance(service.get("description"), str)
+            and isinstance(service.get("executable"), str)
+            and Path(service["executable"]).is_absolute()
+            and isinstance(service.get("args"), list)
+            and all(isinstance(arg, str) for arg in service["args"])
+            and isinstance(service.get("env"), dict)
+            and all(isinstance(key, str) and isinstance(value, str) for key, value in service["env"].items())
+            and isinstance(service.get("readyTimeoutSeconds"), int)
+        ):
+            raise DelegateError(f"--host-services-json holds an invalid service: {service!r}")
+    return services
+
+
+def host_services_instruction(services: list[dict[str, Any]]) -> str:
+    """Names each attached service and the variables holding its endpoint; never a path or a port."""
+    if not services:
+        return ""
+    lines = [
+        "Host services: the following run on the host, outside your sandbox, for this attempt only, and are stopped when you finish. "
+        "Anything they write is not part of your result. Reach them through the environment variables named here:"
+    ]
+    for service in services:
+        variables = ", ".join(f"${name}" for name in sorted(service["env"])) or "none"
+        lines.append(f"- {service['name']}: {service['description']} (endpoint variables: {variables})")
+    return "\n".join(lines) + "\n"
+
+
+def stop_host_services(resource: dict[str, Any]) -> list[str]:
+    """Stop the services a launcher killed outright left behind; returns one failure per service still running.
+
+    host_service_launcher.py stops its services itself on every exit it lives through. This reads the
+    `running.json` it keeps and stops each recorded process group whose start time still matches the
+    recorded one, so a reused pid is never signalled. The executable is not compared: a program may
+    re-exec itself under another path.
+    """
+    root = str(resource.get("host_services_root") or "")
+    if not root:
+        return []
+    record = Path(root) / "running.json"
+    try:
+        entries = json.loads(record.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as error:
+        return [f"host service record unreadable: {error}"]
+    failures: list[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        name, pid, started = str(entry.get("name")), int(entry.get("pid", 0)), str(entry.get("started", "")).strip()
+        if pid <= 0 or not started:
+            continue
+        if run(["ps", "-o", "lstart=", "-p", str(pid)], check=False).stdout.strip() != started:
+            continue
+        whole_group = run(["ps", "-o", "pgid=", "-p", str(pid)], check=False).stdout.strip() == str(pid)
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                if whole_group:
+                    os.killpg(pid, signum)
+                else:
+                    os.kill(pid, signum)
+            # EPERM: a group of zombies on macOS, as in host_service_launcher.GROUP_GONE.
+            except (ProcessLookupError, PermissionError):
+                break
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and run(["ps", "-o", "pid=", "-p", str(pid)], check=False).stdout.strip():
+                time.sleep(0.1)
+        if run(["ps", "-o", "pid=", "-p", str(pid)], check=False).stdout.strip():
+            failures.append(f"host service {name} (pid {pid}) is still running")
+    record.unlink(missing_ok=True)
+    return failures
+
+
 # Mirrored by DEFAULT_IGNORED_PATHS in lib/agentfs-sandbox.ts. The Git index is ignored by default since
 # 2026-09-12: a worker that inspects its work with `git status`/`git diff` refreshes the index inside the
 # overlay, and the live build measurement refused every such attempt as an unowned change. Ignoring it grants
@@ -820,6 +907,8 @@ def prepare_acpx_attempt(
     workspace_mode = getattr(args, "workspace_mode", None) or "repository"
     if workspace_mode == "home":
         prompt += HOME_WORKSPACE_INSTRUCTION
+    host_services = parsed_host_services(getattr(args, "host_services_json", None))
+    prompt += host_services_instruction(host_services)
     write_private(prompt_file, prompt)
     config_path = attempt_dir / "worker-config.json"
     result_path = attempt_dir / "worker-result.json"
@@ -859,6 +948,20 @@ def prepare_acpx_attempt(
     ]) + "\n"
     write_private(launcher, launcher_text)
     launcher.chmod(0o700)
+    # Only the worker's first launch runs beside its services. Every later run of the same session (the
+    # close after settlement, a repeat) uses launch-acpx.sh itself, so no service is started twice.
+    host_services_root = attempt_dir / "host-services"
+    service_launcher: Path | None = None
+    if host_services:
+        host_services_spec = attempt_dir / "host-services.json"
+        write_private(host_services_spec, json.dumps(host_services, indent=2, sort_keys=True) + "\n")
+        service_launcher = attempt_dir / "launch-with-host-services.sh"
+        write_private(service_launcher, "#!/bin/sh\nexec " + " ".join([
+            shlex.quote(sys.executable), shlex.quote(str(HOST_SERVICE_LAUNCHER)),
+            "--spec", shlex.quote(str(host_services_spec)), "--state-root", shlex.quote(str(host_services_root)), "--",
+            shlex.quote(str(launcher)),
+        ]) + "\n")
+        service_launcher.chmod(0o700)
     cancel_config = attempt_dir / "cancel-config.json"
     write_private(cancel_config, json.dumps({ "schemaVersion": 1, "acpxExecutable": acpx_executable, "agent": agent, "sessionName": session_name, "recordId": session_name, "attemptKey": plan["attemptKey"], "cwd": str(agentfs_home / ".agentfs" / "run" / session_name / "mnt"), "acpxHome": str(acpx_home), "timeoutSeconds": 30 }, indent=2, sort_keys=True) + "\n")
     cancel_launcher = attempt_dir / "cancel-acpx.sh"
@@ -910,8 +1013,16 @@ def prepare_acpx_attempt(
         "workspace_relative": workspace_relative,
         "provider_links": provider_links,
         "transient_attempt": transient_attempt,
+        "host_services": [str(service["name"]) for service in host_services],
+        "host_services_root": str(host_services_root) if host_services else None,
+        "service_launcher": str(service_launcher) if service_launcher else None,
     }
     return resource, environment
+
+
+def first_launcher(resource: dict[str, Any]) -> str:
+    """The script the worker's first launch runs: beside its host services when any are attached."""
+    return str(resource.get("service_launcher") or resource["worker_launcher"])
 
 
 def launch_headless_worker(resource: dict[str, Any], environment: dict[str, str]) -> int:
@@ -921,7 +1032,7 @@ def launch_headless_worker(resource: dict[str, Any], environment: dict[str, str]
     probe_stream_endpoint()
     process = subprocess.Popen([
         sys.executable, str(HEADLESS_SUPERVISOR),
-        "--launcher", str(resource["worker_launcher"]),
+        "--launcher", first_launcher(resource),
         "--cwd", str(resource["sandbox_base"]),
         "--stdout", str(resource["headless_stdout"]),
         "--stderr", str(resource["headless_stderr"]),
@@ -1041,7 +1152,7 @@ def command_start(args: argparse.Namespace) -> None:
                 "--seq", "1", "--agent-session-id", resource["acpx_session"],
                 "--agent-session-path", resource["worker_config"],
             ])
-            run(["herdr", "pane", "run", str(pane_id), resource["worker_launcher"]])
+            run(["herdr", "pane", "run", str(pane_id), first_launcher(resource)])
         else:
             worker_pid = launch_headless_worker(resource, environment)
             resource["worker_pid"] = worker_pid
@@ -1770,6 +1881,7 @@ def without_target_paths(text: str) -> str:
 def abort_acpx_attempt(resource: dict[str, Any], cancel_attempt: Any = run_structured_cancel, provider_verifier: Any = verify_provider_links, command_runner: Any = run, tab_closer: Any = close_created_tab, remove_tree: Any = None) -> list[str]:
     failures: list[str] = []
     write_failure_diagnostics(resource, "attempt aborted before cleanup")
+    failures.extend(stop_host_services(resource))
     launcher = Path(str(resource.get("acpx_cancel_script", "")))
     # A teardown only has something to cancel while the attempt launcher still exists; a repeat
     # cleanup after a completed teardown must converge instead of reporting an absent launcher.
@@ -2068,6 +2180,7 @@ def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str,
         post_settlement_failures.append(without_target_paths(str(error)))
     cleanup_failures = abort_acpx_attempt(resource) if post_settlement_failures else []
     if not post_settlement_failures:
+        cleanup_failures.extend(stop_host_services(resource))
         shutil.rmtree(Path(str(resource["attempt_dir"])), ignore_errors=True)
         shutil.rmtree(Path(str(resource["acpx_home"])), ignore_errors=True)
     # A settled Herdr worker keeps its tab until something closes it, and the absence audit below refuses
@@ -2159,6 +2272,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--session", help="true or false")
     start_parser.add_argument("--node", help="exact Delegate Graph node")
     start_parser.add_argument("--command-json", help="structured operational command with executable, args, and cwd")
+    start_parser.add_argument("--host-services-json", help="JSON array of host services resolved for this platform by op=dispatch")
     start_parser.add_argument("--run-id", help="Delegate Graph run ID")
     start_parser.add_argument("--operation-id", help="Delegate Graph operation ID")
     start_parser.add_argument("--owned-paths-json", help="JSON array of graph-owned paths")

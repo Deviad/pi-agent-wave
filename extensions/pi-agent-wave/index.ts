@@ -24,6 +24,8 @@ import { parseWorkerTransportKind } from "./lib/worker-transport.ts";
 import { DEFAULT_IGNORED_PATHS, ownedRelativePaths, realpathExistingPrefix } from "./lib/agentfs-sandbox.ts";
 import { ORPHAN_RECOVERY, runLiveness } from "./lib/liveness.ts";
 import { selectTransport } from "./scripts/delegate.ts";
+import { resolveAgentDir } from "./lib/agent-paths.mjs";
+import { attachHostServices, loadHostServices, resolveHostServicesPath, type AttachedHostService } from "./lib/host-services.mjs";
 import type { AgentRow, VisibleTransport } from "./store.ts";
 import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, ResolvedPolicy } from "./types.ts";
 
@@ -200,6 +202,8 @@ const GraphParams = Type.Object({
 		checkpoint: Type.Optional(Type.String({ minLength: 1 })),
 	}, { additionalProperties: false }), { minItems: 1 })),
 	modelPolicy: Type.Optional(ModelPolicySchema),
+	/** op=dispatch: names from the operator's host-services.jsonc to run on the host beside this worker. */
+	hostServices: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
 	/** Home mode: `$HOME` or a directory under it (`~` allowed); every operation runs there and its changes are placed without Git and undoable. */
 	workspaceRoot: Type.Optional(Type.String({ minLength: 1 })),
 	policyDigest: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
@@ -966,6 +970,10 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					if (!operation.route) throw new Error(`operation ${operationId} has no frozen route`);
 					const selectedModel = operation.route.chain[operation.model_attempt] ?? operation.route.chain[0];
 					if (!selectedModel) throw new Error(`operation ${operationId} has no selected model`);
+					// A parameter error, refused before anything is created: no run directory, record or retry.
+					const hostServices: AttachedHostService[] = params.hostServices
+						? attachHostServices(loadHostServices(resolveHostServicesPath(resolveAgentDir())), params.hostServices)
+						: [];
 					const workerTransport = params.transport ? parseWorkerTransportKind(params.transport) : ctx.mode === "tui" ? selectTransport(process.env, "auto") : "headless";
 					// A home run works in its recorded root whatever directory the session was started in.
 					const homeRoot = graphStore.getRun(runId).workspace_root;
@@ -1021,6 +1029,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const role = roleForNode(operation.node);
 					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", homeRoot && operation.read_only !== 1 ? JSON.stringify(["."]) : operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--workspace-mode", homeRoot ? "home" : "repository", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
 					if (operation.command_json) startArgs.push("--command-json", operation.command_json);
+					if (hostServices.length) startArgs.push("--host-services-json", JSON.stringify(hostServices));
 					const started = await execute(process.execPath, startArgs);
 					if (started.exitCode !== 0) {
 						const startOutput = `${started.stderr ?? ""}${started.stdout ?? ""}`;
@@ -1078,7 +1087,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						} catch (error) {
 							ctx.ui.notify(`agent list unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
 						}
-						return textResult({ state: graphStore.getState(runId), operation: graphStore.getOperation(operationId), attempt, agentId, agentName, transport: workerTransport, launch });
+						return textResult({ state: graphStore.getState(runId), operation: graphStore.getOperation(operationId), attempt, agentId, agentName, transport: workerTransport, launch, hostServices: hostServices.map((service) => service.name) });
 					}
 				}
 				if (params.op === "collect") {
