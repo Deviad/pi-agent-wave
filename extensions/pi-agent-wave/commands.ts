@@ -62,6 +62,7 @@ export function renderStatus(store: GraphStore, runId: string, options: { taskOf
 			if (attempt) lines.push(`${operation.id} | process=${attempt.processState} | acceptance=${attempt.acceptance} | cleanup=${attempt.cleanup} | candidate=${attempt.candidateId ?? "-"} | capture=${attempt.observation?.captureStatus ?? "-"} | session=${attempt.observation?.sessionOrigin ?? "-"} | decision=${attempt.decision ? `${attempt.decision.decision}: ${attempt.decision.reason}` : "-"}`);
 		}
 	}
+	for (const input of store.runInputs(runId)) lines.push(`input ${input.name} | sha256=${input.sha256} | bytes=${input.bytes} | source=${input.sourcePath}`);
 	if (agents.length === 0) lines.push("(no agents registered)");
 	for (const agent of agents) {
 		const route = store.routeForNode(runId, agent.node);

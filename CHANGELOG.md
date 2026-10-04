@@ -6,6 +6,16 @@ All notable changes to `@dpugliese/pi-agent-wave` are recorded here. The format 
 
 ## [Unreleased]
 
+### Added
+
+- **Prepared worker resources.** Named `inputs` at init retain bounded file snapshots for every operation and
+  retry, with operator-only source provenance and private worker copies. Shared addressing lint makes
+  `/delegate` hand missing resource preparation to the supervisor without launching a worker or reopening
+  the policy picker; direct init returns structured diagnostics. New repository runs preserve their init
+  workspace (`dispatchWorkspaceRoot`) when resumed elsewhere. Schema v14 is additive. Input bytes survive
+  cancellation and prune; read-only copy permissions are not a security boundary.
+  (`tasks/handoff-worker-host-inputs.md`, `test/run-inputs.test.ts`, `test/task-host-paths.test.ts`)
+
 ### Fixed
 
 - **A torn-down Herdr attempt no longer wedges a run.** When a `wait` outlived its supervisor (interrupted `op=collect`) and hit `PI_DELEGATE_WAIT_TIMEOUT_MS`, the launcher tore the attempt down (`abort_acpx_attempt`: failure bundle, tab closed, attempt directory and cancel script removed) while the store still said `running`; afterwards `op=collect` re-waited an hour, `op=retry` refused ("still running"), and `op=cancel` failed on the missing launcher. Three changes, each pinned by a test whose removal of the fix was verified to fail it: a Herdr wait fails within seconds when the attempt directory disappears or `herdr agent get` answers `agent_not_found` (`wait_for_settled_agent`, `test/herdr-worker-liveness.test.ts`); `op=collect` settles `failed` from a retained `failure-<operationId>.json` whose attempt directory is gone instead of waiting (`retainedTeardown` in `index.ts`, `test/acpx-collect-convergence.test.ts`); `cancelRegisteredAttempt` treats an absent launcher as an already converged teardown, the rule `abort_acpx_attempt` already stated (`herdr.ts`, `test/acpx-focus-cancellation.test.ts`). Observed on `run_315dce09` 2026-09-20. (`tasks/prd-orphaned-wait-convergence.md`)

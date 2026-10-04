@@ -52,7 +52,7 @@ async function toolIn(dir: string, invocations: { command: string; args: string[
 
 /** Initializes a build run and accepts a one-slice plan, leaving one pending `implement` operation. */
 async function implementOperation(tool: Record<string, any>, root: string): Promise<{ runId: string; operationId: string }> {
-	const init = parsed(await tool.execute("init", { op: "init", story: "git-precondition", graph: "build", task: "Plan the change" }, undefined, () => {}, {} as ExtensionContext));
+	const init = parsed(await tool.execute("init", { op: "init", story: "git-precondition", graph: "build", task: "Plan the change" }, undefined, () => {}, { cwd: root } as ExtensionContext));
 	assert.equal(init.error, undefined, JSON.stringify(init));
 	const runId: string = init.state.runId;
 	const store = new GraphStore({ dbPath: process.env.DELEGATE_GRAPH_DB });

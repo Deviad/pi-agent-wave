@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AcpxAttemptIdentity } from "./acpx-types.ts";
 import type { RuntimeSessionOrigin } from "./runtime-capture.ts";
-import type { OperationRow, RunState } from "../types.ts";
+import type { OperationRow, RunState, RunInput } from "../types.ts";
 
 /** The only result contract. `legacy-v1` (worker-authored JSON reports) was removed on 2026-09-12. */
 export type ResultContract = "runtime-v1";
@@ -118,8 +118,13 @@ export interface RuntimeLedger {
 	readonly round: number;
 	readonly fixIteration: number;
 	readonly policyDigest: string;
+	readonly inputs: readonly { readonly name: string; readonly sha256: string; readonly bytes: number }[];
 	readonly operations: readonly RuntimeLedgerOperation[];
 	readonly events: readonly { readonly id: number; readonly ts: string; readonly type: string; readonly node: string | null; readonly operationId: string | null; readonly agentId: string | null; readonly verdict: string | null; readonly payload: unknown }[];
+}
+
+export interface OperatorRuntimeLedger extends RuntimeLedger {
+	readonly inputs: readonly RunInput[];
 }
 
 export interface RuntimeLedgerOperation {

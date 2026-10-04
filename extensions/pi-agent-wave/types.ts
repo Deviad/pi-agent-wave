@@ -126,6 +126,25 @@ export interface TransitionDecision {
 	reason: string;
 }
 
+/** Host file requested for one run; workers receive a retained copy, never this source path. */
+export interface RunInputDeclaration {
+	readonly name: string;
+	readonly path: string;
+}
+
+export interface RunInput {
+	readonly name: string;
+	readonly sourcePath: string;
+	readonly sha256: string;
+	readonly bytes: number;
+}
+
+export interface RunInitializationOptions {
+	readonly workspaceRoot?: string;
+	readonly dispatchWorkspaceRoot?: string;
+	readonly inputs?: readonly RunInput[];
+}
+
 export interface RunRow {
 	id: string;
 	story: string;
@@ -138,6 +157,9 @@ export interface RunRow {
 	updated_at: string;
 	/** A home run's working directory (`$HOME` or under it); null for every repository run. */
 	workspace_root: string | null;
+	/** Canonical initialization cwd; null preserves the legacy session-cwd fallback. */
+	dispatch_workspace_root: string | null;
+	inputs_json: string;
 }
 
 export interface StateRow {

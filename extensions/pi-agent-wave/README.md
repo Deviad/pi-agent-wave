@@ -305,7 +305,7 @@ Exact-model locks cannot be unlocked; they remain authoritative.
 
 | Operation | Input and behavior |
 | --- | --- |
-| `init` | `story`, `task`; optional `graph` (`build`, `research`, `operations`), `modelPolicy`, `commands` for operations runs, and `workspaceRoot` for a home run (see **Home runs**). Returns the run and its first pending operations. |
+| `init` | `story`, `task`; optional `graph` (`build`, `research`, `operations`), `modelPolicy`, `commands` for operations runs, named `inputs`, `dispatchWorkspaceRoot` to pin the repository workspace, and `workspaceRoot` for a home run (see **Home runs**). Validates and snapshots inputs before creating the run; returns its state, first pending operations and supervision instructions. Unprepared task references return an error with `pathIssues`, without creating a run. |
 | `next` | `runId`. Current-phase operations with their frozen route, `modelPolicy`, `policyDigest`, attempt counters, `retry_not_before`, and the active attempt. A `running` operation whose worker is provably gone is reported as `status: "orphaned"` with `storedStatus: "running"`, an `orphanReason` (`attempt-directory-missing` or `worker-process-gone`) and a `recovery` hint; see **Orphaned workers**. |
 | `status` | `runId`, optional `operationId`. Read-only rendered status whose size follows the run's progress, not its tasks: every task, in the worker rows and in `current operations`, is shown as `task sha256=<hex> bytes=<n> "<first 120 characters>"`, the digest taken over the stored UTF-8 text. A failed or blocked operation carries its error as `blocker=`. With `operationId`, that one operation's full task follows the table under `task <operationId> sha256=<hex>:`. |
 | `watch` | `runId`. Read-only view of every running worker: agent, node, process and acceptance state, the pane its live output is read from, its last rendered line, and the most recent lines. A worker that finished its turn and has not been collected reads `process exited[ <code>], awaiting collect` rather than `running`, read from the worker's own result file; the stored attempt is untouched until `collect`. Emits a `watch` progress event, so ACP clients such as Air show the same summary. Consulted by no gate. |
@@ -324,7 +324,7 @@ Direct initialization accepts every tagged model-policy form: `auto`, a named pr
 
 `collect` always converges. When the launcher cannot produce a settlement record, the attempt settles `failed` with the launcher's reason and names the retained `failure-<operationId>.json` diagnostic bundle (mode 600, redacted, written before the attempt directory is removed); the operation keeps that failed attempt until `retry` classifies it. `cancel` refuses while a worker's ACPX state is `alive` and its cancel command fails, and records `cancelled` when the state is already `no-session`.
 
-An operation whose worker was never registered has nothing to collect: `collect` refuses it without writing anywhere, and `cancel` settles it as cancelled with an `unlaunched-<operationId>.json` diagnostic under `failures/<runId>/` beside the graph database naming the cause. The name distinguishes it from a worker's `failure-<operationId>.json` bundle, which carries the same operation id under `evidence/<runId>/`. A dispatch whose preflight fails classifies the launch failure through `retry`, fenced to the exact counters that were dispatched. An `implement` dispatch from a working directory with no Git `HEAD` is refused before anything is launched (`dispatched: false`, `blocked: "precondition"`), because coding settlement diffs against that revision: the operation becomes `failed` with a `[dispatch_precondition]` error naming the resolved base directory, the run parks in `awaiting_user`, `op=status` shows the error as the operation's `blocker=`, and the operator starts Pi in the repository being edited and resolves with `retry`, or aborts. A dispatch whose declared owned paths resolve outside that working directory, or cover the whole of it, is refused the same way and for the same reason: a worker writes only inside the copy-on-write overlay rooted there, so the slice could never settle. The message names the base directory, every offending path, and the remedy — declare owned paths under the base, or dispatch from the directory that contains them. A wrong `runId` is a refusal, not a write.
+An operation whose worker was never registered has nothing to collect: `collect` refuses it without writing anywhere, and `cancel` settles it as cancelled with an `unlaunched-<operationId>.json` diagnostic under `failures/<runId>/` beside the graph database naming the cause. The name distinguishes it from a worker's `failure-<operationId>.json` bundle, which carries the same operation id under `evidence/<runId>/`. A dispatch whose preflight fails classifies the launch failure through `retry`, fenced to the exact counters that were dispatched. An `implement` dispatch from a working directory with no Git `HEAD` is refused before anything is launched (`dispatched: false`, `blocked: "precondition"`), because coding settlement diffs against that revision: the operation becomes `failed` with a `[dispatch_precondition]` error naming the resolved base directory, the run parks in `awaiting_user`, `op=status` shows the error as the operation's `blocker=`, and the operator initializes a replacement run in the repository being edited when the workspace is pinned. Older runs without a recorded workspace can resume from a corrected session directory. A dispatch whose declared owned paths resolve outside that working directory, or cover the whole of it, is refused the same way and for the same reason: a worker writes only inside the copy-on-write overlay rooted there, so the slice could never settle. The message names the base directory, every offending path, and the remedy — declare owned paths under the base, or initialize a replacement run in the directory that contains them when its workspace is pinned (older unpinned runs can change dispatch directories). A wrong `runId` is a refusal, not a write.
 
 A parked run resumes through `resolve`: `retry` supersedes the parked attempt and returns the operation to `pending` with a fresh identity; `defer`, `abort` and `escalate` are graph transitions. An escalated run can also be resumed by the operator. Foreign, stale, cancelled, terminal, and completed semantic-cap operations cannot be reopened.
 
@@ -474,9 +474,58 @@ An audit refusal (an unowned overlay change) is a permanent failure of the attem
 
 Staging reads a consistent SQLite backup of the closed delta with a 30-second budget; a failed backup fails the attempt and removes partial snapshots, with no raw DB/WAL/SHM fallback. Headless settlement waits for the worker process to exit after its result appears, bounded by `PI_DELEGATE_WORKER_EXIT_TIMEOUT_MS` (default `30000`); a timeout fails the attempt. A Herdr wait fails as soon as the attempt directory is removed, Herdr no longer knows the agent, or, after a 60-second launch grace, no process carries the attempt's AgentFS session any more (`PI_DELEGATE_HERDR_LIVENESS_INTERVAL_S`), so a worker torn down out of band or dead at startup costs seconds, not the full wait bound; its pane may stay open and still report the agent. A worker whose ACP session cannot be opened writes a failed result before exiting, so `collect` settles it at once and `retry` replaces it. When the launcher already tore an attempt down on its own (its `failure-<operationId>.json` exists and the attempt directory is gone), `op=collect` settles the attempt as failed from that bundle without spawning a wait, and `op=cancel` converges without a launcher to run.
 
+### Declared inputs and resource preparation
+
+Provide resources before launching workers so they can run unattended without routine operator repair:
+
+```json
+{
+  "op": "init",
+  "story": "review-archive",
+  "graph": "research",
+  "task": "Review declared input archive. Keep the private job database unopened.",
+  "inputs": [{ "name": "archive", "path": "~/archives/script.mjs" }],
+  "modelPolicy": { "kind": "auto" }
+}
+```
+
+- Input names start with a letter or digit and contain only letters, digits, dots, underscores or hyphens,
+  with at most 64 characters. Declare at most 32 regular readable files, each at most 10 MiB and at most
+  32 MiB total. Directories, final symlinks, duplicate names, duplicate canonical paths or opened file
+  identities, and observed changes during capture are refused. No truncation or content retention occurs
+  on validation failure. A failure committing the run after retention can leave unreferenced content.
+- Declarations accept absolute paths and host `~/`, `$HOME/` or `${HOME}/` references. Capturing is bounded
+  and uses the same no-follow/nonblocking descriptor for validation and reading. Each successful init
+  retains the source bytes once; every node and retry reads a digest-verified attempt-local copy. Changing
+  or deleting the source after init does not change the run's input.
+- Refer to an input by name in the task. The worker prompt supplies its private path under
+  `runtime-evidence/inputs/`. Copies have mode `0400`, an accidental-write deterrent, not immutable
+  storage: a same-user worker can replace its own copy. Later attempts use fresh copies of retained bytes.
+- Task addressing lint catches home references and detected paths outside the effective workspace,
+  resolving existing-prefix symlinks and parent traversal. URLs and recognized command-position slash
+  commands are accepted. It is addressing lint, not filesystem confinement or a complete shell parser.
+- `/delegate` hands an unprepared task to the supervising agent with its selected policy and workspace,
+  rather than creating a doomed run or asking the operator to rewrite it. The supervisor declares needed
+  files, selects registered authorized services for required programs, and preserves prohibitions and
+  provenance without host paths. Direct `op=init` returns the same issues in `pathIssues` beside the error.
+  Ask the operator only for missing resources, ambiguity or new authorization. Preserve required service
+  names in the prepared task and attach them on relevant dispatches and retries.
+- New repository runs record their canonical initialization cwd. `dispatchWorkspaceRoot` can carry that
+  directory through preparation; it does not grant home-mode ownership. Resuming elsewhere does not move
+  a new run's workspace. Home runs use `workspaceRoot`; operational commands retain their own `cwd`.
+  Migrated runs without a recorded root keep the previous session-cwd fallback. If a pinned workspace is
+  wrong, initialize a replacement run in the correct directory; changing the session alone cannot fix it.
+- Operator `status` and `/graph ledger` show source provenance. Worker evidence projects input names,
+  digests and sizes without source paths; input file contents themselves are not redacted and reach the
+  selected provider. Inputs are task data, not permission to access further files or credentials.
+- **Retention:** cancellation and `/graph prune` do not remove input bytes from the private shared
+  `runtime-content/` store. This release adds no content garbage collection or run-scoped input deletion.
+  A required dependency discovered after init remains a named blocker; dynamic input additions and
+  provisioning new host services are not implemented.
+
 ### Home runs
 
-A run initialized with `workspaceRoot` set to `$HOME` or a directory under it (`~` is accepted) is a home run, for tasks that write configuration in the home without anyone watching. Only the `build` and `research` graphs take it, and every other run is unchanged.
+A run initialized with `workspaceRoot` set to `$HOME` or a directory under it (`~` is accepted) is a home run, for tasks that write configuration in the home without anyone watching. Only the `build` and `research` graphs take it; repository runs instead keep their recorded initialization workspace.
 
 - Every operation runs in that directory, whatever directory the Pi session was started in, and an `implement` operation needs no Git repository.
 - A worker owns its whole working directory, so it is never refused for writing an undeclared file. Changes inside `.git` directories, macOS sidecars (`._*`, `.DS_Store`, dropped in every mode) and anything under the graph home are dropped rather than placed.

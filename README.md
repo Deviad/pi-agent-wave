@@ -107,6 +107,27 @@ A running worker is therefore watchable two ways, and both read the worker's own
 
 Some tools cannot run inside the overlay: on macOS no browser starts there. Such a tool can run as a **host service** beside the worker instead. You register it once in `~/.pi/agent/host-services.jsonc`, the supervisor attaches it to one dispatch (`hostServices: ["browser"]`), and it runs on the host, outside the overlay, for that attempt only, reachable from the worker through a loopback port named in an environment variable. Register only tools whose writes are disposable, such as a browser or a database: what a service writes is not audited. Details: the package README, "Host services".
 
+### Give agents their required resources
+
+Workers should receive their dependencies before launch, not search the host for missing files. Declare
+host files with `delegate_graph op=init inputs: [{ name, path }]` and refer to the input name in the task.
+The extension snapshots the bytes once and supplies private copies to every operation and retry, even
+if the source is later removed. Limits are 32 files, 10 MiB per file and 32 MiB total; bytes are never
+truncated. Host HOME references are expanded in input declarations, not in worker tasks.
+
+If `/delegate` contains an unprepared host reference, it hands resource preparation to the supervising
+agent without creating a run or reopening the policy picker. The supervisor declares required files,
+uses registered authorized host services for programs, and preserves prohibitions or provenance
+without host paths. Operator intervention is reserved for missing resources, ambiguity or authorization.
+Direct `op=init` returns addressing diagnostics for the same preparation workflow.
+
+New repository runs keep their initialization workspace across resumed sessions. Optional
+`dispatchWorkspaceRoot` preserves that directory during preparation; `workspaceRoot` still selects
+home mode. Operator status and ledger retain source provenance; worker evidence lists private copies.
+Read-only permissions deter accidental writes, not same-user replacement. Input contents reach the
+selected provider and remain in `runtime-content/` after cancellation or prune; there is no input
+content garbage collection. Details: the package README, "Declared inputs and resource preparation".
+
 ### What a run keeps, and what it tears down
 
 ```mermaid
@@ -124,7 +145,7 @@ Retention comes first, so nothing after it can cost the work: the answer and the
 | Path | Holds | Lifetime |
 | --- | --- | --- |
 | `~/.local/share/delegate-graph/delegate-graph.db` | runs, graphs, agents, operations, events, runtime attempts and decisions, and the `ledger_*` story record | until `/graph prune`; the `ledger_*` rows are never pruned |
-| `runtime-content/` beside the database | content-addressed copies of retained answers and audited changes | not reclaimed by `/graph prune` |
+| `runtime-content/` beside the database | content-addressed input snapshots, retained answers and audited changes | not reclaimed by `/graph prune` |
 | `evidence/<runId>/`, `failures/<runId>/` | one run's settlement and cleanup evidence, diagnostics, capture stream and failure bundles | reclaimed by `/graph prune` with the run |
 | `runs/delegate-graph-…-<run>-<operation>.*` beside the database | one operation's private run directory, durable across reboots | removed as soon as that operation settles; `/graph prune` reclaims any left behind |
 

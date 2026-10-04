@@ -144,6 +144,13 @@ describe("package documentation", () => {
 		expect(packageText.includes("PI_AGENT_WAVE_ROOT")).toBe(false);
 	});
 
+	test("documents input delivery, unattended preparation and retention limits", () => {
+		for (const readme of [rootReadme(), packageReadme()]) {
+			for (const text of ["inputs", "dispatchWorkspaceRoot", "32 MiB", "supervisor", "cancellation", "prune", "provenance"]) expect(readme).toContain(text);
+		}
+		for (const text of ["### Declared inputs and resource preparation", "same-user worker", "not filesystem confinement", "no content garbage collection", "pathIssues"]) expect(packageReadme()).toContain(text);
+	});
+
 	test("ships the approved MIT license text", () => {
 		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 		const license = readFileSync(join(ROOT, "LICENSE"), "utf8");

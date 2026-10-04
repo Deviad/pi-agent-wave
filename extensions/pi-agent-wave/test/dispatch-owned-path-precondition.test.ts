@@ -64,8 +64,8 @@ function gitWorkspace(prefix: string): string {
 }
 
 /** Accepts a one-slice plan whose declared ownership is exactly `ownedPaths`, leaving one pending `implement`. */
-async function implementOperation(tool: Record<string, any>, ownedPaths: string[]): Promise<{ runId: string; operationId: string }> {
-	const init = parsed(await tool.execute("init", { op: "init", story: "owned-path-precondition", graph: "build", task: "Plan the change" }, undefined, () => {}, {} as ExtensionContext));
+async function implementOperation(tool: Record<string, any>, ownedPaths: string[], workspace: string): Promise<{ runId: string; operationId: string }> {
+	const init = parsed(await tool.execute("init", { op: "init", story: "owned-path-precondition", graph: "build", task: "Plan the change" }, undefined, () => {}, { cwd: workspace } as ExtensionContext));
 	assert.equal(init.error, undefined, JSON.stringify(init));
 	const runId: string = init.state.runId;
 	const store = new GraphStore({ dbPath: process.env.DELEGATE_GRAPH_DB });
@@ -96,7 +96,7 @@ function privateRunDirsFor(runId: string): string[] {
 
 async function dispatchWith(ownedPaths: string[], workspace: string, invocations: { command: string; args: string[] }[], dir: string): Promise<{ result: Record<string, any>; runId: string; operationId: string }> {
 	const tool = await toolIn(dir, invocations);
-	const { runId, operationId } = await implementOperation(tool, ownedPaths);
+	const { runId, operationId } = await implementOperation(tool, ownedPaths, workspace);
 	invocations.length = 0;
 	const result = parsed(await tool.execute("dispatch", { op: "dispatch", runId, operationId, transport: "headless" }, undefined, () => {}, { cwd: workspace } as ExtensionContext));
 	return { result, runId, operationId };
@@ -125,8 +125,9 @@ describe("dispatch requires owned paths inside the working directory", () => {
 			assert.ok(reason.includes(base), "the refusal names the resolved base directory");
 			assert.ok(reason.includes(resolve(base, outside)), `the refusal names the offending owned path, got ${reason}`);
 			assert.match(reason, /declare owned paths under /);
-			assert.match(reason, /dispatch this operation from the directory that contains/);
-			assert.match(reason, /resolve this operation with retry, or abort the run/);
+			assert.match(reason, /initialize a replacement run in the directory that contains/);
+			assert.match(reason, /recorded workspace cannot change by resuming elsewhere/);
+			assert.match(reason, /abort and initialize a replacement run if its base is wrong/);
 
 			// AC2: permanent, so the three-attempt transient budget is never spent on it.
 			assert.deepEqual(classifyFailure(reason), { kind: "permanent", reason: "dispatch-precondition" });

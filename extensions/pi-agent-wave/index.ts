@@ -7,11 +7,13 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { liveViewFor, refreshLiveView, streamRunDirectory } from "./lib/live-stream.ts";
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
+import { captureRunInputs, INPUT_FILE_LIMIT } from "./lib/run-inputs.ts";
+import { taskPathIssues, TaskPreparationError } from "./lib/task-host-paths.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { renderLog, renderStatus } from "./commands.ts";
 import delegationIdentityExtension from "./delegation-identity.ts";
-import { supervisorContract } from "./contract.ts";
+import { resourcePreparationContract, supervisorContract } from "./contract.ts";
 import { BUILD_GRAPH, OPERATIONS_GRAPH, RESEARCH_GRAPH } from "./graph-core.ts";
 import { cancelRegisteredAgent, closeRunTabs, focusRegisteredAgent, type CommandExecutor, type TabCleanup } from "./herdr.ts";
 import { installDeferredJob, parseDeferredTime, writeDeferredJob } from "./scheduler.ts";
@@ -27,7 +29,7 @@ import { selectTransport } from "./scripts/delegate.ts";
 import { resolveAgentDir } from "./lib/agent-paths.mjs";
 import { attachHostServices, loadHostServices, resolveHostServicesPath, type AttachedHostService } from "./lib/host-services.mjs";
 import type { AgentRow, VisibleTransport } from "./store.ts";
-import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, ResolvedPolicy } from "./types.ts";
+import type { GraphKind, ModelPolicyInput, OperationalCommandSpec, OperationRow, ResolvedPolicy, RunInputDeclaration, RunState } from "./types.ts";
 
 const EXTENSION_DIR = dirname(new URL(import.meta.url).pathname);
 
@@ -194,6 +196,9 @@ const GraphParams = Type.Object({
 	story: Type.Optional(Type.String()),
 	graph: Type.Optional(Type.Union([Type.Literal("build"), Type.Literal("research"), Type.Literal("operations")])),
 	task: Type.Optional(Type.String()),
+	inputs: Type.Optional(Type.Array(Type.Object({ name: Type.String(), path: Type.String() }, { additionalProperties: false }))),
+	/** Pins a repository run's initialization cwd; does not select home-mode ownership. */
+	dispatchWorkspaceRoot: Type.Optional(Type.String({ minLength: 1 })),
 	commands: Type.Optional(Type.Array(Type.Object({
 		id: Type.String({ minLength: 1 }),
 		name: Type.String({ minLength: 1 }),
@@ -247,13 +252,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * the wording is built here. The `[dispatch_precondition]` prefix is what makes the failure permanent
  * (`retry.ts:classifyFailure`), so it must stay at the start of the message.
  */
-function ownedPathPreconditionReason(baseDir: string, offending: readonly string[]): string {
+function ownedPathPreconditionReason(baseDir: string, offending: readonly string[], pinned = false): string {
 	const wholeBase = offending.filter((path) => { try { return realpathExistingPrefix(path) === baseDir; } catch { return false; } });
 	const escaped = offending.filter((path) => !wholeBase.includes(path));
 	const parts = [`[dispatch_precondition] a worker writes only inside the AgentFS copy-on-write overlay rooted at its working directory; base_dir ${baseDir}.`];
-	if (escaped.length) parts.push(`These owned paths resolve outside it and can never be written: ${escaped.join(", ")}. Remedy: declare owned paths under ${baseDir} (relative entries resolve against it), or dispatch this operation from the directory that contains them.`);
+	if (escaped.length) parts.push(`These owned paths resolve outside it and can never be written: ${escaped.join(", ")}. Remedy: declare owned paths under ${baseDir} (relative entries resolve against it), ${pinned ? "or initialize a replacement run in the directory that contains them" : "or dispatch this operation from the directory that contains them"}.`);
 	if (wholeBase.length) parts.push(`These owned paths cover the whole working directory, which ownership refuses: ${wholeBase.join(", ")}. Remedy: declare the specific files or subdirectories the slice writes.`);
-	parts.push("Then resolve this operation with retry, or abort the run.");
+	parts.push(pinned ? "The recorded workspace cannot change by resuming elsewhere; abort and initialize a replacement run if its base is wrong." : "Then resolve this operation with retry, or abort the run.");
 	return parts.join(" ");
 }
 
@@ -338,11 +343,11 @@ function retainedTeardown(privateRunDir: string, operationId: string, agent: Age
  * directory. Without this, review, test and audit workers received only a one-line task and no plan,
  * implementation answer or ledger (2026-09-12 build measurement: the auditor returned FAIL).
  */
-export function materializeRuntimeEvidence(graphStore: GraphStore, runId: string, privateRunDir: string): { ledgerPath: string; answers: { node: string; path: string }[]; taskSuffix: string } {
+export function materializeRuntimeEvidence(graphStore: GraphStore, runId: string, privateRunDir: string): { ledgerPath: string; answers: { node: string; path: string }[]; inputs: { name: string; path: string }[]; taskSuffix: string } {
 	const dir = join(privateRunDir, "runtime-evidence");
 	mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700);
 	const ledgerPath = join(dir, "ledger.json");
-	writeFileSync(ledgerPath, `${JSON.stringify(graphStore.runtimeLedger(runId), null, 2)}\n`, { mode: 0o600 }); chmodSync(ledgerPath, 0o600);
+	writeFileSync(ledgerPath, `${JSON.stringify(graphStore.workerRuntimeLedger(runId), null, 2)}\n`, { mode: 0o600 }); chmodSync(ledgerPath, 0o600);
 	const answersDir = join(dir, "answers");
 	mkdirSync(answersDir, { recursive: true, mode: 0o700 }); chmodSync(answersDir, 0o700);
 	const content = new RuntimeContentStore(graphStore.dbPath);
@@ -357,9 +362,42 @@ export function materializeRuntimeEvidence(graphStore: GraphStore, runId: string
 		writeFileSync(path, content.read(answer, 16 * 1024 * 1024), { mode: 0o600 }); chmodSync(path, 0o600);
 		answers.push({ node: operation.node, path });
 	}
+	const inputsDir = join(dir, "inputs");
+	const inputs: { name: string; path: string }[] = [];
+	for (const input of graphStore.runInputs(runId)) {
+		mkdirSync(inputsDir, { recursive: true, mode: 0o700 });
+		const path = join(inputsDir, input.name);
+		writeFileSync(path, content.read(input, INPUT_FILE_LIMIT), { mode: 0o400 }); chmodSync(path, 0o400);
+		inputs.push({ name: input.name, path });
+	}
 	const listed = answers.length ? answers.map((item) => `${item.node}: ${item.path}`).join("; ") : "none yet";
-	const taskSuffix = `\n\nRun evidence, derived and read-only (never modify these files): the run ledger is ${ledgerPath}; the accepted answers of completed operations are ${listed}. Changes already integrated from accepted implementation candidates are present in the workspace.\n`;
-	return { ledgerPath, answers, taskSuffix };
+	const declared = inputs.length ? `Declared inputs, read-only copies of snapshots taken at run start: ${inputs.map((input) => `${input.name}: ${input.path}`).join("; ")}.\n` : "";
+	const taskSuffix = `\n\nRun evidence, derived and read-only (never modify these files): the run ledger is ${ledgerPath}; the accepted answers of completed operations are ${listed}. Changes already integrated from accepted implementation candidates are present in the workspace.\n${declared}`;
+	return { ledgerPath, answers, inputs, taskSuffix };
+}
+
+interface RunInitializationRequest {
+	readonly story: string;
+	readonly graph: GraphKind;
+	readonly task: string;
+	readonly commands?: OperationalCommandSpec[];
+	readonly workspaceRoot?: string;
+	readonly dispatchWorkspaceRoot?: string;
+	readonly inputs?: readonly RunInputDeclaration[];
+}
+
+/** Shared creation path: validate everything, capture bounded bytes, retain, then create the run. */
+export function initializePreparedRun(graphStore: GraphStore, request: RunInitializationRequest, policy: ResolvedPolicy, cwd: string): RunState {
+	const options = { workspaceRoot: request.workspaceRoot, dispatchWorkspaceRoot: request.dispatchWorkspaceRoot ?? cwd };
+	const validated = graphStore.validateRunInitialization(request.story, request.graph, request.task, policy, request.commands, options);
+	const base = validated.root ?? validated.dispatchRoot ?? cwd;
+	const issues = taskPathIssues(request.task, base);
+	for (const command of validated.commands ?? []) issues.push(...taskPathIssues(command.name, realpathSync(command.command.cwd)));
+	if (issues.length) throw new TaskPreparationError(issues);
+	const captured = captureRunInputs(request.inputs ?? []);
+	const content = new RuntimeContentStore(graphStore.dbPath);
+	const inputs = captured.map((input) => ({ name: input.name, sourcePath: input.sourcePath, ...content.retain(input.content) }));
+	return graphStore.initRun(request.story, request.graph, request.task, policy, request.commands, { ...options, inputs });
 }
 
 export interface WatchedAgent {
@@ -906,6 +944,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 			"Operate the durable delegation state machine. Initialize a build, research, or operations run, read pending graph operations with their frozen model route, dispatch and collect workers, decide their retained answers, or inspect state. A running dispatch echoes modelPolicy and policyDigest from op=next plus selectedModel and modelAttempt; same-model retryReason and cross-model fallbackReason remain distinct. Graph edges, joins, retry caps, review/test loops, and evidence gates are enforced by the extension.",
 		promptSnippet: "Use delegate_graph for every /delegate graph transition; never invent or skip edges.",
 		promptGuidelines: [
+			"Prepare required host files as named inputs at op=init, and refer to their names in the task. Preparation diagnostics are for the supervisor to resolve; ask the operator only for missing resources, ambiguity or authorization. Preserve task-declared host service attachments on relevant dispatches and retries.",
 			"Per operation: op=next, op=dispatch, op=collect, op=decide, then op=next again. op=record is only for status=cancelled.",
 			"op=collect returns the retained answer, its VERDICT line and a decide template: reuse that template's operationId, verdict and payload shape in op=decide.",
 			"op=decide takes decision accepted or rejected plus a reason; thinker_plan and thinker_split also need payload.slices (id, name, task, ownedPaths on the build graph); coding and operational candidates need op=integrate first.",
@@ -924,16 +963,12 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					// Direct/headless initialization is deterministic and never invokes the picker.
 					const policyInput: ModelPolicyInput = params.modelPolicy ?? { kind: "auto" };
 					const resolved = await resolvePolicy(policyInput, executor(pi));
-					const state = graphStore.initRun(
-						required(params.story, "story"),
-						params.graph ?? "build",
-						required(params.task, "task"),
-						resolved,
-						params.commands as OperationalCommandSpec[] | undefined,
-						params.workspaceRoot === undefined ? {} : { workspaceRoot: params.workspaceRoot },
-					);
+					const state = initializePreparedRun(graphStore, {
+						story: required(params.story, "story"), graph: params.graph ?? "build", task: required(params.task, "task"),
+						commands: params.commands, workspaceRoot: params.workspaceRoot, dispatchWorkspaceRoot: params.dispatchWorkspaceRoot, inputs: params.inputs,
+					}, resolved, ctx.cwd ?? process.cwd());
 					progress("run_created", { runId: state.runId, graph: params.graph ?? "build", status: state.status });
-					return textResult({ state, next: graphStore.next(state.runId) });
+					return textResult({ state, next: graphStore.next(state.runId), supervisorInstructions: supervisorContract(state.runId, params.graph ?? "build", required(params.task, "task"), graphStore.policy(state.runId)) });
 				}
 				const runId = required(params.runId, "runId");
 				graphStore.getRun(runId);
@@ -976,8 +1011,9 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						: [];
 					const workerTransport = params.transport ? parseWorkerTransportKind(params.transport) : ctx.mode === "tui" ? selectTransport(process.env, "auto") : "headless";
 					// A home run works in its recorded root whatever directory the session was started in.
-					const homeRoot = graphStore.getRun(runId).workspace_root;
-					let dispatchCwd = homeRoot ?? ctx.cwd;
+					const run = graphStore.getRun(runId);
+					const homeRoot = run.workspace_root;
+					let dispatchCwd = homeRoot ?? run.dispatch_workspace_root ?? ctx.cwd;
 					if (operation.command_json) {
 						const command: unknown = JSON.parse(operation.command_json);
 						if (isRecord(command) && typeof command.cwd === "string" && command.cwd) dispatchCwd = command.cwd;
@@ -993,7 +1029,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						const declared = declaredOwnership.map((entry) => resolve(baseDir, String(entry)));
 						const containment = ownedRelativePaths(baseDir, declared, "owned", false);
 						if (containment.errors.length) {
-							const reason = ownedPathPreconditionReason(baseDir, containment.errors.map((error) => error.path));
+							const reason = ownedPathPreconditionReason(baseDir, containment.errors.map((error) => error.path), run.dispatch_workspace_root !== null);
 							const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
 							progress("dispatch_refused_by_precondition", { runId, operationId, baseDir, status: refused.state.status });
 							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, baseDir, state: refused.state, operation: refused.operation });
@@ -1005,7 +1041,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						const baseDir = realpathSync(dispatchCwd ?? process.cwd());
 						const head = await execute("git", ["-C", baseDir, "rev-parse", "--verify", "--quiet", "HEAD"]);
 						if (head.exitCode !== 0 || !head.stdout.trim()) {
-							const reason = `[dispatch_precondition] coding operation requires a Git working directory with a HEAD revision; base_dir ${baseDir} has none. Remedy: start the Pi session in the Git repository being edited, then resolve this operation with retry, or abort the run.`;
+							const reason = `[dispatch_precondition] coding operation requires a Git working directory with a HEAD revision; base_dir ${baseDir} has none. Remedy: start the Pi session in the Git repository being edited, ${run.dispatch_workspace_root ? "then initialize a replacement run there; this run's recorded workspace cannot change by resuming elsewhere" : "then resolve this operation with retry, or abort the run"}.`;
 							const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
 							progress("dispatch_refused_by_precondition", { runId, operationId, baseDir, status: refused.state.status });
 							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, baseDir, state: refused.state, operation: refused.operation });
@@ -1016,7 +1052,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					if (initialized.exitCode !== 0) throw new Error(initialized.stderr || initialized.stdout || "headless init failed");
 					const privateRunDir = initialized.stdout.trim();
 					const taskFile = join(privateRunDir, "task.md");
-					let evidence: { ledgerPath: string; answers: { node: string; path: string }[]; taskSuffix: string };
+					let evidence: ReturnType<typeof materializeRuntimeEvidence>;
 					try {
 						evidence = materializeRuntimeEvidence(graphStore, runId, privateRunDir);
 						writeFileSync(taskFile, `${operation.task}\n${evidence.taskSuffix}`, { mode: 0o600 });
@@ -1168,7 +1204,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 
 				throw new Error(`op=record accepts only status=cancelled (use op=cancel); ${params.op === "record" ? `status=${params.status ?? "missing"}` : `op=${params.op}`} is not a runtime-v1 transition`);
 			} catch (error) {
-				return textResult({ error: error instanceof Error ? error.message : String(error) });
+				return textResult({ error: error instanceof Error ? error.message : String(error), ...(error instanceof TaskPreparationError ? { pathIssues: error.pathIssues } : {}) });
 			}
 		},
 	});
@@ -1183,9 +1219,14 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 			const policyInput = await pickPolicy(ctx, parsed.policy);
 			const resolved = await resolvePolicy(policyInput, executor(pi));
 			const story = `${slug(selected.task)}-${Date.now().toString(36)}`;
-			const state = getStore().initRun(story, selected.graph, selected.task, resolved);
-			pi.setSessionName(`delegate: ${story}`);
-			pi.sendUserMessage(supervisorContract(state.runId, selected.graph, selected.task, getStore().policy(state.runId)));
+			try {
+				const state = initializePreparedRun(getStore(), { story, graph: selected.graph, task: selected.task }, resolved, ctx.cwd ?? process.cwd());
+				pi.setSessionName(`delegate: ${story}`);
+				pi.sendUserMessage(supervisorContract(state.runId, selected.graph, selected.task, getStore().policy(state.runId)));
+			} catch (error) {
+				if (!(error instanceof TaskPreparationError)) throw error;
+				pi.sendUserMessage(resourcePreparationContract({ story, graph: selected.graph, task: selected.task, modelPolicy: policyInput, dispatchWorkspaceRoot: realpathSync(ctx.cwd ?? process.cwd()) }, error.pathIssues));
+			}
 		},
 	});
 

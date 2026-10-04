@@ -10,6 +10,32 @@ directory unless they begin with the repository root. The only result contract i
 (`lib/runtime-results.ts:parseResultContract`); `legacy-v1` was removed on 2026-09-12 and must not be
 reintroduced.
 
+## Worker resources increment
+
+`tasks/handoff-worker-host-inputs.md` records this increment and its acceptance proofs. Usability is the
+primary goal: prepare resources before worker launch rather than making workers search the host.
+Both initialization entry points share addressing lint and bounded input validation. `/delegate` hands
+unprepared references to the supervisor with its chosen policy and workspace; direct initialization
+returns structured diagnostics. Optional `dispatchWorkspaceRoot` carries the preparation workspace into
+initialization without selecting home ownership mode. `lib/run-inputs.ts` owns bounded source capture
+and retained-input parsing. Valid file declarations are snapshotted into `RuntimeContentStore`
+and inherited by every node and replacement attempt. Limits are 32 files, 10 MiB per file and 32 MiB
+in aggregate. Sources are opened no-follow/nonblocking, checked through the same descriptor and read
+within an explicit bound before retention. Final symlinks, duplicate names/identities and observed
+mutation are refused. New schema v14 adds `runs.inputs_json` and `runs.dispatch_workspace_root`
+additively; older runs keep empty inputs and their previous cwd fallback. Home roots and operational
+command working directories keep their existing meaning. New repository runs dispatch in their
+recorded initialization workspace even when resumed elsewhere.
+
+Operator ledgers expose input provenance; worker ledgers project input names, digests and sizes only.
+Dispatch verifies retained bytes and writes attempt-local mode-0400 copies alongside evidence, naming
+those copies in the prompt. Permissions deter accidental writes, not same-user replacement; fresh
+attempts always materialize the retained source. Task addressing lint resolves existing-prefix symlinks
+and exempts recognized command-position slash commands and URLs. It is not filesystem confinement.
+Worker instructions name supplied resources and report missing dependencies. Supervision instructions
+preserve task-declared host-service attachments on relevant dispatches and retries. Input bytes survive
+cancellation and prune in the shared content store; this increment adds no garbage collection.
+
 ---
 
 ## 1. Process model and IPC
@@ -258,7 +284,7 @@ the launchd job is present code that is not on a dispatchable path.
 
 `store.ts:CURRENT_SCHEMA_VERSION = 13`. `GraphStore.migrate()` issues a base
 `CREATE TABLE IF NOT EXISTS` block, seeds `schema_version(version)` to 1 when empty, then runs
-`migrateToV2()` … `migrateToV13()` in order. Each migration inspects columns so an interrupted
+`migrateToV2()` … `migrateToV14()` in order. Each migration inspects columns so an interrupted
 migration repairs idempotently, and `migrate()` throws if the final `schema_version` is not
 `CURRENT_SCHEMA_VERSION`. The base block is evolved with the build: it already contains some columns
 that an older store received through a later migration (notably `operations.command_json`), so the
@@ -431,6 +457,16 @@ CLI over `recordLedgerEntry`, `auditStoryLedger` and `storyLedger`.
 `migrateToV13` adds `runs.workspace_root TEXT` additively (`ensureColumn`, one immediate transaction,
 `schema_version` 13). NULL for every existing run and every repository run; a home run records its
 real working directory (§5.1a). No row is rewritten.
+
+### 2.12b v14 — inputs and stable dispatch workspace
+
+`store.ts:migrateToV14` adds `runs.inputs_json TEXT NOT NULL DEFAULT '[]'` and
+`runs.dispatch_workspace_root TEXT` through `ensureColumn` in one immediate transaction. Existing
+rows gain empty inputs and a null dispatch root without changes to their prior columns or dependent
+rows. `index.ts:initializePreparedRun` validates graph arguments and task addressing before bounded
+source capture and retention, then `store.ts:initRun` records the retained references and canonical
+initialization cwd. `store.ts:runInputs` parses references on read; `workerRuntimeLedger` projects
+input metadata without source provenance. The operator ledger and status retain source paths.
 
 ### 2.13 Single-writer, transaction and retention rules
 
@@ -796,6 +832,15 @@ extension (`index.ts` dispatch branch) parses this, registers the agent
 (`store.ts:registerAgent`), re-derives the identity with `resolveAcpxPlan` and refuses a mismatch,
 registers the attempt (`store.ts:beginRuntimeAttempt`), emits `runtime_attempt_registered`, and
 opens the agent list (`agent-list.ts:noteRegisteredAttempt`).
+
+For new repository runs, dispatch takes `runs.dispatch_workspace_root`, not the resuming session cwd.
+Explicit home roots still take precedence, and structured operational commands still select their own
+cwd. Older rows with null dispatch roots use the existing session fallback. Input materialization uses
+`store.ts:workerRuntimeLedger` and `RuntimeContentStore.read` to write mode-0400 private copies and
+append their paths to the worker task; host source paths are operator-only input metadata. Both tool
+init and `/delegate` call `initializePreparedRun`; addressing failures return `pathIssues` through the
+tool or a `contract.ts:resourcePreparationContract` handoff through the command. The latter preserves
+policy and workspace without creating a run or reopening a picker.
 
 ### 5.3 The AgentFS copy-on-write sandbox
 

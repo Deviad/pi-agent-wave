@@ -10,9 +10,10 @@ import { headlessPresentationIdentity, herdrPresentationIdentity, parseWorkerTra
 import { createAcpxAttemptIdentity } from "./lib/acpx-types.ts";
 import { selectAcpAgent } from "./lib/acpx-select.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
+import { parseRunInputs } from "./lib/run-inputs.ts";
 import { RuntimeIntegration, type IntegrationStatus } from "./lib/runtime-integration.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
-import { canonical, candidateContents, type RuntimeLedger, parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, runtimeDigest, type ResultContract, type RuntimeAttempt, type RuntimeAttemptInput, type RuntimeContent, type RuntimeDecision, type RuntimeDecisionInput, type RuntimeRetryInput, type RuntimeRetryResult, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
+import { canonical, candidateContents, type RuntimeLedger, type OperatorRuntimeLedger, parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, runtimeDigest, type ResultContract, type RuntimeAttempt, type RuntimeAttemptInput, type RuntimeContent, type RuntimeDecision, type RuntimeDecisionInput, type RuntimeRetryInput, type RuntimeRetryResult, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import type {
 	EventRow,
 	FrozenPolicy,
@@ -31,6 +32,8 @@ import type {
 	PolicyRoute,
 	ResolvedPolicy,
 	RunRow,
+	RunInput,
+	RunInitializationOptions,
 	RunState,
 	RunStatus,
 	SliceSpec,
@@ -53,7 +56,7 @@ export const DEFAULT_DB_PATH = join(DEFAULT_GRAPH_HOME, "delegate-graph.db");
  * and `migrate()` refuses a build whose migrations stop short of it, so forgetting to bump it is a
  * loud failure instead of a store that silently reports an older version.
  */
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 export interface StoreOptions {
 	dbPath?: string;
@@ -436,6 +439,7 @@ export class GraphStore {
 		this.migrateToV11();
 		this.migrateToV12();
 		this.migrateToV13();
+		this.migrateToV14();
 		if (this.schemaVersion() !== CURRENT_SCHEMA_VERSION) {
 			throw new Error(`store migrated to schema v${this.schemaVersion()}, but this build expects v${CURRENT_SCHEMA_VERSION}`);
 		}
@@ -899,6 +903,17 @@ export class GraphStore {
 		}
 	}
 
+	/** v14 freezes run inputs and the initialization workspace; legacy runs retain their cwd fallback. */
+	private migrateToV14(): void {
+		if (this.schemaVersion() >= 14) return;
+		this.transaction(() => {
+			if (this.schemaVersion() >= 14) return;
+			this.ensureColumn("runs", "inputs_json", "TEXT NOT NULL DEFAULT '[]'");
+			this.ensureColumn("runs", "dispatch_workspace_root", "TEXT");
+			this.db.exec("INSERT OR REPLACE INTO schema_version(version) VALUES (14)");
+		});
+	}
+
 	private migrateToV12(): void {
 		if (this.schemaVersion() >= 12) return;
 		this.db.exec("BEGIN IMMEDIATE");
@@ -1034,6 +1049,21 @@ export class GraphStore {
 		return id;
 	}
 
+	/** Validates initialization before the caller captures or retains any declared inputs. */
+	validateRunInitialization(story: string, graph: GraphKind, task: string, policy: ResolvedPolicy, operationalCommands: OperationalCommandSpec[] | undefined, options: RunInitializationOptions): { root: string | null; dispatchRoot: string | null; commands: OperationalCommandSpec[] | undefined } {
+		if (!story.trim() || !task.trim()) throw new Error("story and task are required");
+		const root = options.workspaceRoot === undefined ? null : homeWorkspaceRoot(options.workspaceRoot, graph);
+		this.assertPolicy(policy);
+		graphDefinition(graph);
+		const commands = graph === "operations" ? validateOperationalCommands(operationalCommands) : undefined;
+		if (graph !== "operations" && operationalCommands?.length) throw new Error("structured commands require the operations graph");
+		if (options.dispatchWorkspaceRoot !== undefined && !isAbsolute(options.dispatchWorkspaceRoot)) throw new Error("dispatch workspace must be an absolute directory");
+		const dispatchRoot = options.dispatchWorkspaceRoot === undefined ? null : realpathSync(options.dispatchWorkspaceRoot);
+		if (dispatchRoot && !statSync(dispatchRoot).isDirectory()) throw new Error(`dispatch workspace must be an existing directory: ${dispatchRoot}`);
+		parseRunInputs(options.inputs ?? []);
+		return { root, dispatchRoot, commands };
+	}
+
 	/** Initializes a run and freezes the selected graph definition plus its immutable policy snapshot. */
 	initRun(
 		story: string,
@@ -1041,20 +1071,17 @@ export class GraphStore {
 		task: string,
 		policy: ResolvedPolicy = DEFAULT_AUTO_POLICY,
 		operationalCommands?: OperationalCommandSpec[],
-		options: { readonly workspaceRoot?: string } = {},
+		options: RunInitializationOptions = {},
 	): RunState {
-		if (!story.trim() || !task.trim()) throw new Error("story and task are required");
-		const root = options.workspaceRoot === undefined ? null : homeWorkspaceRoot(options.workspaceRoot, graph);
-		this.assertPolicy(policy);
-		const commands = graph === "operations" ? validateOperationalCommands(operationalCommands) : undefined;
-		if (graph !== "operations" && operationalCommands?.length) throw new Error("structured commands require the operations graph");
+		const { root, dispatchRoot, commands } = this.validateRunInitialization(story, graph, task, policy, operationalCommands, options);
+		const inputs = parseRunInputs(options.inputs ?? []);
 		const runId = `run_${randomUUID()}`;
 		const definition = graphDefinition(graph);
 		const now = this.iso();
 		const policyJson = stableStringify(policy);
 		const digest = policyDigest(policy);
 		return this.transaction(() => {
-			this.db.query("INSERT INTO runs(id,story,graph_name,task,status,policy_json,policy_digest,created_at,updated_at,workspace_root) VALUES (?,?,?,?,?,?,?,?,?,?)").run(
+			this.db.query("INSERT INTO runs(id,story,graph_name,task,status,policy_json,policy_digest,created_at,updated_at,workspace_root,inputs_json,dispatch_workspace_root) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
 				runId,
 				story,
 				graph,
@@ -1065,6 +1092,8 @@ export class GraphStore {
 				now,
 				now,
 				root,
+				JSON.stringify(inputs),
+				dispatchRoot,
 			);
 			this.db.query("INSERT INTO graphs(run_id,name,definition_json,sha256) VALUES (?,?,?,?)").run(
 				runId,
@@ -1295,7 +1324,7 @@ export class GraphStore {
 	 * only; it cannot invalidate a candidate, settle an operation or advance a graph, and it is not
 	 * consulted by any gate.
 	 */
-	runtimeLedger(runId: string): RuntimeLedger {
+	runtimeLedger(runId: string): OperatorRuntimeLedger {
 		const run = this.getRun(runId);
 		const state = this.getState(runId);
 		const policy = this.policy(runId);
@@ -1316,7 +1345,17 @@ export class GraphStore {
 			return { operationId: operation.id, node: operation.node, round: operation.round, fixIteration: operation.fix_iteration, status: operation.status, modelAttempt: operation.model_attempt, transientAttempts: operation.transient_attempts, selectedModel: operation.selected_model, classifierReason: operation.classifier_reason, retryReason: operation.retry_reason, fallbackReason: operation.fallback_reason, lastError: operation.last_error, retryNotBefore: operation.retry_not_before, attempts };
 		});
 		const events = this.events(runId, 10_000).map((event) => ({ id: event.id, ts: event.ts, type: event.type, node: event.node, operationId: event.operation_id, agentId: event.agent_id, verdict: event.verdict, payload: JSON.parse(event.payload_json) as unknown }));
-		return { schemaVersion: 1, derived: true, derivedAt: this.iso(), runId, story: run.story, graph: run.graph_name, task: run.task, resultContract: "runtime-v1", status: state.status, currentNode: state.currentNode, round: state.round, fixIteration: state.fixIteration, policyDigest: policy.digest, operations, events };
+		return { schemaVersion: 1, derived: true, derivedAt: this.iso(), runId, story: run.story, graph: run.graph_name, task: run.task, resultContract: "runtime-v1", status: state.status, currentNode: state.currentNode, round: state.round, fixIteration: state.fixIteration, policyDigest: policy.digest, inputs: this.runInputs(runId), operations, events };
+	}
+
+	/** Operator-only provenance; the worker projection explicitly drops source paths. */
+	runInputs(runId: string): RunInput[] {
+		return parseRunInputs(JSON.parse(this.getRun(runId).inputs_json));
+	}
+
+	workerRuntimeLedger(runId: string): RuntimeLedger {
+		const ledger = this.runtimeLedger(runId);
+		return { ...ledger, inputs: this.runInputs(runId).map(({ name, sha256, bytes }) => ({ name, sha256, bytes })) };
 	}
 
 	/** Registers the operation's active attempt; a replacement registers only with the identity retryRuntimeAttempt froze. */
