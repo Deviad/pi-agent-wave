@@ -433,10 +433,10 @@ real working directory (§5.1a). No row is rewritten.
   directory. Filesystem removal runs after the commit. The `ledger_*` rows are never pruned, and
   `runtime-content/` is content-addressed and is not reclaimed by `prune` (only `evidence/`,
   `failures/` and the transient run directories are).
-  **Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §3): once
-  run directories live under `<graph home>/runs/` (§5.1), `prune` is their only reclaimer — they no
-  longer sit on a self-clearing volume. The resolution path through `agents.acpx_cancel_script` is
-  unchanged, so this adds no new retention mechanism and no new knob.
+  Run directories live under `<graph home>/runs/` (§5.1), so `prune` is their only reclaimer: they
+  no longer sit on a self-clearing volume. The resolution through `agents.acpx_cancel_script` is
+  location-independent, so a run directory left in `/tmp` by an earlier version is reclaimed the same
+  way.
 - The launcher's own `state.json` is serialized by a directory lock with an orphan check and written
   by atomic rename (`scripts/delegate_core.py:mutate_state`, `clear_orphaned_state_lock`,
   `write_state`).
@@ -664,23 +664,24 @@ successful fallback clears `state.excludedProviders`.
 `scripts/delegate_core.py:command_init` requires ACPX and AgentFS (`require_worker_runtime`, exact
 versions below), or Herdr identity for the Herdr transport (`require_herdr`, which also verifies
 `herdr integration status` and installs the Pi integration if needed). It creates
-`Path(tempfile.mkdtemp(prefix="delegate-graph-herdr-<slug>.", dir="/tmp"))`, chmods it 700, writes
+`Path(tempfile.mkdtemp(prefix="delegate-graph-herdr-<slug>.", dir=run_root()))`, chmods it 700, writes
 `state.json` (`caller_tab`, `transport`, `closed_tabs`, `resources`, `run_label`, `run_slug`) mode
-600 and a private `system-prompt.txt`, and prints the run directory. `require_run_dir` accepts a
-directory only when its resolved parent is `/tmp` and its name starts with `delegate-graph-herdr-`
-and it contains `state.json`.
+600 and a private `system-prompt.txt`, and prints the run directory. `run_root()` is `<graph
+home>/runs/` (created mode 700), where the graph home is the directory of `graph_db_path()`:
+`DELEGATE_GRAPH_DB`, else `~/.local/share/delegate-graph/delegate-graph.db`, the same default as
+`store.ts:DEFAULT_DB_PATH` (pinned by `test/durable-run-root.test.ts`). `require_run_dir` accepts a
+directory only when its resolved parent is the run root or `LEGACY_RUN_ROOT` (`/tmp`, kept for one
+release so a run started by the previous version can still be collected), its name starts with
+`delegate-graph-herdr-`, and it contains `state.json`.
 
-**Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §3): the run
-root moves from `/tmp` to `<graph home>/runs/` (mode 700), where the graph home is the directory
-containing `DELEGATE_GRAPH_DB`, defaulting to `~/.local/share/delegate-graph/`. `/tmp` is volatile —
-a host reboot on 2026-10-03 cleared the only copy of an unsettled attempt's stream, answer sink,
-AgentFS delta and `state.json`, making `run_ab8675e8`'s `thinker_plan` answer unrecoverable. The
-directory name is unchanged, so the cancel-script-to-run-directory relationship used by `prune` and
-by the liveness reaper is unaffected; `require_run_dir` accepts the new root and, for one release,
-`/tmp`. The Python launcher's default must equal `store.ts:DEFAULT_DB_PATH` and the two are pinned
-by a test. The AgentFS grant stays `--no-default-allows --allow <run-dir>`, which makes the run
-directory a sibling of the database, `runtime-content/`, `evidence/` and `failures/` and must reach
-none of them.
+The run root moved out of `/tmp` on 2026-10-04 (`tasks/handoff-durable-worker-record.md` §3): a host
+reboot on 2026-10-03 cleared the only copy of an unsettled attempt's stream, answer sink, AgentFS delta
+and `state.json`, making `run_ab8675e8`'s `thinker_plan` answer unrecoverable. The directory name is
+unchanged, so the cancel-script-to-run-directory relationship used by `prune` and by the liveness
+reaper is unaffected. The AgentFS grant stays `--no-default-allows --allow <run-dir>`; with the root
+under `$HOME` a worker cannot write the database, `runtime-content/`, `evidence/`, `failures/` or a
+sibling run directory, and the grant still delivers `worker-result.json` to the host when the run
+directory lies inside a home run's copy-on-write base (both verified with real AgentFS).
 
 ### 5.1a Home runs (`workspace_root`)
 
@@ -764,9 +765,8 @@ directory go to the overlay and are audited. Writes to `/tmp`, `/private/tmp` an
 directory `/var/folders/<user>/T/` succeed and land on the host without appearing in the delta,
 whatever `TMPDIR` is set to; the run directory is host-writable by design (`--allow`). Absolute
 writes elsewhere under `$HOME` are refused. Every host file is readable, including the graph database
-and `~/.pi/agent/auth.json`. `agentfs run` 0.6.4 has no option that denies `/tmp` or reads. While run
-directories live under `/tmp` (§5.1), a worker can therefore write into another attempt's run
-directory.
+and `~/.pi/agent/auth.json`. `agentfs run` 0.6.4 has no option that denies `/tmp` or reads. Run directories made by a version before 2026-10-04 still live under `/tmp`, where any worker can
+write into them; current run directories are under the graph home (§5.1).
 
 ### 5.4 Audit and staging
 
@@ -1073,10 +1073,10 @@ configuration overrides and tests use temporary agent directories.
 | `PI_FAILOVER_LOCKED`, `PI_FAILOVER_ROUTE`, `PI_FAILOVER_TIER`, `PI_FAILOVER_ROLE`, `PI_DELEGATION_KIND` | model-failover | worker failover arming | `model-failover.ts` (`session_start`, `/failover`) |
 | `PI_DELEGATION_LABEL`, `PI_DELEGATION_MODEL`, `PI_DELEGATION_POLICY`, `PI_DELEGATION_POLICY_DIGEST`, `PI_DELEGATION_ROLE`, `PI_FAILOVER_LOCKED` | worker's Pi session | frozen delegation identity written by the launcher | `scripts/delegate_core.py:delegation_environment`, consumed by `model-failover.ts` |
 
-**Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §3):
-`DELEGATE_GRAPH_DB` additionally determines the private run root, `<graph home>/runs/` (§5.1). No new
-variable is introduced: deriving the root from the database path gives the tests and measurement
-drivers, which already set it to a temporary path, their isolation for free.
+`DELEGATE_GRAPH_DB` also determines the private run root, `<graph home>/runs/` (§5.1;
+`scripts/delegate_core.py:run_root`, `scripts/production-audit.ts:readCleanup`). No separate variable
+exists: deriving the root from the database path gives the tests and measurement drivers, which
+already set it to a temporary path, their isolation for free.
 
 `PI_FAILOVER_ROUTE` etc. are set by `scripts/delegate_core.py:delegation_environment` when a Herdr tab
 is created (`tab_create_argv` passes them as `--env KEY=VALUE`), and the same values are set in the

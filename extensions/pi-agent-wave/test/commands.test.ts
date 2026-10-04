@@ -471,8 +471,12 @@ exit 0
 `);
 		chmodSync(join(binDir, "herdr"), 0o700);
 		const helper = new URL("../scripts/herdr_delegate.py", import.meta.url).pathname;
+		// The run root follows the graph database, so a temporary one keeps the real graph home untouched.
+		const graphHome = mkdtempSync(join(tmpdir(), "command-contract-graph-"));
+		dirs.push(graphHome);
 		const baseEnv = {
 			...process.env,
+			DELEGATE_GRAPH_DB: join(graphHome, "graph.db"),
 			HERDR_ENV: "1",
 			HERDR_PANE_ID: "w-test:p1",
 			HERDR_TAB_ID: "w-test:t1",

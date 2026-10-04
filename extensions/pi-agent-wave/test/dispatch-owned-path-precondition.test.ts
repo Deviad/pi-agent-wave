@@ -1,8 +1,8 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GraphStore } from "../store.ts";
@@ -83,13 +83,14 @@ async function implementOperation(tool: Record<string, any>, ownedPaths: string[
 }
 
 /**
- * Run directories for one run only. A `before`/`after` diff over all of `/tmp` races with the other
- * test files, which create their own `delegate-graph-herdr-*` directories concurrently; the run's own
- * identity is the only race-free way to ask whether *this* dispatch created one.
+ * Run directories for one run only, under the run root beside this test's graph database
+ * (scripts/delegate_core.py:run_root). The run's own identity keeps the question about *this* dispatch
+ * even if other runs share the root.
  */
 function privateRunDirsFor(runId: string): string[] {
 	const token = runId.replace(/^run_/, "");
-	return readdirSync("/tmp").filter((name) => name.startsWith("delegate-graph-herdr-") && name.includes(token));
+	const runRoot = join(dirname(process.env.DELEGATE_GRAPH_DB!), "runs");
+	return existsSync(runRoot) ? readdirSync(runRoot).filter((name) => name.startsWith("delegate-graph-herdr-") && name.includes(token)) : [];
 }
 
 async function dispatchWith(ownedPaths: string[], workspace: string, invocations: { command: string; args: string[] }[], dir: string): Promise<{ result: Record<string, any>; runId: string; operationId: string }> {

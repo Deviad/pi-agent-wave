@@ -102,8 +102,9 @@ test("an owned directory the worker created but left empty stages no change", ()
 });
 
 test("staging scratch does not depend on an inherited TMPDIR, and no shipped module reaches for tmpdir()", () => {
-	// The Python lifecycle pins its private directories to /tmp (delegate_core.py TMP_ROOT) because a launcher-supplied
-	// TMPDIR can outlive nothing: the 2026-09-16 live run lost a settlement to exactly that. Staging must not trust it either.
+	// The Python lifecycle pins its scratch to /tmp (delegate_core.py SCRATCH_ROOT, run directories now live under the
+	// graph home) because a launcher-supplied TMPDIR can outlive nothing: the 2026-09-16 live run lost a settlement to
+	// exactly that. Staging must not trust it either.
 	const root = mkdtempSync(join(tmpdir(), "runtime-stage-tmpdir-"));
 	const savedTmpdir = process.env.TMPDIR;
 	try {

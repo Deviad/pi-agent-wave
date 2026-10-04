@@ -11,7 +11,7 @@ when the machine rebooted before the supervisor reached `op=collect`
 **Not a PRD.** This file is a work order, not a plan of record. Read it with `specification.md`
 (§5.1, §5.5, §5.6, §2.13) and `product.md`.
 
-**Status:** opened 2026-10-03 against `c096e4a`. Nothing implemented yet. Pre-implementation
+**Status:** opened 2026-10-03 against `c096e4a`. Issue 1 implemented 2026-10-04 on `main` after `76bf8c6` (see §3.5a and the checked criteria in §3.6); Issue 2 not started. Pre-implementation
 verification done the same day (§2a): the orphan is detected and recoverable with today's verbs, and
 the AgentFS question in §7 is answered — which changed the coding/operational design in §4.5.
 
@@ -180,18 +180,50 @@ Option (a).
   unix socket today — and far below `PATH_MAX` 1024. The package's own code uses `AF_INET` only
   (`scripts/stream_endpoint.py:72,98`).
 
+### 3.5a Verified before implementation, and the sweep it requires (2026-10-04)
+
+- **The grant wins inside an overlay base.** With real `agentfs v0.6.4`, a worker launched with
+  `--allow <run-dir>` wrote `worker-result.json` and `runtime-output/public-answer.txt` into its run
+  directory and both reached the host with nothing in the delta, in two cases: a home run whose run
+  directory lies inside the workspace's copy-on-write base (`$HOME/.local/share/delegate-graph/runs/…`),
+  and a repository run whose workspace is elsewhere. `collect` therefore keeps reading the result file
+  from the host in both.
+- **Refusal depends on location, not on `$HOME`.** The sandbox lets every write through to `/tmp` and
+  to `/var/folders/<user>/T/` (§7 question 5), so a test that proves a sibling write is refused must put
+  its graph home outside both — `os.tmpdir()` on macOS is under `/var/folders` and would prove
+  nothing. The tests use a temporary directory under `$HOME`.
+- **Assertions that would silently go vacuous are re-pointed.** `test/dispatch-git-precondition.test.ts`
+  and `test/dispatch-owned-path-precondition.test.ts` prove "no run directory was created" by listing
+  `/tmp`, and `scripts/production-audit.ts:readCleanup` looks for leaked production run directories
+  only in `/private/tmp`. After the move all three would pass whatever happened. They now look in the
+  run root (the audit in both places, since `/tmp` stays the legacy root for one release).
+- **Not moved:** `lib/agent-paths.mjs:SCRATCH_ROOT` is short-lived scratch (staging copies, the
+  initializer), not a run directory, and stays `/tmp`; its comment no longer claims to mirror the
+  launcher's run root.
+- **The graph home is a sibling, not a parent, of the grant.** A home run's workspace contains the
+  graph home, but its writes there land in the overlay and staging drops them (home-mode work order),
+  so the live store is never placed over.
+
 ### 3.6 Acceptance criteria
 
-- [ ] `init` creates the run directory under `<graph home>/runs/` and never under `/tmp`.
+- [x] `init` creates the run directory under `<graph home>/runs/` and never under `/tmp`.
   Proof: a focused test with a temporary `DELEGATE_GRAPH_DB` asserting the created path's parent and
   its 700 mode, red before the change.
-- [ ] The Python launcher's default graph-home resolution equals `store.ts:DEFAULT_DB_PATH`.
+  Evidence: `test/durable-run-root.test.ts` "init creates the run directory under <graph home>/runs with
+  private modes, never under /tmp", red before (the old launcher made the directory in `/tmp`, so
+  `<graph home>/runs` did not exist: `ENOENT … lstat '…/graph'`) and green after; run and root both 0700.
+- [x] The Python launcher's default graph-home resolution equals `store.ts:DEFAULT_DB_PATH`.
   Proof: a test that reads both and asserts equality, in the style of the `agent_for_model` triple
   pin; it must fail if either default is edited alone.
-- [ ] A run directory created by the previous version under `/tmp` is still accepted by
+  Evidence: "the launcher's default graph database is the store's DEFAULT_DB_PATH, and the run root sits
+  beside it" compares `delegate_core.graph_db_path()` (with `DELEGATE_GRAPH_DB` unset) against
+  `DEFAULT_DB_PATH`, and `run_root()` against both; red before (`no attribute 'graph_db_path'`).
+- [x] A run directory created by the previous version under `/tmp` is still accepted by
   `require_run_dir`, and one outside both roots is refused.
   Proof: a test exercising all three cases (new root accepted, `/tmp` accepted, other refused).
-- [ ] A worker cannot write the graph database, `runtime-content/`, `evidence/` or `failures/`
+  Evidence: "require_run_dir accepts the run root and, for one release, /tmp; it refuses anything else",
+  red before (the run-root case was refused) and green after.
+- [x] A worker cannot write the graph database, `runtime-content/`, `evidence/` or `failures/`
   through its AgentFS grant, nor another attempt's run directory.
   Proof: a test that resolves the launcher's `--allow` argument and asserts none of those paths lies
   under it, plus a live AgentFS check that a write to the database path and to a sibling run
@@ -199,14 +231,46 @@ Option (a).
   rather than weakening the test. **Reads cannot be denied** with AgentFS 0.6.4 (§7 question 5): a
   sandboxed worker reads the whole host, so this criterion is about writes only. The original wording
   asked for a refused read; that was unachievable and is withdrawn, not satisfied.
+  Evidence: "the launcher grants exactly its run directory, which contains none of the store's paths"
+  (parses the real `launch-acpx.sh` from `prepare_acpx_attempt`: one `--allow`, equal to the run
+  directory) and, with real `agentfs`, "inside the sandbox the store, its evidence and a sibling run
+  directory refuse writes; the own run directory accepts them" (graph home under `$HOME`, §3.5a). Both
+  pin properties of the new location rather than new code, so they passed before the change too.
 - [ ] An attempt's stream and answer sink survive the death of the worker, the transport and the
   supervisor. Proof: launch an attempt, kill the worker process group, and assert
   `runtime-output/public-answer.txt` and `worker.stdout.ndjson` are still present and non-empty.
-- [ ] `prune` still reclaims run directories in the new location.
+  Not checked: what holds and what is missing. "what a worker wrote into its run directory survives the
+  worker being killed" runs a real `agentfs run` with the launcher's flags and a run directory under
+  the run root, SIGKILLs it, and finds `runtime-output/public-answer.txt` and `worker.stdout.ndjson`
+  intact. The process inside the sandbox is a shell standing in for `acpx-worker.ts`; no real attempt
+  (ACPX worker, model) was launched, which the criterion's wording asks for. Finding on the way: a
+  SIGKILL of the `agentfs run` process group does not reach the sandboxed command, which AgentFS runs
+  outside that group (an orphaned `sleep 300` survived until killed by name); cancellation already
+  goes through `acpx-cancel.ts`, but Issue 2 must not assume a group kill ends a worker.
+- [x] `prune` still reclaims run directories in the new location.
   Proof: a test that prunes a terminal run and asserts its run directory under `<graph home>/runs/`
   is gone, alongside its `evidence/` and `failures/` entries.
-- [ ] `specification.md` §5.1, §2.13 and §7 describe the new location; `extensions/pi-agent-wave/README.md`
+  Evidence: "prune reclaims a run directory under the run root" (location-independent resolution through
+  the cancel script; passed before and after, as expected).
+- [x] `specification.md` §5.1, §2.13 and §7 describe the new location; `extensions/pi-agent-wave/README.md`
   states where run directories live and that `prune` is what reclaims them.
+  Evidence: spec §5.1 (`run_root`, `LEGACY_RUN_ROOT`), §2.13, §5.3 and §7 rewritten from "recorded, not
+  yet implemented" to the implemented behaviour; the package README storage table, the root README,
+  `product.md` and `AGENTS.md` name `<graph home>/runs/`.
+
+
+Gate for Issue 1 (2026-10-04, uncommitted tree on `76bf8c6`): `node --experimental-strip-types --test
+extensions/pi-agent-wave/test/*.test.ts` exit 0, 639 tests, 628 pass, 0 fail, 11 skipped (opt-in);
+`npm run typecheck` exit 0; `git diff --check` clean; the live store's sha256 unchanged; the suite left
+no run directory in the real graph home, none in `/tmp`, no scratch in `$HOME` and no mount. Logs:
+`agent-output/durable-run-root-20261004/`. Sweep done on the way: `test/acpx-cleanup.test.ts`, `test/commands.test.ts` and
+`test/support/acpx-cleanup-driver.py` initialized runs without setting `DELEGATE_GRAPH_DB` (against the
+rule in `AGENTS.md`) and so created `runs/` in the real graph home once the root moved; they now use
+temporary graph homes, the driver's outside its credential root so its leak check keeps its meaning.
+`test/support/runtime-result-probe.py` used `TMP_ROOT` as a scratch root; it now uses `SCRATCH_ROOT`,
+which mirrors `lib/agent-paths.mjs` again. Bun package checks not run: Bun is not installed on this host.
+Observed, not changed: `test/stream-endpoint.test.ts` leaves an orphaned `sleep 300` from its stub
+`herdr`.
 
 ## 4. Issue 2 — `collect` can only settle from a worker result the worker never wrote
 

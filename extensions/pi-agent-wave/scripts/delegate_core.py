@@ -35,7 +35,12 @@ HEADLESS_SUPERVISOR = SCRIPT_DIR / "headless_supervisor.py"
 ACPX_CANCEL = SCRIPT_DIR / "acpx-cancel.ts"
 ACPX_PLAN = SCRIPT_DIR / "acpx-plan.ts"
 NODE = shutil.which("node") or "node"
-TMP_ROOT = Path("/tmp").resolve()
+# Short-lived scratch that must not follow an inherited TMPDIR (a launcher-supplied TMPDIR can be reclaimed
+# mid-run). Mirrors SCRATCH_ROOT in lib/agent-paths.mjs; the two must stay identical. Not for run directories.
+SCRATCH_ROOT = Path("/tmp").resolve()
+# Run directories created before the run root moved under the graph home; require_run_dir accepts them
+# for one release so a run started by the previous version can still be collected.
+LEGACY_RUN_ROOT = SCRATCH_ROOT
 RUN_PREFIX = "delegate-graph-herdr-"
 WAIT_TIMEOUT_MS = os.environ.get("PI_DELEGATE_WAIT_TIMEOUT_MS", "3600000")
 # How often a Herdr wait asks `herdr agent get` whether the worker still exists; the attempt directory is checked every tick.
@@ -136,9 +141,20 @@ def slugify(value: str) -> str:
     return slug or "worker"
 
 
+def graph_db_path() -> Path:
+    """The graph database, resolved like store.ts: DELEGATE_GRAPH_DB, else DEFAULT_DB_PATH under $HOME."""
+    override = os.environ.get("DELEGATE_GRAPH_DB", "").strip()
+    return Path(override) if override else Path.home() / ".local" / "share" / "delegate-graph" / "delegate-graph.db"
+
+
+def run_root() -> Path:
+    """Private run directories live beside the graph database, durable across reboots, reclaimed by prune."""
+    return graph_db_path().parent / "runs"
+
+
 def require_run_dir(raw_path: str) -> Path:
     run_dir = Path(raw_path).resolve()
-    if run_dir.parent != TMP_ROOT or not run_dir.name.startswith(RUN_PREFIX):
+    if run_dir.parent not in (run_root().resolve(), LEGACY_RUN_ROOT) or not run_dir.name.startswith(RUN_PREFIX):
         raise DelegateError(f"invalid Herdr delegate run directory: {run_dir}")
     if not run_dir.is_dir() or not (run_dir / "state.json").is_file():
         raise DelegateError(f"incomplete Herdr delegate run directory: {run_dir}")
@@ -248,7 +264,10 @@ def command_init(args: argparse.Namespace) -> None:
     else:
         require_worker_runtime()
     slug = slugify(args.run_label)
-    run_dir = Path(tempfile.mkdtemp(prefix=f"{RUN_PREFIX}{slug}.", dir=TMP_ROOT))
+    root = run_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    run_dir = Path(tempfile.mkdtemp(prefix=f"{RUN_PREFIX}{slug}.", dir=root))
     run_dir.chmod(0o700)
     write_state(
         run_dir,

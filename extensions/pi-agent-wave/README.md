@@ -199,7 +199,7 @@ Where the package writes:
 | `~/.local/share/delegate-graph/runtime-content/` | Content-addressed retained answers, staged files and manifests | With the run |
 | `~/.local/share/delegate-graph/failures/<runId>/` | `unlaunched-<operationId>.json` diagnostics for operations that were never dispatched | Until `/graph prune` reclaims it with the run |
 | `~/.local/share/delegate-graph/evidence/<runId>/` | The records `collect` retains before removing the run directory: settlement evidence, cleanup evidence, the capture stream, and a failure bundle found during collection | Until `/graph prune` reclaims it with the run; the reported paths resolve while the run exists |
-| `/tmp/delegate-graph-herdr-<run>-<operation>.*/` | The operation's transient working directory: task, prompt, worker configuration, ACPX and AgentFS homes, capture files, settlement and cleanup records, materialized run evidence | Removed when the operation settles; `/graph prune` also reclaims the directory of a run whose operation never got that far |
+| `runs/delegate-graph-herdr-<run>-<operation>.*/` beside the database | The operation's private working directory, durable across reboots (one left in `/tmp` by an earlier version is still collected and reclaimed): task, prompt, worker configuration, ACPX and AgentFS homes, capture files, settlement and cleanup records, materialized run evidence | Removed when the operation settles; `/graph prune` also reclaims the directory of a run whose operation never got that far |
 | `<workspace>` | Files placed by `integrate` through the journal, and nothing else | Yours |
 | `/tmp/pi-wave-staging-<pid>-*/` | Settlement's scratch copy of an AgentFS snapshot while staging | Seconds; removed on every exit path |
 

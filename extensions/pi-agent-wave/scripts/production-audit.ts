@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { DEFAULT_DB_PATH } from "../store.ts";
 
 export interface AuditCommand {
 	name: string;
@@ -256,7 +257,10 @@ export function countAgentFsProcesses(processList: string): number {
 export function readCleanup(): CleanupSnapshot {
 	const ps = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
 	const agentFsProcesses = countAgentFsProcesses(`${ps.stdout ?? ""}`);
-	const temporaryDirectories = readdirSync("/private/tmp").filter((name) => PRODUCTION_TEMPORARY.test(name));
+	// Run directories live under the run root beside the graph database (scripts/delegate_core.py:run_root);
+	// /private/tmp is still read for scratch and for run directories made before the move.
+	const runRoot = join(dirname(process.env.DELEGATE_GRAPH_DB ?? DEFAULT_DB_PATH), "runs");
+	const temporaryDirectories = [...readdirSync("/private/tmp"), ...(existsSync(runRoot) ? readdirSync(runRoot) : [])].filter((name) => PRODUCTION_TEMPORARY.test(name));
 	const tabList = spawnSync("herdr", ["tab", "list", "--workspace", process.env.HERDR_WORKSPACE_ID ?? ""], { encoding: "utf8" });
 	let leakedTabs: string[] = [];
 	try {

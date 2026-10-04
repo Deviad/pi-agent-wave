@@ -117,6 +117,19 @@ describe("production host audit bundle", () => {
 		assert.ok(Array.isArray(cleanup.leakedTabs) && Array.isArray(cleanup.temporaryDirectories) && typeof cleanup.tokenFilePresent === "boolean");
 	});
 
+	test("a leaked production run directory under the run root is reported, not only one under /private/tmp", () => {
+		const graphHome = mkdtempSync(join(tmpdir(), "production-audit-run-root-"));
+		directories.push(graphHome);
+		mkdirSync(join(graphHome, "runs", "delegate-graph-herdr-production-acpx-leak.abc"), { recursive: true });
+		const saved = process.env.DELEGATE_GRAPH_DB;
+		process.env.DELEGATE_GRAPH_DB = join(graphHome, "graph.db");
+		try {
+			assert.ok(readCleanup().temporaryDirectories.includes("delegate-graph-herdr-production-acpx-leak.abc"));
+		} finally {
+			if (saved === undefined) delete process.env.DELEGATE_GRAPH_DB; else process.env.DELEGATE_GRAPH_DB = saved;
+		}
+	});
+
 	test("fails closed when any command fails", () => {
 		const directory = mkdtempSync(join(tmpdir(), "production-audit-fail-"));
 		directories.push(directory);

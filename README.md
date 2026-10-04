@@ -124,7 +124,7 @@ Retention comes first, so nothing after it can cost the work: the answer and the
 | `~/.local/share/delegate-graph/delegate-graph.db` | runs, graphs, agents, operations, events, runtime attempts and decisions, and the `ledger_*` story record | until `/graph prune`; the `ledger_*` rows are never pruned |
 | `runtime-content/` beside the database | content-addressed copies of retained answers and audited changes | not reclaimed by `/graph prune` |
 | `evidence/<runId>/`, `failures/<runId>/` | one run's settlement and cleanup evidence, diagnostics, capture stream and failure bundles | reclaimed by `/graph prune` with the run |
-| `/tmp/delegate-graph-…-<run>-<operation>.*` | one operation's private run directory | removed as soon as that operation settles |
+| `runs/delegate-graph-…-<run>-<operation>.*` beside the database | one operation's private run directory, durable across reboots | removed as soon as that operation settles; `/graph prune` reclaims any left behind |
 
 `DELEGATE_GRAPH_DB` moves the database and everything beside it; `PI_CODING_AGENT_DIR`, `PI_MODEL_ROUTING` and `PI_MODEL_CATALOG` relocate the Pi-side configuration the package reads. Every attempt's private directory and every retained file is created mode 600 under an owned directory, and a run that reaches a terminal state is the unit `/graph prune` reclaims.
 

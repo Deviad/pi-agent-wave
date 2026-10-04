@@ -35,7 +35,9 @@ export function resolveFzfPath(agentDir) {
 /**
  * Root for short-lived scratch that must outlive the caller's environment. Deliberately not os.tmpdir():
  * a launcher-supplied TMPDIR can be reclaimed while a delegate run is still in flight, which lost a
- * settlement on 2026-09-16. Mirrors TMP_ROOT in scripts/delegate_core.py; the two must stay identical.
+ * settlement on 2026-09-16. Mirrors SCRATCH_ROOT in scripts/delegate_core.py; the two must stay identical.
+ * Scratch only: run directories live under the graph home (scripts/delegate_core.py:run_root), because
+ * /tmp does not survive a reboot.
  */
 export const SCRATCH_ROOT = "/tmp";
 

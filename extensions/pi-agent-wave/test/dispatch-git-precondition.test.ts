@@ -1,8 +1,8 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GraphStore } from "../store.ts";
@@ -69,8 +69,10 @@ async function implementOperation(tool: Record<string, any>, root: string): Prom
 	} finally { store.close(); }
 }
 
+/** Run directories under the run root beside this test's graph database (scripts/delegate_core.py:run_root). */
 function privateRunDirs(): string[] {
-	return readdirSync("/tmp").filter((name) => name.startsWith("delegate-graph-herdr-"));
+	const runRoot = join(dirname(process.env.DELEGATE_GRAPH_DB!), "runs");
+	return existsSync(runRoot) ? readdirSync(runRoot).filter((name) => name.startsWith("delegate-graph-herdr-")) : [];
 }
 
 describe("coding dispatch requires a Git working directory", () => {

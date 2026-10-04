@@ -1,6 +1,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // Resolved from this file, not the working directory: the same suite must fail the same way whether
@@ -237,7 +239,9 @@ print(json.dumps({'settled': settled, 'bounded': bounded, 'herdr': herdr}))
 
 	test("cleanup is idempotent for an owned empty run", () => {
 		const script = new URL("../scripts/herdr_delegate.py", import.meta.url).pathname;
-		const env = { ...process.env, HERDR_ENV: "1", HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID ?? "workspace", HERDR_TAB_ID: process.env.HERDR_TAB_ID ?? "tab" };
+		// The run root follows the graph database, so a temporary one keeps the real graph home untouched.
+		const graphHome = mkdtempSync(join(tmpdir(), "cleanup-idempotent-"));
+		const env = { ...process.env, DELEGATE_GRAPH_DB: join(graphHome, "graph.db"), HERDR_ENV: "1", HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID ?? "workspace", HERDR_TAB_ID: process.env.HERDR_TAB_ID ?? "tab" };
 		const init = spawnSync("python3", [script, "init", "cleanup-idempotent"], { encoding: "utf8", env });
 		assert.equal(init.status, 0, init.stderr);
 		const runDir = init.stdout.trim();
@@ -248,6 +252,7 @@ print(json.dumps({'settled': settled, 'bounded': bounded, 'herdr': herdr}))
 			assert.equal(second.status, 0, second.stderr);
 		} finally {
 			rmSync(runDir, { recursive: true, force: true });
+			rmSync(graphHome, { recursive: true, force: true });
 		}
 	});
 });

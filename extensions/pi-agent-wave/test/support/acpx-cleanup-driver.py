@@ -184,6 +184,10 @@ def live_process_case() -> dict[str, object]:
     session = f"dg-live-{uuid.uuid4().hex[:10]}"
     env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
     root = Path(tempfile.mkdtemp(prefix="acpx-live-"))
+    # The run root follows the graph database; a private one keeps the real graph home untouched. It sits
+    # outside `root` so that a run-directory path in the output is never mistaken for a credential path.
+    graph_home = Path(tempfile.mkdtemp(prefix="acpx-live-graph-"))
+    env["DELEGATE_GRAPH_DB"] = str(graph_home / "graph.db")
     init = subprocess.run([sys.executable, str(CLI), "init", "live-process"], capture_output=True, text=True, env=env, cwd=str(root), check=False)
     if init.returncode != 0:
         return {"case": "live-process", "skipped": True, "reason": (init.stderr or init.stdout).strip()[:200]}
@@ -285,6 +289,7 @@ def live_process_case() -> dict[str, object]:
             except subprocess.TimeoutExpired:
                 pass
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(graph_home, ignore_errors=True)
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
@@ -303,6 +308,10 @@ def teardown_case(case: str) -> dict[str, object]:
     session = f"dg-probe-{uuid.uuid4().hex[:10]}"
     env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
     root = Path(tempfile.mkdtemp(prefix="acpx-teardown-"))
+    # The run root follows the graph database; a private one keeps the real graph home untouched. It sits
+    # outside `root` so that a run-directory path in the output is never mistaken for a credential path.
+    graph_home = Path(tempfile.mkdtemp(prefix="acpx-teardown-graph-"))
+    env["DELEGATE_GRAPH_DB"] = str(graph_home / "graph.db")
     init = subprocess.run([sys.executable, str(CLI), "init", f"teardown-{case}"], capture_output=True, text=True, env=env, cwd=str(root), check=False)
     if init.returncode != 0:
         return {"case": case, "skipped": True, "reason": (init.stderr or init.stdout).strip()[:200]}
@@ -388,6 +397,7 @@ def teardown_case(case: str) -> dict[str, object]:
         }
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(graph_home, ignore_errors=True)
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
