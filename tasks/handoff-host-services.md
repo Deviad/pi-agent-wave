@@ -115,8 +115,8 @@ Windows entry also needs a code change there); the job-hunter tests' own browser
 ## 4. Known assumptions
 
 - The environment reaches the worker's tools. `acpx-worker.ts` passes `process.env` to `acpx`, and `acpx`
-  (`buildAgentEnvironment`) passes its environment to the agent. Verified live for the Pi adapter (§5); for Codex
-  and Claude it is inferred, not verified.
+  (`buildAgentEnvironment`) passes its environment to the agent. Verified live for all three adapters: Pi (§5),
+  Codex and Claude (§6).
 - A worker inside `agentfs run` reaches host loopback: verified on macOS (`handoff-worker-browser-sandbox.md` §4,
   Decision). Linux and Windows are untested.
 - The free port is found by binding port 0 and closing it before the service binds it. Another process could take
@@ -186,3 +186,25 @@ Windows entry also needs a code change there); the job-hunter tests' own browser
   first-launch fix, pointing `worker_launcher` back at the wrapper fails the preparation case. Rerun after that
   fix, same counts: 678 tests, 667 passed, 0 failed, 11 skipped; typecheck and `git diff --check` clean. Bun
   package checks not run: `bun` is not installed on this host.
+
+## 6. Follow-up live checks (2026-10-04, after the merge at `5adc8c1`)
+
+- **Codex**, `openai-codex/gpt-5.6-luna`, research `thinker_split`, headless, the operator's real
+  `~/.pi/agent/host-services.jsonc`: `run_74f0fb3e-4bd2-413d-bf02-a07b102178bb`, `op_a2f24d45-e854-473a-a4fe-72827a2376e8`.
+  The worker read `BROWSER_CDP_URL` and returned `HeadlessChrome/134.0.6998.35` with `sandbox=macos-sandbox`.
+  Codex's own sandbox first refused `node` (`sandbox_apply: Operation not permitted`, the behaviour `AGENTS.md`
+  records), and Codex retried with host execution permission. Exit 0, settled, cleanup audit passed (closure
+  `files-and-processes-absent`). Post-settlement failures: `runtime configuration snapshot changed: config.toml`
+  and the provider-link check of the same file; Codex rewrote its attempt copy of `config.toml`, presumably
+  recording that approval (inferred; the attempt directory is gone, so the change cannot be read). The real
+  `~/.codex/config.toml` was not touched (last modified 2026-10-03). Whether this needs host services, or happens on
+  any Codex escalation, is not established. Unlike Claude's settings, Codex configuration self-writes are not
+  tolerated (`delegate_core.py` `copy_runtime_file(..., tolerate_self_writes=agent == "claude")`). Evidence:
+  `agent-output/live-host-service-browser-20261004/run3-codex/`.
+- **Claude**, `claude-code/claude-opus-5`, same setup, after the operator signed in again (the earlier Keychain token
+  had expired about 7 days before): `run_2d866b52-8f89-4fbd-acfb-51752867d8e8`, `op_b12c7cc1-edbd-43c9-9e9e-3300acff9541`,
+  about 34 s. The worker printed `cdp=http://127.0.0.1:57161` and `sandbox=macos-sandbox`, then returned
+  `HeadlessChrome/134.0.6998.35`. Exit 0, settled, `postSettlementFailures` empty, cleanup audit passed, one
+  tolerated Claude configuration self-write (`settings.json`). Token file refreshed from the Keychain item
+  `Claude Code-credentials` (mode 600, 480 minutes left at the time). Evidence:
+  `agent-output/live-host-service-browser-20261004/run4-claude/`.

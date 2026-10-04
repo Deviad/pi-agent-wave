@@ -10,8 +10,8 @@ directory that does not exist at the base revision. Home-workspace mode (`gitChe
 **Not a PRD.** This file is a work order. Read it with `specification.md` (integration and the runtime journal)
 and `tasks/handoff-settlement-and-integration-races.md`.
 
-**Status:** opened 2026-10-04; defect 3 explained and items 1–3 implemented the same day (§3 result, §4 decisions); the
-live criterion is open.
+**Status:** opened 2026-10-04; defect 3 explained and items 1–3 implemented the same day (§3 result, §4 decisions);
+every criterion is checked, the live one on merged `main` the same day.
 
 ## 1. Summary
 
@@ -159,11 +159,16 @@ sandbox.
 - [x] Item 4 is either implemented, with a case showing a hand-applied candidate adopted as `applied`, a changed
   file refused, and a different `HEAD` refused; or rejected, with the reason recorded in §4. Rejected; reason in
   §4 Decisions.
-- [ ] One live integration of a candidate that creates a directory, in a repository workspace, reaches `applied`.
-  Proof: the run and operation ids, and the journal row's state. Not run: it spends provider credit and needs
-  explicit authorization. Offline substitute, not a replacement: the real `ats-adapters-us006` manifest and blobs,
-  replayed through `RuntimeIntegration` against a scratch clone at `6e01f68` with no directory pre-created, reach
-  `applied` in one step.
+- [x] One live integration of a candidate that creates a directory, in a repository workspace, reaches `applied`.
+  Proof: the run and operation ids, and the journal row's state. Authorized 2026-10-04 and run on merged `main`
+  (`5adc8c1`): build graph `run_7b0cea2f-6c09-4e54-bc3a-42d3441c5857`, a real `thinker_plan` accepted with one slice
+  owning `docs/notes`, then implement `op_5a9bc175-7e61-4c59-bb6e-120b66d67da6` on `alibaba/qwen3.8-flash`, headless,
+  temporary graph home and repository. Before integration `docs/` did not exist and `HEAD` equalled the base;
+  `op=integrate` returned integration `f9f7c755…` in state `applied` with `newDirectories` `["docs/notes/new-dir",
+  "docs/notes", "docs"]`, and `docs/notes/new-dir/hello.md` reads `hello from a new directory`. Evidence:
+  `agent-output/live-integration-new-directories-20261004/` (`integration-row.json`, `drive.out`). Finding outside
+  this order: the candidate also carried two macOS AppleDouble files (`docs/notes/._new-dir`,
+  `docs/notes/new-dir/._hello.md`, 4096 bytes each), which were placed; see `tasks/handoff-repository-sidecars.md`.
 - [x] `specification.md` (integration), `extensions/pi-agent-wave/README.md` and `AGENTS.md` describe new-directory
   integration and its rollback. Proof: spec §5.9 bullets and `advance` paragraph, README "Decisions" and "Home
   runs", AGENTS.md "Result contracts".
