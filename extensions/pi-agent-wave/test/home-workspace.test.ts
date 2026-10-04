@@ -97,7 +97,7 @@ describe("placement without Git checks", () => {
 		} finally { journal.close(); }
 	});
 
-	test("with Git checks both refusals stand", () => {
+	test("with Git checks a new directory is allowed and the nested-repository refusal stands", () => {
 		const root = scratch("home-placement-git-");
 		const workspace = join(root, "repo");
 		mkdirSync(workspace);
@@ -116,7 +116,8 @@ describe("placement without Git checks", () => {
 		const journal = new RuntimeIntegration(dbPath);
 		try {
 			const after = content.retain(Buffer.from("y"));
-			assert.throws(() => journal.prepare({ workspace, baseRevision, candidateId: "git-new-dir", ownedPaths: ["src"], changes: [{ path: "src/new/file.ts", after, mode: 0o644 }] }), /existing real directory|ENOENT/);
+			const newDir = journal.prepare({ workspace, baseRevision, candidateId: "git-new-dir", ownedPaths: ["src"], changes: [{ path: "src/new/file.ts", after, mode: 0o644 }] });
+			assert.equal(journal.rollback(newDir.id).state, "rolled_back");
 			assert.throws(() => journal.prepare({ workspace, baseRevision, candidateId: "git-nested", ownedPaths: ["vendor"], changes: [{ path: "vendor/lib/x.txt", after, mode: 0o644 }] }), /nested repository/);
 			const applied = journal.prepare({ workspace, baseRevision, candidateId: "git-applied", ownedPaths: ["a.txt"], changes: [{ path: "a.txt", after, mode: 0o644 }] });
 			assert.equal(journal.apply(applied.id).state, "applied");
