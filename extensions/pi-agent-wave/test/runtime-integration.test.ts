@@ -91,15 +91,86 @@ test("result digest reconciles a filesystem change made before its journal ackno
 	} finally { journal.close(); }
 });
 
-test("ownership, symlink, internal Git and missing-parent paths fail during preparation", () => {
+test("ownership, symlink and internal Git paths fail during preparation", () => {
 	const { workspace, root, content, journal } = fixture();
 	try {
 		writeFileSync(join(root, "outside"), "outside"); symlinkSync(join(root, "outside"), join(workspace, "link"));
-		for (const path of ["../outside", ".git/config", "link", "missing/new.txt", "b.txt"]) {
-			assert.throws(() => journal.prepare({ workspace, baseRevision: base(workspace), candidateId: path, ownedPaths: ["a.txt", "link", "missing", ".git"], changes: [{ path, after: content.retain(Buffer.from("replacement")), mode: 0o644 }] }));
+		for (const path of ["../outside", ".git/config", "link", "b.txt"]) {
+			assert.throws(() => journal.prepare({ workspace, baseRevision: base(workspace), candidateId: path, ownedPaths: ["a.txt", "link", ".git"], changes: [{ path, after: content.retain(Buffer.from("replacement")), mode: 0o644 }] }));
 		}
 		assert.equal(readFileSync(join(root, "outside"), "utf8"), "outside");
-		assert.equal(existsSync(join(workspace, "missing")), false);
+	} finally { journal.close(); }
+});
+
+function tree(workspace: string): string {
+	return execFileSync("find", [".", "-path", "./.git", "-prune", "-o", "-print"], { cwd: workspace, encoding: "utf8" }).split("\n").filter(Boolean).sort().join("\n");
+}
+
+test("a candidate file in a new directory integrates with Git checks, and rollback removes the directories it created", () => {
+	const { workspace, content, journal } = fixture();
+	try {
+		mkdirSync(join(workspace, "keep"));
+		const before = tree(workspace);
+		const changes = [
+			{ path: "a/b/new.txt", after: content.retain(Buffer.from("new")), mode: 0o644 },
+			{ path: "a.txt", after: content.retain(Buffer.from("after-a")), mode: 0o644 },
+		];
+		const applied = journal.prepare({ workspace, baseRevision: base(workspace), candidateId: "new-dir", ownedPaths: ["a", "a.txt"], changes });
+		assert.equal(existsSync(join(workspace, "a")), false, "prepare writes nothing");
+		assert.equal(journal.apply(applied.id).state, "applied");
+		assert.equal(readFileSync(join(workspace, "a/b/new.txt"), "utf8"), "new");
+		assert.equal(readFileSync(join(workspace, "a.txt"), "utf8"), "after-a");
+
+		execFileSync("git", ["-C", workspace, "checkout", "-q", "--", "a.txt"]);
+		rmSync(join(workspace, "a"), { recursive: true });
+		const partial = journal.prepare({ workspace, baseRevision: base(workspace), candidateId: "new-dir-rollback", ownedPaths: ["a", "a.txt"], changes });
+		assert.equal(journal.advance(partial.id, "apply").state, "applying");
+		assert.equal(readFileSync(join(workspace, "a/b/new.txt"), "utf8"), "new");
+		assert.equal(journal.rollback(partial.id).state, "rolled_back");
+		assert.equal(tree(workspace), before, "the file and both created directories are gone; keep/ is untouched");
+	} finally { journal.close(); }
+});
+
+test("rollback keeps parent directories the operator created before preparation", () => {
+	const { workspace, content, journal } = fixture();
+	try {
+		mkdirSync(join(workspace, "a/b"), { recursive: true });
+		const prepared = journal.prepare({ workspace, baseRevision: base(workspace), candidateId: "pre-created", ownedPaths: ["a", "a.txt"], changes: [
+			{ path: "a/b/new.txt", after: content.retain(Buffer.from("new")), mode: 0o644 },
+			{ path: "a.txt", after: content.retain(Buffer.from("after-a")), mode: 0o644 },
+		] });
+		assert.equal(journal.advance(prepared.id, "apply").state, "applying");
+		assert.equal(journal.rollback(prepared.id).state, "rolled_back");
+		assert.equal(existsSync(join(workspace, "a/b/new.txt")), false);
+		assert.equal(existsSync(join(workspace, "a/b")), true, "directories that existed at preparation are never removed");
+	} finally { journal.close(); }
+});
+
+test("rollback keeps a created directory that gained other content", () => {
+	const { workspace, content, journal } = fixture();
+	try {
+		const prepared = journal.prepare({ workspace, baseRevision: base(workspace), candidateId: "gained", ownedPaths: ["a", "a.txt"], changes: [
+			{ path: "a/b/new.txt", after: content.retain(Buffer.from("new")), mode: 0o644 },
+			{ path: "a.txt", after: content.retain(Buffer.from("after-a")), mode: 0o644 },
+		] });
+		assert.equal(journal.advance(prepared.id, "apply").state, "applying");
+		writeFileSync(join(workspace, "a/operator.txt"), "mine");
+		assert.equal(journal.rollback(prepared.id).state, "rolled_back");
+		assert.equal(existsSync(join(workspace, "a/b")), false);
+		assert.equal(readFileSync(join(workspace, "a/operator.txt"), "utf8"), "mine");
+	} finally { journal.close(); }
+});
+
+test("a symlinked or nested-repository parent is refused with a message naming the entry", () => {
+	const { workspace, root, content, journal } = fixture();
+	try {
+		mkdirSync(join(root, "elsewhere")); symlinkSync(join(root, "elsewhere"), join(workspace, "linked"));
+		mkdirSync(join(workspace, "vendor/lib"), { recursive: true }); execFileSync("git", ["init", "-q", join(workspace, "vendor/lib")]);
+		const after = content.retain(Buffer.from("x"));
+		assert.throws(() => journal.prepare({ workspace, baseRevision: base(workspace), candidateId: "linked", ownedPaths: ["linked"], changes: [{ path: "linked/new/x.txt", after, mode: 0o644 }] }), /integration parent linked of linked\/new\/x\.txt is missing or not a real directory/);
+		assert.throws(() => journal.prepare({ workspace, baseRevision: base(workspace), candidateId: "nested", ownedPaths: ["vendor"], changes: [{ path: "vendor/lib/new/x.txt", after, mode: 0o644 }] }), /integration parent vendor\/lib of vendor\/lib\/new\/x\.txt is a submodule or nested repository/);
+		assert.equal(existsSync(join(root, "elsewhere/new")), false);
+		assert.equal(existsSync(join(workspace, "vendor/lib/new")), false);
 	} finally { journal.close(); }
 });
 

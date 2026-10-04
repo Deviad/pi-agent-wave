@@ -981,7 +981,13 @@ manifest-immutability trigger described in §1.4. `prepare` takes a `validate` c
   workspace; for operational placement (`gitChecks:false`) it skips the Git checks;
 - refuses non-relative, backslash/`\0`/`.git` paths, unowned paths (outside `ownedPaths`),
   overlapping entries, symlinks, hard links, nested repositories, files over 16 MiB, and a staging
-  root on a different filesystem;
+  root on a different filesystem; a refused parent is named with its entry
+  (`integration parent <dir> of <entry> is missing or not a real directory`, or `… is a submodule or
+  nested repository`);
+- treats a file under a missing parent as absent in both modes and records the entry parents absent at
+  `prepare` in the manifest as `newDirectories`, deepest first (omitted when empty, so earlier manifests
+  keep their digest). A directory the integration creates is new and empty, so it holds no nested
+  repository and nothing in Git's index; the refusals protect existing paths only;
 - reports a dirty preimage that an earlier `applied` integration in the same workspace wrote
   (`appliedHere`) as uncommitted output of that integration, naming the duty to commit the previous
   round's integrated files, rather than as a bare dirty-or-untracked refusal: the graph's rounds hand
@@ -994,18 +1000,22 @@ manifest-immutability trigger described in §1.4. `prepare` takes a `validate` c
 one transaction per step, verifies the base revision and every content reference, snapshots each
 path and requires it to equal either the preimage or the new image (otherwise
 `needs_reconciliation`), finds the first not-yet-applied (or not-yet-reverted) entry, replaces it
-via a private staging file and `renameSync`, and records `applying`. When every entry matches the
-target it records `applied` or `rolled_back`. `finish` loops `advance` until the state is no longer
+via a private staging file and `renameSync`, creating missing parents with `mkdirSync` first, and
+records `applying`. When every entry matches the target it records `applied` or `rolled_back`; before
+`rolled_back` it removes each `newDirectories` entry that is still empty, deepest first, keeps one that
+holds anything, and stops in `needs_reconciliation` if the path to one now crosses a symlink or a
+non-directory. A directory that existed at `prepare` is never removed. Supervisors must not issue a
+workspace mutation and the `integrate` that depends on it in one parallel tool batch: the integration
+may run first (`tasks/handoff-integration-new-directories.md` §3). `finish` loops `advance` until the state is no longer
 `applying`, so a lost acknowledgement converges. `store.ts:prepareIntegration`/`applyRuntimeIntegration`
 validate that the candidate settled, that it retains the manifest and every staged file, that the
 manifest matches the candidate's identity and base revision, that `realpath(workspace)` is
 unchanged, and that the operation is still current.
 
 **Placement without Git checks.** `gitChecks` is false for operational candidates and for coding
-candidates of a home run (`store.ts:prepareIntegration`). Such a placement treats a file under a missing
-parent as absent and creates the parents when it writes the file, and it does not refuse a path under a
-nested repository; with Git checks both refusals stand (`RuntimeIntegration.target`). Rollback of a
-created file removes the file and leaves created directories in place.
+candidates of a home run (`store.ts:prepareIntegration`). Such a placement creates missing parents and
+removes them on rollback exactly as above, and it does not refuse a path under a nested repository;
+with Git checks that refusal stands (`RuntimeIntegration.target`).
 
 **Undo of an applied placement.** `rollback` reverses only a `prepared` or `applying` integration.
 `RuntimeIntegration.undo` also reverses an `applied` one, only without Git checks and only while no

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Database } from "../sqlite.ts";
 import { RuntimeContentStore } from "./runtime-content.ts";
@@ -17,6 +17,11 @@ interface Manifest {
 	readonly entries: readonly Entry[];
 	/** False for operational candidates placed into a working directory that need not be a Git root. */
 	readonly gitChecks: boolean;
+	/**
+	 * Entry parents absent at `prepare`, deepest first: apply creates them, and rollback removes each one still
+	 * empty. Omitted when there are none, so manifests written before this field keep their digest.
+	 */
+	readonly newDirectories?: readonly string[];
 }
 type State = "prepared" | "applying" | "applied" | "rolled_back" | "needs_reconciliation";
 type Direction = "apply" | "rollback";
@@ -60,7 +65,9 @@ function parseManifest(raw: string): Manifest {
 	const value: unknown = JSON.parse(raw);
 	if (!object(value) || value.version !== 1 || !Array.isArray(value.entries) || !Array.isArray(value.ownedPaths)) throw new Error("invalid integration manifest");
 	if (value.gitChecks !== undefined && typeof value.gitChecks !== "boolean") throw new Error("invalid integration manifest");
+	if (value.newDirectories !== undefined && !Array.isArray(value.newDirectories)) throw new Error("invalid integration manifest");
 	return {
+		...(value.newDirectories === undefined ? {} : { newDirectories: value.newDirectories.map((path: unknown) => relativePath(text(path))) }),
 		version: 1, workspace: text(value.workspace), baseRevision: text(value.baseRevision), candidateId: text(value.candidateId),
 		gitChecks: value.gitChecks !== false,
 		ownedPaths: value.ownedPaths.map((path) => relativePath(text(path))),
@@ -74,6 +81,8 @@ function git(workspace: string, arg: string): string {
 	return execFileSync("git", ["-C", workspace, "rev-parse", arg], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 }).trim();
 }
 function absent(error: unknown): boolean { return error instanceof Error && "code" in error && error.code === "ENOENT"; }
+function notEmpty(error: unknown): boolean { return error instanceof Error && "code" in error && (error.code === "ENOTEMPTY" || error.code === "EEXIST"); }
+function depth(path: string): number { return path.split("/").length; }
 function syncDirectory(path: string): void {
 	const fd = openSync(path, constants.O_RDONLY);
 	try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -155,32 +164,70 @@ export class RuntimeIntegration {
 	}
 
 	/**
-	 * Resolves an entry's absolute target, refusing symlinked parents. With Git checks every parent must
-	 * already exist and none may hold a nested repository, because Git's index and submodules own those
-	 * paths. Placement without Git checks has neither concern: a missing parent means the file is absent
-	 * (null), and `createParents` makes the directories when a file is about to be written.
+	 * Resolves an entry's absolute target. Every existing parent must be a real directory and, with Git
+	 * checks, must not hold a nested repository or submodule. A missing parent means the file is absent
+	 * (null); `createParents` makes the missing directories when a file is about to be written. A directory
+	 * made here is new and empty, so it holds no nested repository and nothing in Git's index.
 	 */
 	private target(workspace: string, path: string, gitChecks: boolean, createParents = false): string | null {
 		relativePath(path);
 		const parts = path.split("/");
 		let parent = workspace;
-		for (const part of parts.slice(0, -1)) {
+		for (const [index, part] of parts.slice(0, -1).entries()) {
 			parent = join(parent, part);
+			const name = parts.slice(0, index + 1).join("/");
+			const refused = (cause?: unknown) => new Error(`integration parent ${name} of ${path} is missing or not a real directory`, { cause });
 			let stat;
 			try { stat = lstatSync(parent); }
 			catch (error) {
-				if (gitChecks || !absent(error)) throw error;
+				if (!absent(error)) throw refused(error);
 				if (!createParents) return null;
 				mkdirSync(parent);
 				syncDirectory(dirname(parent));
 				stat = lstatSync(parent);
 			}
-			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("integration parent must be an existing real directory");
+			if (!stat.isDirectory() || stat.isSymbolicLink()) throw refused();
 			if (!gitChecks) continue;
-			try { lstatSync(join(parent, ".git")); throw new Error("submodule or nested repository path is unsupported"); }
-			catch (error) { if (!absent(error)) throw error; }
+			try { lstatSync(join(parent, ".git")); }
+			catch (error) { if (absent(error)) continue; throw error; }
+			throw new Error(`integration parent ${name} of ${path} is a submodule or nested repository, which is unsupported`);
 		}
 		return join(workspace, ...parts);
+	}
+
+	/** The parents of `path` that do not exist in the workspace, shallowest first. */
+	private absentParents(workspace: string, path: string): string[] {
+		const parts = path.split("/").slice(0, -1);
+		for (let index = 0; index < parts.length; index++) {
+			try { lstatSync(join(workspace, ...parts.slice(0, index + 1))); }
+			catch (error) {
+				if (!absent(error)) throw error;
+				return parts.slice(index).map((_, offset) => parts.slice(0, index + offset + 1).join("/"));
+			}
+		}
+		return [];
+	}
+
+	/**
+	 * Removes the directories this integration's apply created, deepest first. A directory that holds
+	 * anything is kept; one whose path now crosses a symlink or a non-directory stops the rollback.
+	 */
+	private removeNewDirectories(manifest: Manifest): void {
+		for (const directory of manifest.newDirectories ?? []) {
+			const parts = directory.split("/");
+			let missing = false;
+			for (let index = 0; index < parts.length && !missing; index++) {
+				const component = parts.slice(0, index + 1).join("/");
+				let stat;
+				try { stat = lstatSync(join(manifest.workspace, component)); }
+				catch (error) { if (!absent(error)) throw error; missing = true; continue; }
+				if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`integration rollback cannot remove ${directory}: ${component} is not a real directory`);
+			}
+			if (missing) continue;
+			const path = join(manifest.workspace, directory);
+			try { rmdirSync(path); syncDirectory(dirname(path)); }
+			catch (error) { if (!absent(error) && !notEmpty(error)) throw error; }
+		}
 	}
 
 	private snapshot(workspace: string, path: string, retain: boolean, gitChecks: boolean): FileImage | null {
@@ -225,6 +272,7 @@ export class RuntimeIntegration {
 			const active = this.db.query("SELECT id FROM runtime_integrations WHERE workspace=? AND state IN ('prepared','applying','needs_reconciliation')").get(workspace);
 			if (active) throw new Error("workspace has an active integration");
 			const seen: string[] = [];
+			const newDirectories = new Set<string>();
 			const entries = input.changes.map((change): Entry => {
 				const path = relativePath(change.path);
 				if (!ownedPaths.some((owned) => path === owned || path.startsWith(`${owned}/`))) throw new Error("unowned integration path");
@@ -244,10 +292,15 @@ export class RuntimeIntegration {
 					}
 				}
 				const after = change.after === null ? null : { content: parseRuntimeContent(change.after), mode: mode(change.mode) };
-				if (after) { if (after.content.bytes > 16 * 1024 * 1024) throw new Error("integration file exceeds 16 MiB limit"); this.content.verify(after.content); }
+				if (after) {
+					if (after.content.bytes > 16 * 1024 * 1024) throw new Error("integration file exceeds 16 MiB limit");
+					this.content.verify(after.content);
+					for (const directory of this.absentParents(workspace, path)) newDirectories.add(directory);
+				}
 				return { path, before, after };
 			});
-			const manifest: Manifest = { version: 1, workspace, baseRevision: input.baseRevision, candidateId: text(input.candidateId), ownedPaths, entries, gitChecks };
+			const created = [...newDirectories].sort((a, b) => depth(b) - depth(a) || (a < b ? -1 : a > b ? 1 : 0));
+			const manifest: Manifest = { version: 1, workspace, baseRevision: input.baseRevision, candidateId: text(input.candidateId), ownedPaths, entries, gitChecks, ...(created.length ? { newDirectories: created } : {}) };
 			const id = runtimeDigest(manifest);
 			// The override is not part of the manifest: it records how this integration came to be prepared, not
 			// what it does, so it must not change the digest two identical candidates share.
@@ -328,6 +381,7 @@ export class RuntimeIntegration {
 				});
 				const index = manifest.entries.findIndex((entry, index) => canonical(observed[index]) !== canonical(direction === "apply" ? entry.after : entry.before));
 				if (index === -1) {
+					if (direction === "rollback") this.removeNewDirectories(manifest);
 					this.db.query("UPDATE runtime_integrations SET state=?,direction=?,error=NULL WHERE id=?").run(direction === "apply" ? "applied" : "rolled_back", direction, id);
 				} else {
 					const entry = manifest.entries[index];
