@@ -961,6 +961,11 @@ run that must report `closed` and `noSession`, followed by `verify_provider_link
 for file type, mode and (for exact snapshots) byte hash or key set; Claude's two configuration
 files (`~/.claude.json` and `.claude/settings.json`) are under the self-write rule: they must remain
 a mode-600 JSON object, and any change is recorded in `configuration_self_writes`, never refused.
+Codex's `config.toml` is a `selfWrites: codex-trust` snapshot (`copy_runtime_file(..., codex_trust_root=<attempt>)`,
+which also writes `<attempt>/config.toml.pristine`): when its bytes changed, `codex_trust_additions` parses both
+with `tomllib` and accepts only added `projects` entries naming directories inside the attempt, the trust entry
+Codex writes for each new working directory; everything outside `projects` must be equal and every existing
+entry unchanged. Accepted entries are recorded in `configuration_self_writes` as `addedKeys`.
 Every other snapshot keeps exact bytes. A failure in this close/verify block is appended to
 `postSettlementFailures`; the candidate is not discarded.
 
@@ -1275,7 +1280,7 @@ The test tree (top-level `test/*.test.ts`) covers, by area:
   `acpx-collect-convergence.test.ts`, `delegate-script-rehearsal.test.ts`,
   `worker-transport.test.ts`, `headless-pi-stdio.test.ts`.
 - **Credential and configuration:** `credential-preflight.test.ts`,
-  `provider-credential-snapshot.test.ts`, `provider-runtime-config.test.ts`,
+  `provider-credential-snapshot.test.ts`, `provider-runtime-config.test.ts`, `codex-trust-selfwrite.test.ts`,
   `approval-block-routing.test.ts`, `owned-path-normalization.test.ts`, `agentfs-sandbox.test.ts`,
   `claude-code-auth.test.ts`, `acpx-permissions.test.ts`, `acpx-routing.test.ts`,
   `acpx-requirement.test.ts`, `agentfs-requirement.test.ts`, `herdr-requirement.test.ts`,

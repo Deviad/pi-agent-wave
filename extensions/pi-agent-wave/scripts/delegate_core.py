@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -744,12 +745,15 @@ def copy_credential_file(source: Path, destination: Path) -> dict[str, str]:
     return materialize_credential_file(destination, source.read_text(encoding="utf-8"))
 
 
-def copy_runtime_file(source: Path, destination: Path, *, mutable_catalog: bool = False, tolerate_self_writes: bool = False) -> dict[str, str]:
+def copy_runtime_file(source: Path, destination: Path, *, mutable_catalog: bool = False, tolerate_self_writes: bool = False, codex_trust_root: Path | None = None) -> dict[str, str]:
     """Copy private runtime data; only a provider catalog may refresh its contents.
 
     A snapshot marked ``selfWrites: tolerated`` (Claude's own JSON configuration, 2026-09-12 decision) may be
     rewritten by the agent inside the attempt: it must stay a private regular JSON object, and every change is
-    recorded rather than refused. All other snapshots keep exact bytes.
+    recorded rather than refused. A snapshot marked ``selfWrites: codex-trust`` (Codex's config.toml, 2026-10-04
+    decision) may gain project-trust entries for directories under ``codex_trust_root`` and nothing else; its
+    pristine bytes are kept beside the attempt, outside the agent's home, for that comparison. All other
+    snapshots keep exact bytes.
     """
     data = source.read_bytes()
     write_private_bytes(destination, data)
@@ -767,7 +771,40 @@ def copy_runtime_file(source: Path, destination: Path, *, mutable_catalog: bool 
             key_set = "unparseable"
         record["selfWrites"] = "tolerated"
         record["keySet"] = key_set
+    if codex_trust_root is not None:
+        pristine = codex_trust_root / f"{destination.name}.pristine"
+        write_private_bytes(pristine, data)
+        record["selfWrites"] = "codex-trust"
+        record["trustRoot"] = str(codex_trust_root)
+        record["pristine"] = str(pristine)
     return record
+
+
+def codex_trust_additions(original: str, observed: str, trust_root: str) -> list[str]:
+    """The project-trust entries Codex added for directories inside ``trust_root``.
+
+    Codex records `[projects."<cwd>"]` in its config.toml for each new working directory, and every attempt runs
+    in a fresh AgentFS mount. Raises DelegateError for any other difference: a file that no longer parses, a change
+    outside `projects`, a changed or removed existing entry, or an entry for a directory outside the attempt.
+    """
+    try:
+        before = tomllib.loads(original)
+        after = tomllib.loads(observed)
+    except tomllib.TOMLDecodeError as error:
+        raise DelegateError(f"changed and is no longer valid TOML ({error})") from error
+    before_projects = before.pop("projects", {})
+    after_projects = after.pop("projects", {})
+    if before != after or not isinstance(before_projects, dict) or not isinstance(after_projects, dict):
+        raise DelegateError("changed outside its project trust entries")
+    if any(after_projects.get(path) != entry for path, entry in before_projects.items()):
+        raise DelegateError("changed an existing project entry")
+    root = os.path.realpath(trust_root)
+    added = sorted(path for path in after_projects if path not in before_projects)
+    for path in added:
+        resolved = os.path.realpath(path)
+        if resolved != root and not resolved.startswith(root + os.sep):
+            raise DelegateError(f"trusts a directory outside the attempt: {path}")
+    return added
 
 
 def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: Path, selected_model: str = "", command_runner: Any = run, thinking: str | None = None) -> tuple[dict[str, str], list[dict[str, str]]]:
@@ -808,7 +845,12 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
     }
     for source, destination in configuration[agent]:
         if source.exists():
-            links.append(copy_runtime_file(source, destination, mutable_catalog=agent == "pi" and destination.name == "models-store.json", tolerate_self_writes=agent == "claude"))
+            links.append(copy_runtime_file(
+                source, destination,
+                mutable_catalog=agent == "pi" and destination.name == "models-store.json",
+                tolerate_self_writes=agent == "claude",
+                codex_trust_root=attempt_dir if agent == "codex" and destination.name == "config.toml" else None,
+            ))
     claude_token_source = os.environ.get("PI_CLAUDE_OAUTH_TOKEN_FILE") if agent == "claude" else None
     claude_token_link: Path | None = None
     if claude_token_source:
@@ -1486,6 +1528,25 @@ def verify_provider_links(resource: dict[str, Any]) -> bool:
             if item["kind"] == "snapshot":
                 data = link.read_bytes()
                 observed_sha = hashlib.sha256(data).hexdigest()
+                if item.get("selfWrites") == "codex-trust":
+                    if observed_sha == item["sha256"]:
+                        continue
+                    try:
+                        pristine = Path(str(item["pristine"])).read_text(encoding="utf-8")
+                        added = codex_trust_additions(pristine, data.decode("utf-8"), str(item["trustRoot"]))
+                    except (OSError, UnicodeDecodeError) as error:
+                        raise DelegateError(f"{label} changed and cannot be compared: {link} ({type(error).__name__})") from error
+                    except DelegateError as error:
+                        raise DelegateError(f"{label} {error}: {link}") from error
+                    resource.setdefault("configuration_self_writes", {})[link.name] = {
+                        "name": link.name,
+                        "addedKeys": [f'projects."{path}"' for path in added],
+                        "removedKeys": [],
+                        "contentChanged": True,
+                        "expectedSha256": item["sha256"],
+                        "observedSha256": observed_sha,
+                    }
+                    continue
                 if item.get("selfWrites") != "tolerated":
                     if observed_sha != item["sha256"]:
                         raise DelegateError(f"{label} changed: {link}")
