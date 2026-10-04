@@ -66,7 +66,7 @@ failure.
   shows a Codex attempt's `config.toml` as `codex-trust` and Claude's `settings.json` still `tolerated`. Dropping the
   Codex wiring fails it.
 - [x] `AGENTS.md` (the self-write invariant), `specification.md` and the README describe the Codex tolerance.
-  Evidence: `AGENTS.md` and `product.md` self-write entries, spec §5.6 (`verify_provider_links` paragraph) and test
+  Evidence: `AGENTS.md` and `product.md` self-write entries, spec §5.7 (`verify_provider_links` paragraph) and test
   inventory, README "Credentials and configuration".
 - [x] One live Codex attempt settles with empty `postSettlementFailures`. Proof: run id and collect result.
   Authorized 2026-10-04. `run_5a50f5c7-cdc0-4657-95f9-0973f3f665f8`, `op_2769672f-6c18-4c15-9110-2c0fa383b369`,
