@@ -111,7 +111,7 @@ export function agentFsChanges(dbPath: string, baseDir?: string, agentFsExecutab
 /**
  * Like agentFsChanges, but a failed `agentfs fs cat` during host comparison is reported as an
  * audit error instead of being silently promoted to a modified file, and platform metadata
- * (`._*`, `.DS_Store`) is kept so the caller can decide by ownership whether to export it.
+ * (`._*`, `.DS_Store`) is kept in the inventory so the audit can report it as ignored.
  */
 export function agentFsChangeInventory(dbPath: string, baseDir?: string, agentFsExecutable = "agentfs"): AgentFsChangeInventory {
 	const db = new Database(dbPath, { readonly: true });
@@ -262,10 +262,11 @@ export function auditAgentFsChanges(dbPath: string, baseDir: string, ownedPaths:
 	// no ownership to the container's other children, which stay violations unless declared.
 	const containerOf = (change: AgentFsChange, paths: readonly string[]): boolean => change.kind === "directory" && paths.some((path) => path === "" || path.startsWith(`${change.path}/`));
 	for (const change of inventory.changes) {
-		if (under(change, allowed) || containerOf(change, allowed)) owned.push(change);
+		// Finder and NFS metadata is never work, inside ownership too: the macOS overlay writes `._*` beside the
+		// files a worker creates, and exporting them would place them in the workspace.
+		if (platformMetadata(change.path)) ignored.push(change);
+		else if (under(change, allowed) || containerOf(change, allowed)) owned.push(change);
 		else if (under(change, ignoredAllowed) || containerOf(change, ignoredAllowed)) ignored.push(change);
-		// Finder/Spotlight metadata is discarded rather than exported or refused, but only outside ownership.
-		else if (platformMetadata(change.path)) ignored.push(change);
 		else violations.push(change);
 	}
 	const errors = [...allowedOwnership.errors, ...ignoredOwnership.errors, ...inventory.errors];
