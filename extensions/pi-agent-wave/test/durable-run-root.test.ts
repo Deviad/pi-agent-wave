@@ -66,6 +66,56 @@ describe("durable run root", () => {
 		assert.equal(python("print(core.run_root())", { ...process.env, DELEGATE_GRAPH_DB: override }), join(dirname(override), "runs"));
 	});
 
+	test("a run directory's name reduces the run and operation UUIDs to 8 characters, keeping the full label in state", () => {
+		const graphHome = join(scratch("run-root-name-"), "graph");
+		const env = { ...process.env, DELEGATE_GRAPH_DB: join(graphHome, "graph.db") };
+		const label = "run_d34d01f4-a5f7-48d3-945c-8e2548e80a35-op_ed00d5ce-8a52-48e2-abea-4d7d00842fdf";
+		const init = spawnSync(process.execPath, ["--experimental-strip-types", join(SCRIPTS, "delegate.ts"), "--transport", "headless", "--", "init", label], { encoding: "utf8", env });
+		assert.equal(init.status, 0, init.stderr);
+		const runDir = init.stdout.trim();
+		const name = runDir.split("/").at(-1) ?? "";
+		assert.match(name, /^delegate-graph-herdr-run-d34d01f4-op-ed00d5ce\.[^/]+$/);
+		assert.ok(name.length <= 55, `the run directory name is ${name.length} characters: ${name}`);
+		assert.equal(JSON.parse(readFileSync(join(runDir, "state.json"), "utf8")).run_label, label, "the full label stays in state");
+		assert.equal(python(`core.require_run_dir(${JSON.stringify(runDir)}); print("accepted")`, env), "accepted");
+	});
+
+	test("a pi worker whose AgentFS working directory would overflow pi's session directory name is refused before any credential exists", () => {
+		// Two long components push the attempt's mount path past 252 characters, the longest pi 0.87.1 can open.
+		const runDir = join(scratch("run-root-deep-"), "a".repeat(90), "b".repeat(90), "delegate-graph-herdr-deep.abc");
+		mkdirSync(runDir, { recursive: true, mode: 0o700 });
+		const workspace = scratch("run-root-deep-ws-");
+		const outcome = python(`
+import os
+from pathlib import Path
+core.ACTIVE_TRANSPORT = 'headless'
+run_dir = Path(${JSON.stringify(runDir)})
+os.environ['HOME'] = str(run_dir / 'no-provider-home')
+os.chdir(${JSON.stringify(workspace)})
+model = 'alibaba/deepseek-v4.1-flash'
+args = core.build_parser().parse_args(['start', str(run_dir), 'thinker', '--node', 'thinker_plan', '--model', model])
+task = run_dir / 'task.md'; task.write_text('Offline fixture; never dispatched.'); task.chmod(0o600)
+try:
+    core.prepare_acpx_attempt(run_dir, args, {'run_label': 'deep'}, 'dg_deep_thinker_0001', model, task, 'thinker_plan')
+    print(json.dumps({'refused': None}))
+except core.DelegateError as error:
+    attempt = run_dir / 'acpx' / 'dg_deep_thinker_0001'
+    print(json.dumps({'refused': str(error), 'providers': (attempt / 'providers').exists(), 'credentials': [str(p) for p in run_dir.rglob('auth.json')]}))`);
+		const result = JSON.parse(outcome) as { refused: string | null; providers?: boolean; credentials?: string[] };
+		assert.ok(result.refused, "the attempt must be refused");
+		assert.match(result.refused, /^\[dispatch_precondition\] /);
+		assert.match(result.refused, /working directory would be \d+ characters; pi can open at most 252/);
+		assert.equal(result.providers, false, "no provider directory is materialized");
+		assert.deepEqual(result.credentials, [], "no credential file is written");
+
+		const verdicts = python(`
+from pathlib import Path
+short = Path(${JSON.stringify(workspace)})
+deep = Path(${JSON.stringify(runDir)})
+print(json.dumps([core.worker_cwd_precondition('pi', short, 'dg-thinker-0-0-0123456789ab'), core.worker_cwd_precondition('codex', deep / ('c' * 200), 'dg-thinker-0-0-0123456789ab')]))`);
+		assert.deepEqual(JSON.parse(verdicts), [null, null], "a short pi path and an unmeasured agent are not refused");
+	});
+
 	test("require_run_dir accepts the run root and, for one release, /tmp; it refuses anything else", () => {
 		const graphHome = join(scratch("run-root-require-"), "graph");
 		const env = { ...process.env, DELEGATE_GRAPH_DB: join(graphHome, "graph.db") };

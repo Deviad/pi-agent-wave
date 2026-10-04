@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, statSync, write
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { decideTransition, graphDefinition } from "./graph-core.ts";
-import { classifyFailure, retryDelayMs, selectModelFallback, type ModelFallbackDecision } from "./retry.ts";
+import { classifyFailure, retryDelayMs, selectModelFallback, startupFailureSignature, type ModelFallbackDecision } from "./retry.ts";
 import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
 import { headlessPresentationIdentity, herdrPresentationIdentity, parseWorkerTransportKind, type WorkerPresentationIdentity, type WorkerTransportKind } from "./lib/worker-transport.ts";
 import { createAcpxAttemptIdentity } from "./lib/acpx-types.ts";
@@ -206,6 +206,15 @@ function policyDigest(policy: ResolvedPolicy): string {
 
 /** The default auto policy persisted when a run initializes without an explicitly resolved one. */
 export const DEFAULT_AUTO_POLICY: ResolvedPolicy = { input: { kind: "auto" }, routes: [] };
+
+/**
+ * Where `delegate_core.py:startup_failure_evidence_dir` retains a failed `sessions ensure`'s evidence for one
+ * attempt; both apply the same rule, every character outside `[A-Za-z0-9_-]` in a component becoming `-`.
+ */
+export function startupFailureEvidenceDirectory(graphHome: string, runId: string, operationId: string, transientAttempt: number, model: string): string {
+	const component = (value: string | number) => String(value).replace(/[^A-Za-z0-9_-]/g, "-");
+	return join(graphHome, "evidence", component(runId), ["startup-failure", component(operationId), component(transientAttempt), component(model)].join("-"));
+}
 
 function ensurePrivatePath(dbPath: string): void {
 	mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
@@ -1647,6 +1656,18 @@ export class GraphStore {
 			const classification = classifyFailure(error);
 			const policyFields = (modelAttempt: number, transientAttempt: number, retryReason: string, fallbackReason: string | null) =>
 				this.policyEventContext(run.id, operation.node, modelAttempt, transientAttempt, retryReason, fallbackReason);
+			// A failed `sessions ensure` happens before any model is called, so when it repeats identically neither the
+			// same-model budget nor the frozen chain can change the result: the operator gets it, with the evidence.
+			// classifier_reason and last_error describe the previous automatic retry; an operator retry clears both.
+			if (classification.reason === "worker-startup-failure" && operation.classifier_reason === "worker-startup-failure" && operation.last_error !== null && startupFailureSignature(operation.last_error) === startupFailureSignature(error)) {
+				const evidenceDirectories = this.startupFailureEvidence(operation.id);
+				const parked = `${error}\nrepeated identical worker startup failure, parked for the operator: ${evidenceDirectories.length ? `retained startup evidence: ${evidenceDirectories.join("; ")}` : "no startup evidence was retained"}`;
+				this.db.query("UPDATE operations SET status='failed',classifier_reason=?,last_error=?,finished_at=? WHERE id=?").run(classification.reason, parked, now, operation.id);
+				if (previous?.agentId) this.db.query("UPDATE agents SET status='failed',last_activity_at=? WHERE id=?").run(now, previous.agentId);
+				this.setState(run.id, state.currentNode, state.round, state.fixIteration, "awaiting_user");
+				this.event({ runId: run.id, type: "startup_failure_repeated", node: operation.node, operationId: operation.id, agentId: previous?.agentId ?? undefined, fromAgent: role, toAgent: "user", replyTo: "user", payload: { ...policyFields(operation.model_attempt, operation.transient_attempts, classification.reason, null), classification: classification.reason, error, evidenceDirectories, attemptKey: previous?.attemptKey ?? null } });
+				return result(null, classification.reason, true);
+			}
 			if (classification.kind === "transient" && operation.transient_attempts < 3) {
 				const attempt = operation.transient_attempts + 1;
 				const retryReason = input.retryReason?.trim() || classification.reason;
@@ -1675,6 +1696,18 @@ export class GraphStore {
 			this.setState(run.id, state.currentNode, state.round, state.fixIteration, "awaiting_user");
 			this.event({ runId: run.id, type: classification.kind === "transient" ? "retry_exhausted" : "operation_failed", node: operation.node, operationId: operation.id, agentId: previous?.agentId ?? undefined, fromAgent: role, toAgent: "user", replyTo: "user", payload: { ...policyFields(operation.model_attempt, operation.transient_attempts, classification.reason, null), classification: classification.reason, error, attemptKey: previous?.attemptKey ?? null } });
 			return result(null, classification.reason, true);
+		});
+	}
+
+	/** The startup-failure evidence directories that exist for an operation's two most recent attempts, oldest first. */
+	private startupFailureEvidence(operationId: string): string[] {
+		const rows = this.db.query<{ run_id: string; identity_json: string }, [string]>("SELECT run_id,identity_json FROM runtime_attempts WHERE operation_id=? ORDER BY rowid DESC LIMIT 2").all(operationId);
+		return rows.reverse().flatMap((row) => {
+			const registered: unknown = JSON.parse(row.identity_json);
+			const identity = isRecordValue(registered) && isRecordValue(registered.identity) ? registered.identity : {};
+			if (typeof identity.transientAttempt !== "number" || typeof identity.selectedModel !== "string") return [];
+			const directory = startupFailureEvidenceDirectory(dirname(this.dbPath), row.run_id, operationId, identity.transientAttempt, identity.selectedModel);
+			return existsSync(directory) ? [directory] : [];
 		});
 	}
 

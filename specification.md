@@ -89,8 +89,17 @@ publisher and removes the endpoint descriptor, then writes `status.json` (schema
   after ~100 ms when the failure text contains `Cannot call write after a stream was destroyed`. If
   the ensure still fails, the worker writes the schema-2 worker result anyway, with a `failed` outcome
   whose error is `ACPX session ensure failed after <n> attempt(s): <acpx output>` and an empty capture
-  (the ACPX output kept as `worker.stderr.txt`), so `collect` settles the attempt at once; a missing
-  `acpx` executable still throws without a result (`tasks/handoff-worker-startup-failure.md`).
+  (the ACPX output kept as `runtime-output/worker.stderr.txt`, beside an `environment.json` naming the
+  working directory, the ACPX home, their lengths, and the environment given to ACPX with values kept
+  only for `PATH`, `HOME`, `TMPDIR`, `NODE_*`, `npm_config_*` and `ACPX_*` names that are not
+  secret-shaped), so `collect` settles the attempt at once; a missing `acpx` executable still throws
+  without a result (`tasks/handoff-worker-startup-failure.md`). Before settlement removes the attempt,
+  `delegate_core.py:write_failure_diagnostics` copies that stderr and environment, the prompt-time
+  `worker-config.json`, the ACPX home's `.npm/_logs/*.log` (as `_logs/`) and `.acpx/` tree (as
+  `acpx-state/`), and a `versions.json` (`agentfs`, `acpx`, `pi`, `node`, resolved `pi-acp`) into
+  `<graph home>/evidence/<runId>/startup-failure-<operation>-<transient>-<model>/`, each file private
+  and redacted, never a credential or `.claude.json`; the failure bundle names it as
+  `startupFailureEvidence` (`tasks/handoff-worker-session-ensure-diagnostics.md`).
 - **Prompt.** `buildPromptArgv` produces
   `acpx --cwd <process.cwd()> --format json --json-strict --timeout <configured> --ttl 5 --model
   <model> --permission-policy <json> --non-interactive-permissions fail [--no-terminal] <agent>
@@ -576,7 +585,8 @@ resume: it is resumed by the operator, or it stays deferred until pruned.
    `worker-exited-before-result`, `worker-gone` (`attempt directory removed before result`,
    `no longer registered before result`, `process gone before result`, or a message starting `worker orphaned:` — the same death
    noticed by Herdr's wait or by `collect` after a reboot), `worker-startup-failure` (`ACPX session ensure failed` or `Cannot call write after a stream was
-   destroyed`: the ACP session could not be opened and no prompt ran), `worker-empty-answer`
+   destroyed`: the ACP session could not be opened and no prompt ran; §4.2 parks a repeated identical
+   one), `worker-empty-answer`
    (`exited without a candidate`),
    `runtime-snapshot-churn` (`runtime configuration snapshot changed`), `agentfs-audit-error`
    (`AgentFS audit error`), `agentfs-snapshot-error` (`AgentFS snapshot failed`), and `timeout` for
@@ -615,7 +625,16 @@ non-empty chain and an in-range attempt, classifies, and returns
   synthesized `runtime worker exited without a candidate (capture <status>)`. With no attempt, the
   operation must be `pending` and the caller must supply both the launch error and the exact
   `modelAttempt`/`transientAttempt` it was dispatched with, otherwise the retry is refused as stale.
-  It classifies with `classifyFailure`. If transient and `transient_attempts < 3`, it supersedes,
+  It classifies with `classifyFailure`. A `worker-startup-failure` whose operation's
+  `classifier_reason` is also `worker-startup-failure` and whose `retry.ts:startupFailureSignature`
+  equals that of `last_error` (retained-diagnostics lines dropped, absolute paths and ACPX session
+  names masked) parks at once, because a failed `sessions ensure` precedes any model call: the operation
+  `failed`, the agent `failed`, the run `awaiting_user`, a `startup_failure_repeated` event whose
+  payload lists `evidenceDirectories`, and `last_error` ending `retained startup evidence: <dir>; <dir>`
+  for the startup-failure directories of the current and previous attempt that exist
+  (`store.ts:startupFailureEvidenceDirectory`, the naming rule `delegate_core.py` writes with). An
+  approved retry clears `classifier_reason` and `last_error`, so the next startup failure retries
+  again. Otherwise, if transient and `transient_attempts < 3`, it supersedes,
   increments the transient counter, records `classifier_reason`/`retry_reason`/`last_error` and
   `retry_not_before = now + retryDelayMs(transient_attempts)`, clears `started_at`/`finished_at`,
   and emits a `retry` event. Otherwise, if transient and the chain has a next model, it advances
@@ -674,7 +693,9 @@ successful fallback clears `state.excludedProviders`.
 `scripts/delegate_core.py:command_init` requires ACPX and AgentFS (`require_worker_runtime`, exact
 versions below), or Herdr identity for the Herdr transport (`require_herdr`, which also verifies
 `herdr integration status` and installs the Pi integration if needed). It creates
-`Path(tempfile.mkdtemp(prefix="delegate-graph-herdr-<slug>.", dir=run_root()))`, chmods it 700, writes
+`Path(tempfile.mkdtemp(prefix="delegate-graph-herdr-<run_dir_slug(label)>.", dir=run_root()))`, where
+`run_dir_slug` is the label's slug with each UUID cut to its first 8 characters, at most 40 long
+(`run-d34d01f4-op-ed00d5ce` for the extension's `<runId>-<operationId>` label), chmods it 700, writes
 `state.json` (`caller_tab`, `transport`, `closed_tabs`, `resources`, `run_label`, `run_slug`) mode
 600 and a private `system-prompt.txt`, and prints the run directory. `run_root()` is `<graph
 home>/runs/` (created mode 700), where the graph home is the directory of `graph_db_path()`:
@@ -686,9 +707,22 @@ release so a run started by the previous version can still be collected), its na
 
 The run root moved out of `/tmp` on 2026-10-04 (`tasks/handoff-durable-worker-record.md` §3): a host
 reboot on 2026-10-03 cleared the only copy of an unsettled attempt's stream, answer sink, AgentFS delta
-and `state.json`, making `run_ab8675e8`'s `thinker_plan` answer unrecoverable. The directory name is
-unchanged, so the cancel-script-to-run-directory relationship used by `prune` and by the liveness
-reaper is unaffected. The AgentFS grant stays `--no-default-allows --allow <run-dir>`; with the root
+and `state.json`, making `run_ab8675e8`'s `thinker_plan` answer unrecoverable. The cancel-script-to-run-
+directory relationship used by `prune` and by the liveness reaper is unaffected by the move.
+
+The move lengthened every worker's working directory, the AgentFS mount
+`<run dir>/acpx/<agent>/agentfs-home/.agentfs/run/<session>/mnt`, past what `pi` can open: `pi` 0.87.1
+names a session directory `--<cwd with "/" replaced by "-">--`, which must fit 255 bytes, so a working
+directory of 253 characters or more exits on `ENAMETOOLONG` before ACPX opens a session
+(`tasks/handoff-worker-session-ensure-diagnostics.md` §4 item 4). The full-UUID label gave 257
+characters under `~/.local/share/delegate-graph`; the shortened name gives 201. The full label is still
+stored in `state.json`, where the run-id fallback and the Herdr tab title read it. For a `pi` worker,
+`prepare_acpx_attempt` checks the computed working directory (`worker_cwd_precondition`) before it
+materializes any credential, and raises a `[dispatch_precondition]` naming the length, the limit and
+the remedy (a shorter `DELEGATE_GRAPH_DB` location). `index.ts` takes a `start` failure carrying that
+marker through `retryRuntimeAttempt` like a credential-preflight block (permanent
+`dispatch-precondition`, run `awaiting_user`, run directory discarded, `blocked: "precondition"`).
+Codex and Claude workers are not checked; their limits were not measured. The AgentFS grant stays `--no-default-allows --allow <run-dir>`; with the root
 under `$HOME` a worker cannot write the database, `runtime-content/`, `evidence/`, `failures/` or a
 sibling run directory, and the grant still delivers `worker-result.json` to the host when the run
 directory lies inside a home run's copy-on-write base (both verified with real AgentFS).

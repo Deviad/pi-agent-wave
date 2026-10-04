@@ -1024,6 +1024,16 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const started = await execute(process.execPath, startArgs);
 					if (started.exitCode !== 0) {
 						const startOutput = `${started.stderr ?? ""}${started.stdout ?? ""}`;
+						// The launcher refuses an attempt whose worker pi could not start in (delegate_core.py:worker_cwd_precondition);
+						// like a credential preflight block, nothing was registered, so the refusal goes through the fenced path.
+						const precondition = /\[dispatch_precondition\]/.exec(startOutput);
+						if (precondition) {
+							const reason = startOutput.slice(precondition.index).split("\n")[0].trim();
+							const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
+							progress("dispatch_refused_by_precondition", { runId, operationId, status: refused.state.status });
+							discardUnlaunchedRunDirectory(privateRunDir);
+							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, state: refused.state, operation: refused.operation });
+						}
 						const preflight = /worker preflight:/.exec(startOutput);
 						if (preflight) {
 							const reason = startOutput.slice(preflight.index).split("\n")[0].trim();

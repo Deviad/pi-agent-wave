@@ -1,10 +1,10 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { CURRENT_SCHEMA_VERSION, GraphStore } from "../store.ts";
+import { CURRENT_SCHEMA_VERSION, GraphStore, startupFailureEvidenceDirectory } from "../store.ts";
 import { Database } from "../sqlite.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { parseResultContract, canonical } from "../lib/runtime-results.ts";
@@ -378,6 +378,62 @@ test("a transient failure replaces the attempt under the same model and fences r
 	assert.equal(reopened.settleRuntimeAttempt(failedSettlement(input.identity.attemptKey, "ACPX worker failed while prompting")).supersededAt, retried.previousAttempt?.supersededAt);
 	assert.equal(reopened.runtimeAttemptByOperation(operation.id)?.attemptKey, next.attemptKey);
 	assert.throws(() => reopened.decideRuntimeCandidate({ attemptKey: input.identity.attemptKey, decision: "accepted", reason: "stale" }), /superseded/);
+});
+
+/** The live 2026-10-04 message of a failed `sessions ensure`, as the worker records it. */
+const STARTUP_FAILURE = 'ACPX session ensure failed after 2 attempt(s): {"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error: Cannot call write after a stream was destroyed","data":{"acpxCode":"RUNTIME","origin":"cli","sessionId":"unknown"}}}';
+
+test("two consecutive identical startup failures park the operation for the operator, naming both evidence directories", () => {
+	const { root, store, run, operation, input } = fixture("research", "chain");
+	const first = input.identity;
+	const second = createHeadlessAcpxAttemptIdentity({ ...first, transientAttempt: 1 });
+	const directories = [first, second].map((identity) => startupFailureEvidenceDirectory(root, run.runId, operation.id, identity.transientAttempt, identity.selectedModel));
+	for (const directory of directories) mkdirSync(directory, { recursive: true });
+
+	store.beginRuntimeAttempt(input);
+	store.settleRuntimeAttempt(failedSettlement(first.attemptKey, `${STARTUP_FAILURE}\nretained worker diagnostics: ${root}/evidence/one.json`));
+	const retried = store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id });
+	assert.equal(retried.exhausted, false, "the first startup failure still retries");
+	assert.equal(retried.classification, "worker-startup-failure");
+
+	store.beginRuntimeAttempt({ ...input, identity: second, sessionId: second.sessionName });
+	store.settleRuntimeAttempt(failedSettlement(second.attemptKey, `${STARTUP_FAILURE}\nretained worker diagnostics: ${root}/evidence/two.json`));
+	const parked = store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id });
+	assert.equal(parked.exhausted, true, "the identical repeat parks instead of spending the budget");
+	assert.equal(parked.retry, null);
+	assert.equal(parked.classification, "worker-startup-failure");
+	assert.equal(parked.operation.status, "failed");
+	assert.equal(parked.operation.transient_attempts, 1, "the remaining same-model budget is not spent");
+	assert.equal(parked.operation.model_attempt, 0, "the frozen chain does not advance");
+	assert.equal(parked.state.status, "awaiting_user");
+	assert.equal(store.runtimeAttemptByOperation(operation.id)?.attemptKey, second.attemptKey, "the parked attempt stays active for the operator");
+	assert.match(parked.operation.last_error ?? "", new RegExp(`retained startup evidence: ${directories[0]}; ${directories[1]}$`));
+	const event = store.events(run.runId, 100).find((candidate) => candidate.type === "startup_failure_repeated");
+	assert.ok(event, "the park is its own event");
+	assert.deepEqual((JSON.parse(event.payload_json) as { evidenceDirectories: string[] }).evidenceDirectories, directories);
+
+	// The operator's retry resumes; the next startup failure is a first failure again and retries.
+	assert.equal(store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id, approved: true }).state.status, "active");
+	const third = createHeadlessAcpxAttemptIdentity({ ...first, transientAttempt: 2 });
+	store.beginRuntimeAttempt({ ...input, identity: third, sessionId: third.sessionName });
+	store.settleRuntimeAttempt(failedSettlement(third.attemptKey, STARTUP_FAILURE));
+	assert.equal(store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id }).exhausted, false);
+});
+
+test("a startup failure followed by a different error, or by a different startup failure, still retries", () => {
+	for (const followUp of ["HTTP 503 overloaded", "ACPX session ensure failed after 1 attempt(s): spawn pi-acp ENOENT"]) {
+		const { store, run, operation, input } = fixture("research", "chain");
+		store.beginRuntimeAttempt(input);
+		store.settleRuntimeAttempt(failedSettlement(input.identity.attemptKey, STARTUP_FAILURE));
+		assert.equal(store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id }).exhausted, false);
+		const next = createHeadlessAcpxAttemptIdentity({ ...input.identity, transientAttempt: 1 });
+		store.beginRuntimeAttempt({ ...input, identity: next, sessionId: next.sessionName });
+		store.settleRuntimeAttempt(failedSettlement(next.attemptKey, followUp));
+		const retried = store.retryRuntimeAttempt({ runId: run.runId, operationId: operation.id });
+		assert.equal(retried.exhausted, false, `${followUp} retries as before`);
+		assert.deepEqual([retried.retry?.modelAttempt, retried.retry?.attempt], [0, 2]);
+		assert.equal(store.events(run.runId, 100).some((event) => event.type === "startup_failure_repeated"), false);
+	}
 });
 
 test("the same-model budget is three, then the frozen chain advances once, then the run parks", () => {

@@ -105,7 +105,7 @@ def diagnostics_case() -> dict[str, object]:
     owned["run_id"] = "run-diagnostic"
     owned["operation_id"] = "op-diagnostic"
     owned["node"] = "implement"
-    owned["selected_model"] = "alibaba/some-model"
+    owned["model"] = "alibaba/some-model"
     attempt = Path(str(owned["attempt_dir"]))
     # Built at runtime so the repository never contains a credential-shaped literal.
     setup_token = "sk-ant-" + "oat" + ("A" * 34)

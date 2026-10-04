@@ -75,6 +75,20 @@ export function classifyFailure(message: string, semanticVerdict = false): Failu
 	return { kind: "permanent", reason: "unclassified" };
 }
 
+/**
+ * A startup failure's message with what legitimately differs between attempts masked: the line naming retained
+ * diagnostics, absolute paths and ACPX session names. Two failures with one signature are the same fault.
+ */
+export function startupFailureSignature(message: string): string {
+	return message.split("\n")
+		.filter((line) => !/^retained (?:worker )?diagnostics: /.test(line.trim()))
+		.join("\n")
+		.replace(/\bdg-[a-z0-9-]+?-\d+-\d+-[0-9a-f]{12}\b/g, "<session>")
+		.replace(/(?:\/[^\s"'/]+)+\/?/g, "<path>")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 /** Selects the next frozen route entry only for transient launch/provider failures. */
 export function selectModelFallback(
 	chain: readonly string[],

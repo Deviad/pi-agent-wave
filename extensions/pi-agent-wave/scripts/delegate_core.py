@@ -144,6 +144,20 @@ def slugify(value: str) -> str:
     return slug or "worker"
 
 
+UUID_PATTERN = re.compile(r"([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+RUN_DIR_SLUG_MAX = 40
+
+
+def run_dir_slug(label: str) -> str:
+    """The label part of a run directory's name: the slug with each UUID cut to 8 characters, at most 40 long.
+
+    A worker's working directory is an AgentFS mount nested in this directory, and pi cannot open a working
+    directory of 253 characters or more (`worker_cwd_precondition`), so the name is kept short. Uniqueness
+    comes from the random suffix `mkdtemp` adds, never from the label.
+    """
+    return UUID_PATTERN.sub(r"\1", slugify(label))[:RUN_DIR_SLUG_MAX].strip("-") or "worker"
+
+
 def graph_db_path() -> Path:
     """The graph database, resolved like store.ts: DELEGATE_GRAPH_DB, else DEFAULT_DB_PATH under $HOME."""
     override = os.environ.get("DELEGATE_GRAPH_DB", "").strip()
@@ -270,7 +284,7 @@ def command_init(args: argparse.Namespace) -> None:
     root = run_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
-    run_dir = Path(tempfile.mkdtemp(prefix=f"{RUN_PREFIX}{slug}.", dir=root))
+    run_dir = Path(tempfile.mkdtemp(prefix=f"{RUN_PREFIX}{run_dir_slug(args.run_label)}.", dir=root))
     run_dir.chmod(0o700)
     write_state(
         run_dir,
@@ -727,6 +741,31 @@ def provider_runtime_environment(attempt_dir: Path, acpx_home: Path, real_home: 
     return environment, links
 
 
+# pi keeps each working directory's sessions in one directory named `--<cwd with "/" replaced by "-">--`, which
+# must fit the 255-byte filename limit; at 253 characters pi exits on ENAMETOOLONG before ACPX can open a session.
+PI_SESSION_DIRECTORY_NAME_MAX = 255
+PI_WORKING_DIRECTORY_MAX = PI_SESSION_DIRECTORY_NAME_MAX - 3
+
+
+def worker_cwd_precondition(agent: str, agentfs_home: Path, session_name: str) -> str | None:
+    """The refusal for a pi worker whose AgentFS working directory pi could not open, or None when it fits.
+
+    Only pi's limit was measured (2026-10-04); Codex and Claude are not refused.
+    """
+    if agent != "pi":
+        return None
+    cwd = agentfs_home.resolve() / ".agentfs" / "run" / session_name / "mnt"
+    length = len(str(cwd))
+    if length <= PI_WORKING_DIRECTORY_MAX:
+        return None
+    return (
+        f"[dispatch_precondition] the worker's AgentFS working directory would be {length} characters; pi can open at most "
+        f"{PI_WORKING_DIRECTORY_MAX}, because it names a session directory after it and that name must fit "
+        f"{PI_SESSION_DIRECTORY_NAME_MAX} bytes. Remedy: point DELEGATE_GRAPH_DB at a graph home whose path is at least "
+        f"{length - PI_WORKING_DIRECTORY_MAX} characters shorter, then resolve this operation with retry, or abort the run."
+    )
+
+
 def prepare_acpx_attempt(
     run_dir: Path,
     args: argparse.Namespace,
@@ -762,6 +801,9 @@ def prepare_acpx_attempt(
     agentfs_home = attempt_dir / "agentfs-home"
     acpx_home.mkdir(mode=0o700)
     agentfs_home.mkdir(mode=0o700)
+    refusal = worker_cwd_precondition(agent, agentfs_home, session_name)
+    if refusal:
+        raise DelegateError(refusal)
     provider_environment, provider_links = provider_runtime_environment(attempt_dir, acpx_home, real_home, model, thinking=thinking)
     prompt_file = attempt_dir / "prompt.md"
     read_only = args.access_mode == "read-only" if args.access_mode is not None else node not in {"implement", "source_search"}
@@ -1546,6 +1588,109 @@ def _recent_worker_events(path: Path, limit: int) -> list[object]:
 
 
 
+STARTUP_FAILURE_PREFIX = "ACPX session ensure failed"
+STARTUP_EVIDENCE_FILE_BYTES = 256 * 1024
+STARTUP_EVIDENCE_MAX_FILES = 64
+STARTUP_EVIDENCE_VERSION_TIMEOUT_SECONDS = 10
+# Credential and account files never enter the evidence directory, even when one sits inside a copied tree.
+STARTUP_EVIDENCE_SKIPPED_NAMES = frozenset({"auth.json", ".credentials.json", "setup-token", ".claude.json"})
+
+
+def evidence_name_component(value: object) -> str:
+    """One path component of a retained evidence name; store.ts:startupFailureEvidenceDirectory applies the same rule."""
+    return re.sub(r"[^A-Za-z0-9_-]", "-", str(value))
+
+
+def startup_failure_evidence_dir(resource: dict[str, Any]) -> Path:
+    """`<graph home>/evidence/<runId>/startup-failure-<operation>-<transient>-<model>/` for one attempt."""
+    name = "-".join([
+        "startup-failure",
+        evidence_name_component(resource.get("operation_id")),
+        evidence_name_component(resource.get("transient_attempt", 0)),
+        evidence_name_component(resource.get("model")),
+    ])
+    return graph_db_path().parent / "evidence" / evidence_name_component(resource.get("run_id")) / name
+
+
+def is_startup_failure(result: object) -> bool:
+    """True when the worker result records a `sessions ensure` that failed, so no prompt ever ran."""
+    output = result.get("output") if isinstance(result, dict) else None
+    outcome = output.get("outcome") if isinstance(output, dict) else None
+    return isinstance(outcome, dict) and outcome.get("kind") == "failed" and str(outcome.get("error", "")).startswith(STARTUP_FAILURE_PREFIX)
+
+
+def _first_output_line(argv: list[str]) -> str:
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=STARTUP_EVIDENCE_VERSION_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"unavailable: {type(error).__name__}"
+    lines = (completed.stdout or completed.stderr or "").strip().splitlines()
+    return redact_failure_text(lines[0][:200]) if lines else f"no output (exit {completed.returncode})"
+
+
+def startup_failure_versions(acpx_home: Path, attempt_dir: Path) -> dict[str, Any]:
+    """The executables a failed start ran through, and every pi-acp build npm resolved for it."""
+    acpx = shutil.which("acpx") or "acpx"
+    try:
+        configured = json.loads((attempt_dir / "worker-config.json").read_text(encoding="utf-8")).get("acpxExecutable")
+        if isinstance(configured, str) and configured:
+            acpx = configured
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    pi_acp: list[str] = []
+    for manifest in sorted((acpx_home / ".npm" / "_npx").glob("*/node_modules/pi-acp/package.json")):
+        try:
+            pi_acp.append(str(json.loads(manifest.read_text(encoding="utf-8")).get("version")))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pi_acp.append("unreadable")
+    return {
+        "schemaVersion": 1,
+        "agentfs": _first_output_line([shutil.which("agentfs") or "agentfs", "--version"]),
+        "acpx": _first_output_line([acpx, "--version"]),
+        "pi": _first_output_line([shutil.which("pi") or "pi", "--version"]),
+        "node": _first_output_line([shutil.which("node") or NODE, "--version"]),
+        "piAcp": pi_acp,
+    }
+
+
+def retain_startup_failure_evidence(resource: dict[str, Any], attempt_dir: Path) -> Path:
+    """Copy what can explain a failed `sessions ensure` out of the attempt before settlement deletes it.
+
+    Only named sources are read, so no materialized credential can be reached. A repeat call adds files not yet
+    retained and rewrites none: the abort after a failed close must not replace the prompt-time configuration.
+    """
+    destination = startup_failure_evidence_dir(resource)
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for private in (destination.parent, destination):
+        private.chmod(0o700)
+    output_dir = attempt_dir / "runtime-output"
+    acpx_home = Path(str(resource.get("acpx_home") or attempt_dir / "acpx-home"))
+    sources: list[tuple[Path, str]] = [
+        (output_dir / "worker.stderr.txt", "worker.stderr.txt"),
+        (output_dir / "environment.json", "environment.json"),
+        (attempt_dir / "worker-config.json", "worker-config.json"),
+    ]
+    sources += [(log, f"_logs/{log.name}") for log in sorted((acpx_home / ".npm" / "_logs").glob("*.log"))]
+    state = acpx_home / ".acpx"
+    if state.is_dir():
+        sources += [(path, f"acpx-state/{path.relative_to(state)}") for path in sorted(state.rglob("*")) if path.is_file()]
+    for source, relative in sources[:STARTUP_EVIDENCE_MAX_FILES]:
+        if source.name in STARTUP_EVIDENCE_SKIPPED_NAMES or source.is_symlink() or not source.is_file():
+            continue
+        if not any(source.resolve().is_relative_to(root.resolve()) for root in (attempt_dir, acpx_home)):
+            continue
+        target = destination / relative
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target.parent.chmod(0o700)
+        write_private(target, _read_text_tail(source, STARTUP_EVIDENCE_FILE_BYTES))
+    versions = destination / "versions.json"
+    if not versions.exists():
+        write_private(versions, json.dumps(startup_failure_versions(acpx_home, attempt_dir), indent=2, sort_keys=True) + "\n")
+    return destination
+
+
 def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | None:
     """Retain a bounded private diagnostic bundle before the attempt directory is removed."""
     attempt_dir = Path(str(resource.get("attempt_dir", "")))
@@ -1561,6 +1706,12 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
             result = {"unreadable": True}
     terminal = result.get("terminal") if isinstance(result, dict) else None
     suffix = str(resource.get("operation_id") or attempt_dir.name)
+    startup_evidence: dict[str, str] = {}
+    if is_startup_failure(result):
+        try:
+            startup_evidence["startupFailureEvidence"] = str(retain_startup_failure_evidence(resource, attempt_dir))
+        except OSError as error:
+            startup_evidence["startupFailureEvidenceError"] = type(error).__name__
     changed_configuration = []
     for index, item in enumerate(resource.get("provider_links", [])):
         if item.get("kind") != "snapshot":
@@ -1589,7 +1740,7 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
         "node": resource.get("node"),
         "role": resource.get("role"),
         "acpAgent": resource.get("acp_agent"),
-        "selectedModel": resource.get("selected_model"),
+        "selectedModel": resource.get("model"),
         "acpxSession": resource.get("acpx_session"),
         "agentFsSession": resource.get("agentfs_session"),
         "attemptKey": resource.get("acpx_attempt_key"),
@@ -1600,8 +1751,11 @@ def write_failure_diagnostics(resource: dict[str, Any], reason: str) -> Path | N
         "agentFsSnapshot": resource.get("agentfs_snapshot"),
         "workerExit": resource.get("worker_exit"),
         "changedConfiguration": changed_configuration,
-        "stderrTail": _read_text_tail(attempt_dir / "worker.stderr.txt", FAILURE_DIAGNOSTIC_STDERR_BYTES),
+        # A prompt or a failed ensure writes its stderr beside its result; a close run writes worker-close.stderr.txt.
+        "stderrTail": _read_text_tail(next((path for path in (attempt_dir / "runtime-output" / "worker.stderr.txt", attempt_dir / "worker.stderr.txt") if path.is_file()), attempt_dir / "worker.stderr.txt"), FAILURE_DIAGNOSTIC_STDERR_BYTES),
+        "closeStderrTail": _read_text_tail(attempt_dir / "worker-close.stderr.txt", FAILURE_DIAGNOSTIC_STDERR_BYTES),
         "recentEvents": _recent_worker_events(worker_stream_source(resource) or attempt_dir / "worker.stdout.ndjson", FAILURE_DIAGNOSTIC_EVENT_LIMIT),
+        **startup_evidence,
     }
     path = run_dir / f"failure-{suffix}.json"
     write_private(path, json.dumps(bundle, indent=2, sort_keys=True) + "\n")

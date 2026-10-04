@@ -88,7 +88,8 @@ async function implementOperation(tool: Record<string, any>, ownedPaths: string[
  * even if other runs share the root.
  */
 function privateRunDirsFor(runId: string): string[] {
-	const token = runId.replace(/^run_/, "");
+	// A run directory's name carries the run UUID's first 8 characters (delegate_core.py:run_dir_slug).
+	const token = `run-${runId.replace(/^run_/, "").slice(0, 8)}`;
 	const runRoot = join(dirname(process.env.DELEGATE_GRAPH_DB!), "runs");
 	return existsSync(runRoot) ? readdirSync(runRoot).filter((name) => name.startsWith("delegate-graph-herdr-") && name.includes(token)) : [];
 }
@@ -180,6 +181,33 @@ describe("dispatch requires owned paths inside the working directory", () => {
 			} finally {
 				Object.assign(process.env, { PI_CODING_AGENT_DIR: saved.agentDir, DELEGATE_GRAPH_DB: saved.db });
 			}
+		}
+	});
+
+	test("a graph home deep enough to overflow pi's session directory name parks the operation with a named precondition", async () => {
+		const workspace = gitWorkspace("owned-deep-home-");
+		const saved = { agentDir: process.env.PI_CODING_AGENT_DIR, db: process.env.DELEGATE_GRAPH_DB };
+		const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "owned-deep-home-"))), "a".repeat(90), "b".repeat(90));
+		mkdirSync(dir, { recursive: true });
+		dirs.push(dirname(dirname(dir)));
+		try {
+			const invocations: { command: string; args: string[] }[] = [];
+			const { result, runId, operationId } = await dispatchWith(["src/a.ts"], workspace, invocations, dir);
+			assert.equal(result.blocked, "precondition", JSON.stringify(result));
+			const reason = String(result.reason);
+			assert.match(reason, /^\[dispatch_precondition\] .*working directory would be \d+ characters; pi can open at most 252/);
+			assert.deepEqual(classifyFailure(reason), { kind: "permanent", reason: "dispatch-precondition" });
+			assert.equal(result.operation.classifier_reason, "dispatch-precondition");
+			assert.equal(result.state.status, "awaiting_user");
+			assert.ok(invocations.some((call) => call.args.includes("start")), "the refusal comes from the launcher");
+			assert.deepEqual(privateRunDirsFor(runId), [], "the run directory init created is discarded");
+			const store = new GraphStore({ dbPath: process.env.DELEGATE_GRAPH_DB });
+			try {
+				assert.equal(store.agents(runId).length, 0, "no agents row");
+				assert.equal(store.runtimeAttemptByOperation(operationId), undefined, "no runtime_attempts row");
+			} finally { store.close(); }
+		} finally {
+			Object.assign(process.env, { PI_CODING_AGENT_DIR: saved.agentDir, DELEGATE_GRAPH_DB: saved.db });
 		}
 	});
 

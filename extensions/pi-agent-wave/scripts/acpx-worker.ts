@@ -163,6 +163,23 @@ export function ensureAcpxSession(config: AcpxWorkerConfig, env: NodeJS.ProcessE
 
 
 
+const ENVIRONMENT_VALUE_NAMES = new Set(["PATH", "HOME", "TMPDIR"]);
+const ENVIRONMENT_VALUE_PREFIXES = ["NODE_", "npm_config_", "ACPX_"];
+const SECRET_SHAPED_NAME = /TOKEN|SECRET|KEY|PASSWORD|AUTH|CREDENTIAL/i;
+
+/**
+ * What a failed `sessions ensure` ran with, for the startup-failure evidence directory. Values are kept only for
+ * the allowlisted names and never for a secret-shaped one; every other name is listed with a null value.
+ */
+export function startupEnvironmentRecord(env: NodeJS.ProcessEnv, cwd: string, acpxHome: string): Record<string, unknown> {
+	const environment: Record<string, string | null> = {};
+	for (const name of Object.keys(env).sort()) {
+		const allowed = (ENVIRONMENT_VALUE_NAMES.has(name) || ENVIRONMENT_VALUE_PREFIXES.some((prefix) => name.startsWith(prefix))) && !SECRET_SHAPED_NAME.test(name);
+		environment[name] = allowed ? env[name] ?? null : null;
+	}
+	return { schemaVersion: 1, cwd, cwdLength: cwd.length, acpxHome, acpxHomeLength: acpxHome.length, environment };
+}
+
 /**
  * acpx exits with EXIT_CODES.PERMISSION_DENIED (5) and reports `permission_denied`
  * when every permission request in a turn was denied or cancelled, which is an
@@ -204,6 +221,7 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 		console.error(message);
 		const output = new RuntimeOutputFiles(join(dirname(config.resultPath), "runtime-output"), { attemptKey: config.attemptKey, sessionId: config.sessionName, requestId: null });
 		output.stderr(Buffer.from(`${ensure.stderr}${ensure.stdout}`));
+		writeFileSync(join(dirname(config.resultPath), "runtime-output", "environment.json"), `${JSON.stringify(startupEnvironmentRecord(env, process.cwd(), config.acpxHome), null, 2)}\n`, { mode: 0o600 });
 		publishWorkerResult(config, join(dirname(config.resultPath), "runtime-output"), output.finish({ kind: "failed", exitCode: ensure.exitCode, error: message }));
 		return ensure.exitCode || 1;
 	}
