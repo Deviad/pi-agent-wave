@@ -11,6 +11,7 @@ import type { NodeName } from "../types.ts";
 import { parseResultContract, type ResultContract } from "../lib/runtime-results.ts";
 import { AcpxRenderer } from "../lib/acpx-render.ts";
 import { runRuntimeProcess } from "../lib/runtime-process.ts";
+import { RuntimeOutputFiles, type RuntimeOutputResult } from "../lib/runtime-output.ts";
 
 export interface AcpxWorkerConfig {
 	readonly schemaVersion: 1;
@@ -195,7 +196,17 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 		return exitCode;
 	}
 	const ensure = ensureAcpxSession(config, env);
-	if (ensure.exitCode !== 0) throw new Error(`ACPX session ensure failed after ${ensure.attempts} attempt(s): ${ensure.stderr || ensure.stdout}`);
+	if (ensure.exitCode !== 0) {
+		// No prompt ran, but the attempt is over: publish a failed result so collect settles it now instead of
+		// waiting for a result that will never come. A missing acpx executable still throws above, unrecorded.
+		const message = `ACPX session ensure failed after ${ensure.attempts} attempt(s): ${(ensure.stderr || ensure.stdout).trim()}`;
+		if (!config.attemptKey) throw new Error(message);
+		console.error(message);
+		const output = new RuntimeOutputFiles(join(dirname(config.resultPath), "runtime-output"), { attemptKey: config.attemptKey, sessionId: config.sessionName, requestId: null });
+		output.stderr(Buffer.from(`${ensure.stderr}${ensure.stdout}`));
+		publishWorkerResult(config, join(dirname(config.resultPath), "runtime-output"), output.finish({ kind: "failed", exitCode: ensure.exitCode, error: message }));
+		return ensure.exitCode || 1;
+	}
 	{
 		const ensured = jsonAction(ensure.stdout, "session_ensured");
 		if (!config.attemptKey || typeof ensured?.acpxSessionId !== "string") throw new Error("runtime output requires exact attempt and ensured session identity");
@@ -204,16 +215,21 @@ export async function runAcpxWorker(config: AcpxWorkerConfig): Promise<number> {
 		const renderer = new AcpxRenderer((piece) => process.stdout.write(piece), { color: process.stdout.isTTY === true });
 		const output = await runRuntimeProcess({ executable: config.acpxExecutable, args: buildPromptArgv(config), cwd: process.cwd(), env, outputDir, identity: { attemptKey: config.attemptKey, sessionId: ensured.acpxSessionId, requestId: null }, timeoutMs: config.timeoutSeconds * 1000, onStdout: (bytes) => renderer.push(bytes) });
 		renderer.end();
-		const result = { schemaVersion: 2, resultContract: "runtime-v1", agent: config.agent, selectedModel: config.selectedModel, sessionName: config.sessionName, attemptKey: config.attemptKey, outputDir, output };
-		// The waiter polls for this path's existence and then parses it, so it must never exist half-written:
-		// creating it first and writing after left a window where the poll saw an empty file and the wait
-		// failed with "invalid ACPX worker result: Expecting value: line 1 column 1 (char 0)".
-		const pending = `${config.resultPath}.${process.pid}.tmp`;
-		const fd = openSync(pending, "wx", 0o600);
-		try { writeFileSync(fd, JSON.stringify(result, null, 2) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
-		renameSync(pending, config.resultPath);
+		publishWorkerResult(config, outputDir, output);
 		return output.outcome.kind === "exited" ? output.outcome.exitCode : 2;
 	}
+}
+
+/** Writes the schema-2 runtime-v1 worker result that settlement reads. */
+function publishWorkerResult(config: AcpxWorkerConfig, outputDir: string, output: RuntimeOutputResult): void {
+	const result = { schemaVersion: 2, resultContract: "runtime-v1", agent: config.agent, selectedModel: config.selectedModel, sessionName: config.sessionName, attemptKey: config.attemptKey, outputDir, output };
+	// The waiter polls for this path's existence and then parses it, so it must never exist half-written:
+	// creating it first and writing after left a window where the poll saw an empty file and the wait
+	// failed with "invalid ACPX worker result: Expecting value: line 1 column 1 (char 0)".
+	const pending = `${config.resultPath}.${process.pid}.tmp`;
+	const fd = openSync(pending, "wx", 0o600);
+	try { writeFileSync(fd, JSON.stringify(result, null, 2) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+	renameSync(pending, config.resultPath);
 }
 
 async function main(): Promise<void> {

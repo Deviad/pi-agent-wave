@@ -86,7 +86,11 @@ publisher and removes the endpoint descriptor, then writes `status.json` (schema
   `acpx --cwd <process.cwd()> --format json --json-strict --timeout <configured> --ttl 5 <agent>
   sessions ensure --name <sessionName>`; the result is read as JSON and the `session_ensured`
   action's `acpxSessionId` is required (`runAcpxWorker`). `ensureAcpxSession` retries exactly once
-  after ~100 ms when the failure text contains `Cannot call write after a stream was destroyed`.
+  after ~100 ms when the failure text contains `Cannot call write after a stream was destroyed`. If
+  the ensure still fails, the worker writes the schema-2 worker result anyway, with a `failed` outcome
+  whose error is `ACPX session ensure failed after <n> attempt(s): <acpx output>` and an empty capture
+  (the ACPX output kept as `worker.stderr.txt`), so `collect` settles the attempt at once; a missing
+  `acpx` executable still throws without a result (`tasks/handoff-worker-startup-failure.md`).
 - **Prompt.** `buildPromptArgv` produces
   `acpx --cwd <process.cwd()> --format json --json-strict --timeout <configured> --ttl 5 --model
   <model> --permission-policy <json> --non-interactive-permissions fail [--no-terminal] <agent>
@@ -211,6 +215,11 @@ Herdr is driven only through its CLI with direct argv, never a shell. The comman
 `SIGKILL` (`lib/pane-read.ts:PANE_READ_TIMEOUT_MS`, `readPane`). No settle decision reads a pane's agent
 status: `wait_for_settled_agent` settles only on the worker's result file and refuses a resource
 that has none; `herdr agent get <pane>` is an advisory liveness probe that can only end a wait early.
+So is the process table: a pane outlives a worker that died early (its shell returns to the prompt
+and Herdr keeps reporting the agent), so after `WORKER_LAUNCH_GRACE_S` (60 s, mirroring
+`lib/liveness.ts:LAUNCH_GRACE_MS`) each liveness probe also runs `ps -axo command=`
+(`worker_process_present`) and ends the wait with `Herdr worker process gone before result` when no
+line carries the attempt's AgentFS session or attempt directory; an unreadable table keeps waiting.
 
 ### 1.7 The launchd deferred resume
 
@@ -565,8 +574,9 @@ resume: it is resumed by the operator, or it stays deferred until pruned.
    (`provider credential target changed`), `worker-report-missing`, `worker-credential-preflight`
    (`worker preflight|no usable credential`), `worker-report-unavailable` (`REPORT_UNAVAILABLE`),
    `worker-exited-before-result`, `worker-gone` (`attempt directory removed before result`,
-   `no longer registered before result`, or a message starting `worker orphaned:` — the same death
-   noticed by Herdr's wait or by `collect` after a reboot), `worker-empty-answer`
+   `no longer registered before result`, `process gone before result`, or a message starting `worker orphaned:` — the same death
+   noticed by Herdr's wait or by `collect` after a reboot), `worker-startup-failure` (`ACPX session ensure failed` or `Cannot call write after a stream was
+   destroyed`: the ACP session could not be opened and no prompt ran), `worker-empty-answer`
    (`exited without a candidate`),
    `runtime-snapshot-churn` (`runtime configuration snapshot changed`), `agentfs-audit-error`
    (`AgentFS audit error`), `agentfs-snapshot-error` (`AgentFS snapshot failed`), and `timeout` for

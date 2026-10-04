@@ -41,6 +41,14 @@ describe("transient failure policy", () => {
 			"worker orphaned: private run directory /private/tmp/delegate-graph-herdr-run-x._grcts5h no longer exists, so no result can appear",
 		]) expect(classifyFailure(message)).toEqual({ kind: "transient", reason: "worker-gone" });
 		expect(classifyFailure("headless worker exited before result: no diagnostic output").reason).toBe("worker-exited-before-result");
+		expect(classifyFailure("Herdr worker process gone before result: dg_run-d0ca_thinker_90f09d18")).toEqual({ kind: "transient", reason: "worker-gone" });
+	});
+
+	test("a worker whose ACPX session could not be opened is transient", () => {
+		const observed = 'ACPX session ensure failed after 2 attempt(s): {"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error: Cannot call write after a stream was destroyed","data":{"acpxCode":"RUNTIME","origin":"cli","sessionId":"unknown"}}}';
+		expect(classifyFailure(observed)).toEqual({ kind: "transient", reason: "worker-startup-failure" });
+		expect(classifyFailure("ACPX session ensure failed after 1 attempt(s): agent exited")).toEqual({ kind: "transient", reason: "worker-startup-failure" });
+		expect(classifyFailure("Internal error: Cannot call write after a stream was destroyed")).toEqual({ kind: "transient", reason: "worker-startup-failure" });
 	});
 
 	test("a genuine unowned-changes export refusal stays permanent", () => {

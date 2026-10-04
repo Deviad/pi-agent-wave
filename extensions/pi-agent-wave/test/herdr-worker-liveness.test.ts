@@ -75,6 +75,44 @@ def fake_run(argv, check=True, **_kwargs):
 		assert.deepEqual(observed.calls, [["herdr", "agent", "get", "wZ:p9"]], "the probe must target the pane: `herdr agent get <name>` answers agent_not_found for a live worker");
 	});
 
+	test("fails within seconds when the worker process is gone although its pane still reports the agent", () => {
+		// run_d0caa7e3 (2026-10-04): the worker died at `sessions ensure`, the pane's shell went back to its
+		// prompt, and Herdr kept answering `working` for that pane, so only the process table told the truth.
+		const body = String.raw`
+resource['agentfs_session'] = 'dg-thinker-0-0-fixture'
+core['WORKER_LAUNCH_GRACE_S'] = 0
+def fake_run(argv, check=True, **_kwargs):
+    calls.append(argv)
+    if argv[0] == 'ps':
+        return Result(0, '  101 /bin/zsh -l\n  102 node some-other-agent dg-thinker-9-9-other\n')
+    return Result(0, json.dumps({'result': {'agent': {'agent': 'worker', 'agent_status': 'working', 'pane_id': 'wZ:p9'}}}))
+`;
+		const observed = probe(body, "herdr");
+		assert.match(String(observed.error), /^Herdr worker process gone before result: worker$/);
+		assert.ok(Number(observed.elapsed) < 3, `took ${observed.elapsed}s`);
+	});
+
+	test("a live worker process, or an unreadable process table, keeps the wait going", () => {
+		for (const table of ["Result(0, '  201 agentfs run --session dg-thinker-0-0-fixture --no-default-allows node acpx-worker.ts\\n')", "Result(1, 'ps: operation not permitted')"]) {
+			const body = String.raw`
+resource['agentfs_session'] = 'dg-thinker-0-0-fixture'
+core['WORKER_LAUNCH_GRACE_S'] = 0
+def fake_run(argv, check=True, **_kwargs):
+    calls.append(argv)
+    if argv[0] == 'ps':
+        return ${table}
+    return Result(0, json.dumps({'result': {'agent': {'agent': 'worker', 'agent_status': 'working', 'pane_id': 'wZ:p9'}}}))
+def finish():
+    (attempt_dir / 'worker-result.json').write_text(json.dumps({'schemaVersion': 2, 'resultContract': 'runtime-v1'}))
+threading.Timer(1.0, finish).start()
+core['wait_for_worker_exit'] = lambda resource: None
+`;
+			const observed = probe(body, "herdr");
+			assert.equal(observed.error, null, `${table} must not end the wait`);
+			assert.ok((observed.calls as string[][]).some((argv) => argv[0] === "ps"), "the process table was consulted");
+		}
+	});
+
 	test("a malformed liveness answer keeps waiting for the result", () => {
 		const body = String.raw`
 def fake_run(argv, check=True, **_kwargs):

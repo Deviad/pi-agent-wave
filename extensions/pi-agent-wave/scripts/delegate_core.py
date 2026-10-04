@@ -45,6 +45,9 @@ RUN_PREFIX = "delegate-graph-herdr-"
 WAIT_TIMEOUT_MS = os.environ.get("PI_DELEGATE_WAIT_TIMEOUT_MS", "3600000")
 # How often a Herdr wait asks `herdr agent get` whether the worker still exists; the attempt directory is checked every tick.
 HERDR_LIVENESS_INTERVAL_S = float(os.environ.get("PI_DELEGATE_HERDR_LIVENESS_INTERVAL_S", "5"))
+# How long after the wait starts a Herdr worker may be absent from the process table: the pane starts the
+# launcher after the attempt is registered. Mirrors LAUNCH_GRACE_MS in lib/liveness.ts.
+WORKER_LAUNCH_GRACE_S = 60.0
 START_READY_TIMEOUT_SECONDS = 10.0
 START_RETRY_SECONDS = 0.2
 STATE_LOCK_TIMEOUT_SECONDS = 10.0
@@ -1153,6 +1156,19 @@ def herdr_agent_registered(pane_id: str) -> bool:
         return True
 
 
+def worker_process_present(resource: dict[str, Any]) -> bool | None:
+    """Whether any process carries the attempt's AgentFS session or attempt directory, the markers
+    lib/liveness.ts:workerLiveness uses; None when the process table cannot be read, which is not
+    evidence of absence."""
+    markers = [str(marker) for marker in (resource.get("agentfs_session"), resource.get("attempt_dir")) if marker]
+    if not markers:
+        return None
+    table = run(["ps", "-axo", "command="], check=False)
+    if table.returncode != 0:
+        return None
+    return any(marker in line for line in (table.stdout or "").splitlines() for marker in markers)
+
+
 def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
     agent_name = str(resource["agent"])
     if resource.get("execution") == "acpx-agentfs":
@@ -1160,6 +1176,7 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
         attempt_dir = Path(str(resource.get("attempt_dir", "")))
         deadline = time.monotonic() + (int(WAIT_TIMEOUT_MS) / 1000)
         next_liveness_probe = time.monotonic() + HERDR_LIVENESS_INTERVAL_S
+        process_checks_from = time.monotonic() + WORKER_LAUNCH_GRACE_S
         while time.monotonic() < deadline and not result_path.exists():
             worker_pid = resource.get("worker_pid")
             if not using_herdr() and isinstance(worker_pid, int) and not process_alive(worker_pid):
@@ -1168,7 +1185,8 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
                 raise DelegateError(f"headless worker exited before result: {diagnostic[-2000:]}")
             if using_herdr():
                 # A Herdr worker has no pid to watch; its teardown is visible as the attempt directory
-                # disappearing (abort_acpx_attempt removes it) or Herdr forgetting the agent.
+                # disappearing (abort_acpx_attempt removes it), Herdr forgetting the agent, or no process
+                # carrying the attempt's markers any more.
                 if str(attempt_dir) and not attempt_dir.exists():
                     raise DelegateError(f"Herdr worker attempt directory removed before result: {attempt_dir}")
                 pane_id = str(resource.get("pane", ""))
@@ -1178,6 +1196,10 @@ def wait_for_settled_agent(run_dir: Path, resource: dict[str, Any]) -> None:
                         raise DelegateError(
                             f"Herdr worker no longer registered before result: {agent_name} on pane {pane_id}"
                         )
+                    # A pane outlives a worker that died early (its shell returns to the prompt and Herdr
+                    # keeps reporting the agent), so the process table is asked as well.
+                    if time.monotonic() >= process_checks_from and worker_process_present(resource) is False and not result_path.exists():
+                        raise DelegateError(f"Herdr worker process gone before result: {agent_name}")
             time.sleep(0.1)
         if not result_path.exists():
             raise DelegateError(f"ACPX worker result timed out: {result_path}")
