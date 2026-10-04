@@ -34,6 +34,15 @@ describe("transient failure policy", () => {
 		expect(classifyFailure("AgentFS audit error (2 total)").reason).toBe("agentfs-audit-error");
 	});
 
+	test("a worker gone before its result is transient whichever transport noticed it, and whenever", () => {
+		for (const message of [
+			"Herdr worker attempt directory removed before result: /tmp/delegate-graph-herdr-run.x/acpx/dg_a",
+			"Herdr worker no longer registered before result: dg_a on pane w2:pF",
+			"worker orphaned: private run directory /private/tmp/delegate-graph-herdr-run-x._grcts5h no longer exists, so no result can appear",
+		]) expect(classifyFailure(message)).toEqual({ kind: "transient", reason: "worker-gone" });
+		expect(classifyFailure("headless worker exited before result: no diagnostic output").reason).toBe("worker-exited-before-result");
+	});
+
 	test("a genuine unowned-changes export refusal stays permanent", () => {
 		expect(classifyFailure("AgentFS export failed (exit 2): unowned changes (1 total): src/escape.ts")).toEqual({ kind: "permanent", reason: "unclassified" });
 		expect(classifyFailure("AgentFS contains unowned changes: unowned.txt").kind).toBe("permanent");

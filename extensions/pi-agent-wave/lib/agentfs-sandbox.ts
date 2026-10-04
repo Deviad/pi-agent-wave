@@ -96,7 +96,8 @@ function normalizeChangedPath(path: string): string {
 	return path.replace(/^\/+/, "").split("/").filter(Boolean).join("/");
 }
 
-function platformMetadata(path: string): boolean {
+/** Finder and NFS sidecars (`._*`, `.DS_Store`): never work, never placed. */
+export function platformMetadata(path: string): boolean {
 	return path.split("/").some((part) => part.startsWith("._") || part === ".DS_Store");
 }
 

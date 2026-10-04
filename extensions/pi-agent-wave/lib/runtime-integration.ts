@@ -143,27 +143,49 @@ export class RuntimeIntegration {
 		});
 	}
 
+	/** The integration journaled for a candidate in a workspace, if any, and whether it ran Git checks. */
+	forCandidate(workspace: string, candidateId: string): (IntegrationStatus & { readonly gitChecks: boolean }) | null {
+		const row = this.db.query<JournalRow, [string, string]>("SELECT * FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?").get(realpathSync(resolve(workspace)), candidateId);
+		return row ? { ...this.get(row.id), gitChecks: parseManifest(row.manifest_json).gitChecks } : null;
+	}
+
 	get(id: string): IntegrationStatus {
 		const row = this.row(id);
 		return { id, state: row.state, direction: row.direction, error: row.error, overrideReason: row.override_reason };
 	}
 
-	private target(workspace: string, path: string): string {
+	/**
+	 * Resolves an entry's absolute target, refusing symlinked parents. With Git checks every parent must
+	 * already exist and none may hold a nested repository, because Git's index and submodules own those
+	 * paths. Placement without Git checks has neither concern: a missing parent means the file is absent
+	 * (null), and `createParents` makes the directories when a file is about to be written.
+	 */
+	private target(workspace: string, path: string, gitChecks: boolean, createParents = false): string | null {
 		relativePath(path);
 		const parts = path.split("/");
 		let parent = workspace;
 		for (const part of parts.slice(0, -1)) {
 			parent = join(parent, part);
-			const stat = lstatSync(parent);
+			let stat;
+			try { stat = lstatSync(parent); }
+			catch (error) {
+				if (gitChecks || !absent(error)) throw error;
+				if (!createParents) return null;
+				mkdirSync(parent);
+				syncDirectory(dirname(parent));
+				stat = lstatSync(parent);
+			}
 			if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("integration parent must be an existing real directory");
+			if (!gitChecks) continue;
 			try { lstatSync(join(parent, ".git")); throw new Error("submodule or nested repository path is unsupported"); }
 			catch (error) { if (!absent(error)) throw error; }
 		}
 		return join(workspace, ...parts);
 	}
 
-	private snapshot(workspace: string, path: string, retain: boolean): FileImage | null {
-		const target = this.target(workspace, path);
+	private snapshot(workspace: string, path: string, retain: boolean, gitChecks: boolean): FileImage | null {
+		const target = this.target(workspace, path, gitChecks);
+		if (target === null) return null;
 		let stat;
 		try { stat = lstatSync(target); } catch (error) { if (absent(error)) return null; throw error; }
 		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("integration requires a regular file without symlinks or hard links");
@@ -208,7 +230,7 @@ export class RuntimeIntegration {
 				if (!ownedPaths.some((owned) => path === owned || path.startsWith(`${owned}/`))) throw new Error("unowned integration path");
 				if (seen.some((other) => other === path || other.startsWith(`${path}/`) || path.startsWith(`${other}/`))) throw new Error("overlapping integration entries");
 				seen.push(path);
-				const before = this.snapshot(workspace, path, true);
+				const before = this.snapshot(workspace, path, true, gitChecks);
 				if (gitChecks) {
 					const status = execFileSync("git", ["--literal-pathspecs", "-C", workspace, "status", "--porcelain", "--untracked-files=all", "--", path], { encoding: "utf8", timeout: 10_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
 					// A path this journal already applied and nobody committed is the graph's own doing, not the
@@ -257,7 +279,8 @@ export class RuntimeIntegration {
 	}
 
 	private replace(manifest: Manifest, entry: Entry, image: FileImage | null): void {
-		const target = this.target(manifest.workspace, entry.path);
+		const target = this.target(manifest.workspace, entry.path, manifest.gitChecks, image !== null);
+		if (target === null) throw new Error(`integration parent of ${entry.path} is missing`);
 		if (image === null) { unlinkSync(target); syncDirectory(dirname(target)); return; }
 		this.content.verify(image.content);
 		const contentFd = openSync(this.content.path(image.content), constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -299,7 +322,7 @@ export class RuntimeIntegration {
 				const observed = manifest.entries.map((entry) => {
 					this.clearTemporary(this.temporary(manifest, entry));
 					for (const image of [entry.before, entry.after]) if (image) this.content.verify(image.content);
-					const image = this.snapshot(manifest.workspace, entry.path, false);
+					const image = this.snapshot(manifest.workspace, entry.path, false, manifest.gitChecks);
 					if (canonical(image) !== canonical(entry.before) && canonical(image) !== canonical(entry.after)) throw new Error(`integration conflict at ${entry.path}`);
 					return image;
 				});
@@ -324,6 +347,24 @@ export class RuntimeIntegration {
 
 	apply(id: string): IntegrationStatus { return this.finish(id, "apply"); }
 	rollback(id: string): IntegrationStatus { return this.finish(id, "rollback"); }
+
+	/**
+	 * Reverses a placement made without Git checks, including one already `applied`, which `rollback`
+	 * refuses. Each file must still equal its placed image or its preimage, so a later edit stops the undo
+	 * in `needs_reconciliation` and is never overwritten. Integrations with Git checks are reverted with Git.
+	 */
+	undo(id: string): IntegrationStatus {
+		this.transaction(() => {
+			const row = this.row(id);
+			const manifest = parseManifest(row.manifest_json);
+			if (manifest.gitChecks) throw new Error("undo applies only to placements without Git checks; revert this integration with Git");
+			if (row.state !== "applied") return;
+			const active = this.db.query("SELECT id FROM runtime_integrations WHERE workspace=? AND id<>? AND state IN ('prepared','applying','needs_reconciliation')").get(manifest.workspace, id);
+			if (active) throw new Error("undo refused: the workspace has an active integration");
+			this.db.query("UPDATE runtime_integrations SET state='applying',direction='rollback',error=NULL WHERE id=?").run(id);
+		});
+		return this.finish(id, "rollback");
+	}
 	private finish(id: string, direction: Direction): IntegrationStatus {
 		let result = this.advance(id, direction);
 		while (result.state === "applying") result = this.advance(id, direction);

@@ -25,9 +25,11 @@ worker is *noticed*, and a live-but-quiet worker is *bounded*. Today none of the
 | 4 | Waits key on pane status instead of the worker's own result file | A healthy worker can appear idle-less for the whole wait bound | `herdr agent wait --until idle --timeout 780000` timed out while the worker was healthy |
 | 5 | The `delegate-ledger` wrapper cannot resolve a *relative* package path | A false alarm that reads as "the ledger was lost" | wrapper line 22 discards the relative entry at `~/.pi/agent/settings.json:28` |
 | 6 | Orphaned Herdr tabs survive a run that never settles | Tabs accumulate; a six-day-old worker tab is still open | `w1:tC` from `run_a6a35211` |
+| 7 | A worker that disappears is classified by transport and timing, not by what happened (added 2026-10-03 evening, §8a) | A Herdr worker that dies, or any worker lost to a reboot, parks the run for the operator; the same death on headless is retried | `run_ab8675e8` `op_6c32d0f7…`, rehearsed on a copy |
 
 Items 1 and 2 are the ones that make unattended operation unsafe. Items 3–6 are the ones that make it
-expensive or confusing.
+expensive or confusing. Item 7 completes item 2: item 2 made a dead worker visible, item 7 makes it
+recoverable without the operator while budget remains.
 
 ## 2. How this was found, and where the evidence is
 
@@ -501,6 +503,103 @@ where the orphan is settled: `collect`'s orphan path. The run-end sweep runs aft
   and asserts it is untouched (the cleaner must act only on rows it created).
   Evidence: the same unit test keeps `w1:t1` (never recorded) and `w1:tD` (recorded id, now another
   run's label → `not-owned`) open; the tool test keeps the operator's `w1:t1`.
+
+## 8a. Issue 7 — a worker that disappears is classified by transport and timing
+
+### 8a.1 Symptom
+
+The same event — a worker gone before writing its result — is transient on one path and permanent on
+the others, so whether `op=retry` replaces the worker or parks the run for the operator depends on the
+transport and on when the death is noticed, not on what happened.
+
+### 8a.2 Evidence
+
+`retry.ts:classifyFailure` run on the four messages the code produces for that event (2026-10-03):
+
+| Where the death is noticed | Message source | Classification |
+| --- | --- | --- |
+| headless, during the wait | `scripts/delegate_core.py:wait_for_settled_agent` `headless worker exited before result` | `transient` / `worker-exited-before-result` |
+| Herdr, attempt directory gone during the wait | same function, `Herdr worker attempt directory removed before result` | `permanent` / `unclassified` |
+| Herdr, agent gone during the wait | same function, `Herdr worker no longer registered before result` | `permanent` / `unclassified` |
+| any transport, at `collect` (reboot, `/tmp` sweep) | `index.ts:collectRuntimeAttempt` `worker orphaned: private run directory … no longer exists` | `permanent` / `unclassified` |
+
+The last row is what `run_ab8675e8` produced when rehearsed on a copy of the store
+(`agent-output/durable-worker-record-20261003/zombie-rehearsal-*.json`): `retry` → `awaiting_user`,
+classification `unclassified`. A permanent failure goes straight to `awaiting_user`
+(`store.ts:retryRuntimeAttempt`); no budget is spent and the frozen chain is never consulted.
+
+### 8a.3 Why this matters
+
+The asymmetry has no rationale in the code: none of the three Herdr/collect messages was deliberately
+made permanent, they simply match no pattern and fall through to `unclassified`. Its effect is that a
+reboot, a closed tab or a crashed Herdr server always needs the operator, while the identical headless
+death does not. `AGENTS.md` already treats "exit without a candidate" and connection loss as transient;
+a worker that vanished entirely is the same class of infrastructure failure.
+
+### 8a.4 Fix options
+
+- **(a) Classify every "worker gone before its result" message as transient, recommended.** One
+  pattern, reason `worker-gone`; the headless message keeps its existing reason so nothing pinned to it
+  moves. A worker that kills itself deterministically is bounded by the budget that already bounds the
+  headless case: three same-model attempts, then the frozen chain, then `retry_exhausted` →
+  `awaiting_user`.
+- **(b) Make all four permanent.** Consistent, but turns every headless worker crash into an operator
+  decision, which is the babysitting this work order exists to remove.
+- **(c) A dedicated budget for orphans.** Rejected: a second counter for a failure class the existing
+  budget already bounds.
+
+### 8a.5 Chosen design (2026-10-03, recorded before implementation)
+
+Option (a). `retry.ts:TRANSIENT_PATTERNS` gains `worker-gone`, matching
+`attempt directory removed before result`, `no longer registered before result` and a message that
+starts `worker orphaned:`. No message text changes, no new verb, no schema change.
+
+What this does and does not buy, stated so it is not over-read: `op=retry` is still the only path that
+applies the classification, so a worker lost to a reboot is replaced only when a supervisor calls
+`collect` and `retry`. The change removes the *operator* from that loop while budget remains; it does
+not make anything run while no supervisor session exists. A worker that is deliberately stopped by
+closing its tab is now retried rather than parked; the documented way to stop a worker remains
+`op=cancel` (or the agent list's Escape), which is not a retry path.
+
+Two existing tests used the orphan as a shortcut to a parked run (`worker-liveness-reaper.test.ts`,
+`run-tab-cleanup.test.ts`). They keep their `resolve abort` coverage by seeding the operation with its
+transient budget already spent (`transient_attempts = 3`, a one-model chain), so `retry` parks the run
+by exhaustion — the state in which the operator legitimately decides.
+
+### 8a.6 Acceptance criteria
+
+- [x] All three Herdr/collect messages classify `transient` / `worker-gone`, and the headless message
+  keeps `worker-exited-before-result`. Proof: `test/retry.test.ts`, red before the pattern is added.
+  Evidence: "a worker gone before its result is transient whichever transport noticed it, and
+  whenever" failed before the `retry.ts` pattern (1 fail of 24) and passes after (24 of 24).
+- [x] A first orphan's `retry` replaces the worker instead of parking the run: operation `pending`,
+  run `active`, classification `worker-gone`, `retry_not_before` set. Proof:
+  `test/worker-liveness-reaper.test.ts`, red before the change.
+  Evidence: "op=next reports the orphan, collect settles it failed, and retry replaces the worker
+  without parking the run" failed before with `actual: 'unclassified', expected: 'worker-gone'` and
+  passes after; it also asserts `transient_attempts: 1`.
+- [x] An orphan whose transient budget is spent still parks the run (`retry_exhausted` →
+  `awaiting_user`) and `resolve abort` still records its `events` row. Proof: the same file, seeded
+  with `transient_attempts = 3`.
+  Evidence: "an orphan whose transient budget is spent parks the run, and resolve aborts it with an
+  events row" failed before on the `retry_exhausted` assertion (the park was recorded as
+  `operation_failed`) and passes after with both the `retry_exhausted` and `abort` rows.
+- [x] `run-tab-cleanup.test.ts` still proves the tab sweep on `resolve abort`, reached by exhaustion.
+  Evidence: 3 of 3 pass, seeded at `transient_attempts = 3`. This test keeps the sweep covered; it
+  does not distinguish the classification change (with the seed it parks either way), which the two
+  reaper tests above do.
+- [x] `AGENTS.md`, `product.md`, `specification.md` §4.1 and `extensions/pi-agent-wave/README.md` list
+  the new transient reason.
+  Evidence: each names "a worker gone before its result"; the spec names `worker-gone` and its three
+  message forms.
+- [x] Full Node suite, `npm run typecheck` and `git diff --check` green.
+  Evidence (2026-10-03, uncommitted tree on `c096e4a`): `node --experimental-strip-types --test
+  extensions/pi-agent-wave/test/*.test.ts` exit 0, 619 tests, 608 pass, 0 fail, 11 skipped (opt-in);
+  `npm run typecheck` exit 0; `git diff --check` clean. Logs:
+  `agent-output/durable-worker-record-20261003/gate-node-suite.log`, `gate-typecheck.log`. The Bun
+  package checks named in `AGENTS.md` were **not run**: Bun is not installed on this host (not on
+  `PATH`, no `~/.bun`, not found by Spotlight). `package-docs.test.ts` passes under Node through the
+  `test-api.mjs` shim (11 of 11), which is not a substitute for the Bun run.
 
 ## 9. Sequencing, ownership and verification
 

@@ -200,6 +200,8 @@ const GraphParams = Type.Object({
 		checkpoint: Type.Optional(Type.String({ minLength: 1 })),
 	}, { additionalProperties: false }), { minItems: 1 })),
 	modelPolicy: Type.Optional(ModelPolicySchema),
+	/** Home mode: `$HOME` or a directory under it (`~` allowed); every operation runs there and its changes are placed without Git and undoable. */
+	workspaceRoot: Type.Optional(Type.String({ minLength: 1 })),
 	policyDigest: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
 	selectedModel: Type.Optional(Type.String({ minLength: 1 })),
 	modelAttempt: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -924,6 +926,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 						required(params.task, "task"),
 						resolved,
 						params.commands as OperationalCommandSpec[] | undefined,
+						params.workspaceRoot === undefined ? {} : { workspaceRoot: params.workspaceRoot },
 					);
 					progress("run_created", { runId: state.runId, graph: params.graph ?? "build", status: state.status });
 					return textResult({ state, next: graphStore.next(state.runId) });
@@ -964,14 +967,16 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					const selectedModel = operation.route.chain[operation.model_attempt] ?? operation.route.chain[0];
 					if (!selectedModel) throw new Error(`operation ${operationId} has no selected model`);
 					const workerTransport = params.transport ? parseWorkerTransportKind(params.transport) : ctx.mode === "tui" ? selectTransport(process.env, "auto") : "headless";
-					let dispatchCwd = ctx.cwd;
+					// A home run works in its recorded root whatever directory the session was started in.
+					const homeRoot = graphStore.getRun(runId).workspace_root;
+					let dispatchCwd = homeRoot ?? ctx.cwd;
 					if (operation.command_json) {
 						const command: unknown = JSON.parse(operation.command_json);
 						if (isRecord(command) && typeof command.cwd === "string" && command.cwd) dispatchCwd = command.cwd;
 					}
 					const execute = executor(pi, dispatchCwd);
 					const declaredOwnership: unknown = operation.owned_paths_json ? JSON.parse(operation.owned_paths_json) : [];
-					if (Array.isArray(declaredOwnership) && declaredOwnership.length) {
+					if (!homeRoot && Array.isArray(declaredOwnership) && declaredOwnership.length) {
 						// A worker writes only inside the copy-on-write overlay rooted at this directory, so a slice
 						// that owns anything outside it is unsatisfiable. Settlement would reject it as an
 						// `AgentFS audit error`, which retry.ts classifies transient: without this check one malformed
@@ -986,7 +991,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, baseDir, state: refused.state, operation: refused.operation });
 						}
 					}
-					if (operation.node === "implement") {
+					if (operation.node === "implement" && !homeRoot) {
 						// Coding settlement diffs against the HEAD the launcher records in this directory; without one the
 						// worker's whole turn would be discarded at collect, so the refusal happens before anything exists.
 						const baseDir = realpathSync(dispatchCwd ?? process.cwd());
@@ -1014,7 +1019,7 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					}
 					progress("runtime_evidence_materialized", { runId, operationId, ledgerPath: evidence.ledgerPath, answers: evidence.answers.length });
 					const role = roleForNode(operation.node);
-					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
+					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", homeRoot && operation.read_only !== 1 ? JSON.stringify(["."]) : operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--workspace-mode", homeRoot ? "home" : "repository", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
 					if (operation.command_json) startArgs.push("--command-json", operation.command_json);
 					const started = await execute(process.execPath, startArgs);
 					if (started.exitCode !== 0) {

@@ -1,8 +1,8 @@
 import { Database } from "./sqlite.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { decideTransition, graphDefinition } from "./graph-core.ts";
 import { classifyFailure, retryDelayMs, selectModelFallback, type ModelFallbackDecision } from "./retry.ts";
 import { parseAcpAgent, parseAcpxState, type AcpAgent, type AcpxState } from "./lib/acpx-types.ts";
@@ -53,7 +53,7 @@ export const DEFAULT_DB_PATH = join(DEFAULT_GRAPH_HOME, "delegate-graph.db");
  * and `migrate()` refuses a build whose migrations stop short of it, so forgetting to bump it is a
  * loud failure instead of a store that silently reports an older version.
  */
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 export interface StoreOptions {
 	dbPath?: string;
@@ -296,6 +296,22 @@ function slicesFromPayload(payload: Record<string, unknown> | undefined): SliceS
 }
 
 /** Owns the SQLite event stream and materialized state for every delegate graph run. */
+/**
+ * Validates a home run's working directory: an existing real directory equal to or under the real
+ * `$HOME`, on a graph whose operations take the run's directory (an operations command names its own).
+ */
+function homeWorkspaceRoot(path: string, graph: GraphKind): string {
+	if (graph !== "build" && graph !== "research") throw new Error("a home workspace is only for the build or research graph");
+	const home = realpathSync(homedir());
+	const expanded = path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path;
+	if (!isAbsolute(expanded)) throw new Error("a home workspace must be an absolute path or start with ~");
+	let real: string;
+	try { real = realpathSync(expanded); } catch { throw new Error(`a home workspace must be an existing directory: ${expanded}`); }
+	if (!statSync(real).isDirectory()) throw new Error(`a home workspace must be an existing directory: ${real}`);
+	if (real !== home && !real.startsWith(`${home}/`)) throw new Error(`a home workspace must be HOME or a directory under HOME (${home}): ${real}`);
+	return real;
+}
+
 export class GraphStore {
 	readonly dbPath: string;
 	private readonly db: Database;
@@ -410,6 +426,7 @@ export class GraphStore {
 		this.migrateToV10();
 		this.migrateToV11();
 		this.migrateToV12();
+		this.migrateToV13();
 		if (this.schemaVersion() !== CURRENT_SCHEMA_VERSION) {
 			throw new Error(`store migrated to schema v${this.schemaVersion()}, but this build expects v${CURRENT_SCHEMA_VERSION}`);
 		}
@@ -858,6 +875,21 @@ export class GraphStore {
 	 * kept as a value instead: that is what lets a story outlive the run that produced it. Claims
 	 * cascade from their entry, because they are part of it rather than a record of their own.
 	 */
+	/** v13 records a home run's working directory; NULL keeps every earlier run a repository run. */
+	private migrateToV13(): void {
+		if (this.schemaVersion() >= 13) return;
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			if (this.schemaVersion() >= 13) { this.db.exec("ROLLBACK"); return; }
+			this.ensureColumn("runs", "workspace_root", "TEXT");
+			this.db.exec("INSERT OR REPLACE INTO schema_version(version) VALUES (13)");
+			this.db.exec("COMMIT");
+		} catch (error) {
+			this.db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
 	private migrateToV12(): void {
 		if (this.schemaVersion() >= 12) return;
 		this.db.exec("BEGIN IMMEDIATE");
@@ -1000,8 +1032,10 @@ export class GraphStore {
 		task: string,
 		policy: ResolvedPolicy = DEFAULT_AUTO_POLICY,
 		operationalCommands?: OperationalCommandSpec[],
+		options: { readonly workspaceRoot?: string } = {},
 	): RunState {
 		if (!story.trim() || !task.trim()) throw new Error("story and task are required");
+		const root = options.workspaceRoot === undefined ? null : homeWorkspaceRoot(options.workspaceRoot, graph);
 		this.assertPolicy(policy);
 		const commands = graph === "operations" ? validateOperationalCommands(operationalCommands) : undefined;
 		if (graph !== "operations" && operationalCommands?.length) throw new Error("structured commands require the operations graph");
@@ -1011,7 +1045,7 @@ export class GraphStore {
 		const policyJson = stableStringify(policy);
 		const digest = policyDigest(policy);
 		return this.transaction(() => {
-			this.db.query("INSERT INTO runs(id,story,graph_name,task,status,policy_json,policy_digest,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").run(
+			this.db.query("INSERT INTO runs(id,story,graph_name,task,status,policy_json,policy_digest,created_at,updated_at,workspace_root) VALUES (?,?,?,?,?,?,?,?,?,?)").run(
 				runId,
 				story,
 				graph,
@@ -1021,6 +1055,7 @@ export class GraphStore {
 				digest,
 				now,
 				now,
+				root,
 			);
 			this.db.query("INSERT INTO graphs(run_id,name,definition_json,sha256) VALUES (?,?,?,?)").run(
 				runId,
@@ -1036,7 +1071,7 @@ export class GraphStore {
 				"active",
 				now,
 			);
-			this.event({ runId, type: "run_initialized", toNode: definition.initialNode, replyTo: definition.initialNode, payload: { story, graph, task, policy: { digest, input: policy.input } } });
+			this.event({ runId, type: "run_initialized", toNode: definition.initialNode, replyTo: definition.initialNode, payload: { story, graph, task, policy: { digest, input: policy.input }, ...(root ? { workspaceRoot: root } : {}) } });
 			if (commands) {
 				for (const item of commands) this.insertOperation(runId, definition.initialNode, item.name, 1, 0, item.id, item.ownedPaths, item.checkpoint ? { ...item.command, checkpoint: item.checkpoint } : item.command);
 			} else {
@@ -1404,7 +1439,7 @@ export class GraphStore {
 		}
 		const journal = new RuntimeIntegration(this.dbPath);
 		try {
-			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding", overrideReason: override ?? null }, () => {
+			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding" && this.getRun(attempt.runId).workspace_root === null, overrideReason: override ?? null }, () => {
 				const run = this.getRun(attempt.runId);
 				const operation = this.getOperation(attempt.operationId);
 				if (run.status !== "active" || operation.status === "cancelled") throw new Error(`runtime integration unavailable: ${run.status === "active" ? operation.status : run.status}`);
@@ -1417,8 +1452,36 @@ export class GraphStore {
 		} finally { journal.close(); }
 	}
 
+	/**
+	 * Undoes a placement made without Git checks after it was applied, whatever the graph or the run has
+	 * done since: undoing is the operator's decision, and its point is to be available after the run
+	 * moved on. Returns null when the candidate has no applied placement, so the caller falls back to the
+	 * ordinary rollback. Changes no graph state and records `integration_undone`.
+	 */
+	undoRuntimeIntegration(attemptKey: string, manifestReference: RuntimeContent): IntegrationStatus | null {
+		const attempt = this.runtimeAttempt(attemptKey);
+		const candidate = attempt.candidate;
+		if (!candidate || (candidate.kind !== "coding" && candidate.kind !== "operational") || !attempt.candidateId) return null;
+		if (!candidate.artifacts.some((item) => canonical(item) === canonical(manifestReference))) throw new Error("candidate does not retain this staging manifest");
+		const content = new RuntimeContentStore(this.dbPath);
+		const staging = parseRuntimeStagingManifest(JSON.parse(content.read(manifestReference, 16 * 1024 * 1024).toString("utf8")));
+		const journal = new RuntimeIntegration(this.dbPath);
+		try {
+			const found = journal.forCandidate(staging.workspace, attempt.candidateId);
+			if (!found || found.gitChecks || found.state !== "applied") return null;
+			for (const reference of candidateContents(candidate)) content.verify(reference);
+			const status = journal.undo(found.id);
+			this.transaction(() => this.event({ runId: attempt.runId, type: "integration_undone", operationId: attempt.operationId, payload: { integrationId: found.id, attemptKey, state: status.state } }));
+			return status;
+		} finally { journal.close(); }
+	}
+
 	/** Applies a prepared candidate integration to completion, or rolls it back; each file step is journaled. */
 	applyRuntimeIntegration(attemptKey: string, manifest: RuntimeContent, direction: "apply" | "rollback" = "apply", overrideReason?: string): IntegrationStatus {
+		if (direction === "rollback") {
+			const undone = this.undoRuntimeIntegration(attemptKey, manifest);
+			if (undone) return undone;
+		}
 		const prepared = this.prepareIntegration(attemptKey, manifest, direction === "rollback", overrideReason);
 		const journal = new RuntimeIntegration(this.dbPath);
 		try { return direction === "apply" ? journal.apply(prepared.id) : journal.rollback(prepared.id); }

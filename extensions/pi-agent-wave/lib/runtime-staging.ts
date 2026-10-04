@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, copyFileSync, existsSync, lstatSync, openSync, readSync, realpathSync, rmSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { makeScratchDir } from "./agent-paths.mjs";
-import { DEFAULT_IGNORED_PATHS, auditAgentFsChanges, agentFsAuditErrorMessage } from "./agentfs-sandbox.ts";
+import { DEFAULT_IGNORED_PATHS, auditAgentFsChanges, agentFsAuditErrorMessage, platformMetadata } from "./agentfs-sandbox.ts";
 import { RuntimeContentStore } from "./runtime-content.ts";
 import { canonical, parseRuntimeContent, type RuntimeContent } from "./runtime-results.ts";
 
@@ -40,6 +40,13 @@ export interface RuntimeStagingInput {
 	readonly attemptKey: string;
 	readonly ownedPaths: readonly string[];
 	readonly readOnly: boolean;
+	/**
+	 * A home run owns its whole working directory. Paths inside a `.git` directory, platform sidecars and
+	 * paths under `excludedRoots` (the graph home) are dropped rather than staged: the journal refuses the
+	 * first, the second would litter the home, and the third must never be placed over the live store.
+	 */
+	readonly ownWholeBase?: boolean;
+	readonly excludedRoots?: readonly string[];
 }
 
 function snapshotDigest(path: string): string {
@@ -63,14 +70,19 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 		copyFileSync(input.snapshotPath, workingSnapshot);
 		// Owned paths may arrive through a symlinked prefix (macOS /var -> /private/var); the manifest records them relative to the real workspace.
 		const ownedPaths = input.ownedPaths.map((path) => { const absolute = resolve(workspace, path); try { return realpathSync(absolute); } catch { return absolute; } });
-		const audit = auditAgentFsChanges(workingSnapshot, workspace, ownedPaths, { ignoredPaths: DEFAULT_IGNORED_PATHS.map((path) => resolve(workspace, path)), agentFsExecutable: input.agentFsExecutable });
+		const ownWholeBase = input.ownWholeBase === true;
+		const audit = auditAgentFsChanges(workingSnapshot, workspace, ownedPaths, { ignoredPaths: DEFAULT_IGNORED_PATHS.map((path) => resolve(workspace, path)), agentFsExecutable: input.agentFsExecutable, ownWholeBase });
+		const excluded = (input.excludedRoots ?? [])
+			.map((root) => { try { return relative(workspace, realpathSync(root)); } catch { return relative(workspace, resolve(root)); } })
+			.filter((path) => path && !path.startsWith("..") && !isAbsolute(path));
+		const staged = (path: string): boolean => !ownWholeBase || !(path.split("/").includes(".git") || platformMetadata(path) || excluded.some((root) => path === root || path.startsWith(`${root}/`)));
 		const errors = input.readOnly ? audit.errors.filter((error) => error.kind !== "audit_error") : audit.errors;
 		if (errors.length) throw new Error(agentFsAuditErrorMessage(errors));
 		if (!input.readOnly && audit.violations.length) throw new Error(`AgentFS contains unowned changes: ${audit.violations.map((item) => item.path).join(", ")}`);
 		const files: RuntimeContent[] = [];
 		// Container directories carry no content of their own: an owned file's parents are created when it
 		// is applied, so staging the container would only ask integration for a change Git does not model.
-		const changes = (input.readOnly ? [] : audit.owned).filter((change) => change.kind !== "directory").map((change) => {
+		const changes = (input.readOnly ? [] : audit.owned).filter((change) => change.kind !== "directory" && staged(change.path)).map((change) => {
 			let after: RuntimeContent | null = null;
 			if (change.kind === "file") {
 				const result = spawnSync(input.agentFsExecutable, ["fs", workingSnapshot, "cat", `/${change.path}`], { shell: false, encoding: null, maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
@@ -82,7 +94,8 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 		if (snapshotDigest(input.snapshotPath) !== before) throw new Error("AgentFS snapshot changed during staging");
 		const manifest = content.retain(Buffer.from(canonical({
 			version: 1, attemptKey: input.attemptKey, workspace, baseRevision: input.baseRevision, snapshotDigest: before,
-			ownedPaths: ownedPaths.map((path) => relative(workspace, path)), changes, readOnly: input.readOnly,
+			// The whole base has no relative spelling, so a home run's manifest owns exactly the paths it staged.
+			ownedPaths: ownWholeBase ? changes.map((change) => change.path) : ownedPaths.map((path) => relative(workspace, path)), changes, readOnly: input.readOnly,
 		})));
 		return { manifest, files, changes };
 	} finally { rmSync(scratch, { recursive: true, force: true }); }

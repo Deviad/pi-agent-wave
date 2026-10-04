@@ -28,6 +28,8 @@ const TRANSIENT_PATTERNS: Array<[RegExp, string]> = [
 	[/worker preflight|no usable credential/i, "worker-credential-preflight"],
 	[/\bREPORT_UNAVAILABLE\b/, "worker-report-unavailable"],
 	[/exited before result/i, "worker-exited-before-result"],
+	// The same death as the headless line above, noticed by Herdr's wait or by `collect` after a reboot.
+	[/attempt directory removed before result|no longer registered before result|^worker orphaned:/i, "worker-gone"],
 	[/exited without a candidate/i, "worker-empty-answer"],
 	[/runtime configuration snapshot changed/i, "runtime-snapshot-churn"],
 	// The audit could not read an overlay path; a genuine "unowned changes" verdict is not here and stays permanent.

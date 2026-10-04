@@ -44,6 +44,7 @@ export function renderStatus(store: GraphStore, runId: string, options: { taskOf
 	const state = store.getState(runId);
 	const frozen = store.policy(runId);
 	const policy = modelPolicyLabel(frozen.input);
+	const workspace = store.getRun(runId).workspace_root;
 	const agents = store.agents(runId);
 	const operations = store.operations(runId, true);
 	const latestByAgent = new Map<string, PolicyEvent>();
@@ -52,7 +53,7 @@ export function renderStatus(store: GraphStore, runId: string, options: { taskOf
 		if (event.agent_id && selected) latestByAgent.set(event.agent_id, selected);
 	}
 	const lines = [
-		`run ${runId} | graph=${state.graph} | node=${state.currentNode} | status=${state.status} | round=${state.round} | fix=${state.fixIteration} | policy=${policy} | digest=${frozen.digest}`,
+		`run ${runId} | graph=${state.graph} | node=${state.currentNode} | status=${state.status} | round=${state.round} | fix=${state.fixIteration} | policy=${policy} | digest=${frozen.digest}${workspace ? ` | workspace=home:${workspace}` : ""}`,
 		"agent | node | transport | policy | tier | model | attempt | status | current task | last activity",
 	];
 	{

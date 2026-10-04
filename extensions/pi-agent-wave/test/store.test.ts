@@ -5,7 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GraphStore, roleForNode } from "../store.ts";
+import { CURRENT_SCHEMA_VERSION, GraphStore, roleForNode } from "../store.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { selectAcpAgent } from "../lib/acpx-select.ts";
 import type { ResolvedPolicy } from "../types.ts";
@@ -519,12 +519,13 @@ describe("SQLite state store", () => {
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM operations WHERE id='op_v1'").get()?.selected_model).toBe(null);
 		expect(db.query<{ selected_model: string | null }, []>("SELECT selected_model FROM agents WHERE id='agent_v1'").get()?.selected_model).toBe(null);
 		const version = db.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_version").get();
-		expect(version?.version).toBe(12);
-		// v12 is additive, so the oldest supported schema must gain the ledger tables without any
-		// historical row changing, which is what the counts above already pin for runs and events.
+		expect(version?.version).toBe(CURRENT_SCHEMA_VERSION);
+		// v12 and v13 are additive, so the oldest supported schema must gain the ledger tables and the
+		// workspace column without any historical row changing, which the counts above pin for runs and events.
 		for (const table of ["ledger_entries", "ledger_claims", "ledger_aggregates"]) {
 			expect(db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(table)?.name).toBe(table);
 		}
+		expect(db.query<{ workspace_root: string | null }, []>("SELECT workspace_root FROM runs").get()?.workspace_root).toBe(null);
 		db.close();
 		migrated.close();
 		const reopened = new GraphStore({ dbPath });

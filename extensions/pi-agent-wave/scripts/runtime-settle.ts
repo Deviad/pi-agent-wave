@@ -29,6 +29,8 @@ export interface RuntimeSettleConfig {
 	readonly agentFsExecutable: string;
 	readonly evidencePath: string;
 	readonly dbPath?: string;
+	/** A home run (workspace mode `home`) owns its whole working directory; see runtime-staging.ts. */
+	readonly ownWholeBase?: boolean;
 }
 
 export interface RuntimeSettlementEvidence {
@@ -56,12 +58,15 @@ export function parseRuntimeSettleConfig(value: unknown): RuntimeSettleConfig {
 	if (value.snapshotPath !== null && typeof value.snapshotPath !== "string") throw new Error("runtime settle config snapshotPath must be a path or null");
 	if ((value.kind === "coding" || value.kind === "operational") && (value.readOnly || value.snapshotPath === null)) throw new Error(`${value.kind} settlement requires an owned-write AgentFS snapshot`);
 	if (value.dbPath !== undefined && typeof value.dbPath !== "string") throw new Error("runtime settle config dbPath must be a string");
+	if (value.ownWholeBase !== undefined && typeof value.ownWholeBase !== "boolean") throw new Error("runtime settle config ownWholeBase must be a boolean");
+	if (value.ownWholeBase === true && value.kind !== "coding") throw new Error("whole-base ownership is only for coding settlement in a home run");
 	return {
 		schemaVersion: 1, attemptKey: text(value.attemptKey, "attemptKey"), workerResultPath: resolve(text(value.workerResultPath, "workerResultPath")), kind: value.kind,
 		baseDir: resolve(text(value.baseDir, "baseDir")), baseRevision: text(value.baseRevision, "baseRevision"), ownedPaths: value.ownedPaths.map(String), readOnly: value.readOnly,
 		checkpointPath: typeof value.checkpointPath === "string" && value.checkpointPath.trim() ? value.checkpointPath : null,
 		snapshotPath: value.snapshotPath === null ? null : resolve(value.snapshotPath), agentFsExecutable: text(value.agentFsExecutable, "agentFsExecutable"),
 		evidencePath: resolve(text(value.evidencePath, "evidencePath")), dbPath: value.dbPath === undefined ? undefined : resolve(value.dbPath),
+		ownWholeBase: value.ownWholeBase === true,
 	};
 }
 
@@ -87,7 +92,8 @@ function observeCheckpoint(content: RuntimeContentStore, changes: readonly { rea
 export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlementEvidence {
 	// Storage is a precondition, checked before the worker result is touched: a store that cannot be reached must fail
 	// here, by name, rather than after parsing an answer that a retry will then have to re-settle.
-	const content = new RuntimeContentStore(config.dbPath ?? process.env.DELEGATE_GRAPH_DB ?? DEFAULT_DB_PATH);
+	const dbPath = config.dbPath ?? process.env.DELEGATE_GRAPH_DB ?? DEFAULT_DB_PATH;
+	const content = new RuntimeContentStore(dbPath);
 	const result: unknown = JSON.parse(readFileSync(config.workerResultPath, "utf8"));
 	if (!isRecord(result) || result.schemaVersion !== 2 || result.resultContract !== "runtime-v1") throw new Error("runtime settlement requires a schema 2 runtime-v1 worker result");
 	if (result.attemptKey !== config.attemptKey) throw new Error("worker result attempt does not match the settling attempt");
@@ -104,7 +110,7 @@ export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlem
 	let checkpoint: RuntimeCheckpoint | null = null;
 	if (config.kind === "coding" || config.kind === "operational") {
 		if (config.snapshotPath === null) throw new Error(`${config.kind} settlement requires an AgentFS snapshot`);
-		const staged = stageRuntimeAgentFs({ agentFsExecutable: config.agentFsExecutable, snapshotPath: config.snapshotPath, baseDir: config.baseDir, baseRevision: config.baseRevision, attemptKey: config.attemptKey, ownedPaths: config.ownedPaths, readOnly: false }, content);
+		const staged = stageRuntimeAgentFs({ agentFsExecutable: config.agentFsExecutable, snapshotPath: config.snapshotPath, baseDir: config.baseDir, baseRevision: config.baseRevision, attemptKey: config.attemptKey, ownedPaths: config.ownedPaths, readOnly: false, ownWholeBase: config.ownWholeBase, excludedRoots: config.ownWholeBase ? [dirname(dbPath)] : [] }, content);
 		manifest = staged.manifest; files = staged.files; changes = staged.changes;
 		if (config.kind === "operational" && config.checkpointPath) checkpoint = observeCheckpoint(content, staged.changes, config.baseDir, config.checkpointPath);
 	}

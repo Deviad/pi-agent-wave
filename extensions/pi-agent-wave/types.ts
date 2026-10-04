@@ -136,6 +136,8 @@ export interface RunRow {
 	policy_digest: string;
 	created_at: string;
 	updated_at: string;
+	/** A home run's working directory (`$HOME` or under it); null for every repository run. */
+	workspace_root: string | null;
 }
 
 export interface StateRow {

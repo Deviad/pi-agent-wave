@@ -10,8 +10,8 @@ interface StatementQuery<TRow, TParams extends unknown[]> {
 export class Database {
 	private readonly database: DatabaseSync;
 
-	constructor(path: string, _options: { create?: boolean; strict?: boolean; readonly?: boolean } = {}) {
-		this.database = new DatabaseSync(path);
+	constructor(path: string, options: { create?: boolean; strict?: boolean; readonly?: boolean } = {}) {
+		this.database = new DatabaseSync(path, { readOnly: options.readonly === true });
 	}
 
 	exec(sql: string): void {

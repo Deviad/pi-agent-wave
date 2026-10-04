@@ -418,6 +418,17 @@ def operational_instruction(raw: str | None, cwd: Path | None = None) -> str:
 
 
 # Strict by default; only an explicit private-launch override discards named paths.
+# Told to every worker of a home run. Its working directory is the run's workspace root (the operator's
+# home or a directory under it); HOME inside the sandbox is a private directory, so `~` must not be used.
+HOME_WORKSPACE_INSTRUCTION = (
+    "Home workspace: your working directory is the operator's home workspace (their home directory or a directory under it). "
+    "Address every file relative to the current directory, for example ./.config/app/config.toml; `~` and $HOME point to a private "
+    "directory, not the operator's home, and absolute paths into the home are refused. Every change you make here is reviewed, "
+    "placed after acceptance and can be undone, so edit the files directly. Do not commit inside Git repositories under it: changes "
+    "inside .git directories are discarded.\n"
+)
+
+
 # Mirrored by DEFAULT_IGNORED_PATHS in lib/agentfs-sandbox.ts. The Git index is ignored by default since
 # 2026-09-12: a worker that inspects its work with `git status`/`git diff` refreshes the index inside the
 # overlay, and the live build measurement refused every such attempt as an unowned change. Ignoring it grants
@@ -742,6 +753,9 @@ def prepare_acpx_attempt(
         prompt += "Terminal capability is disabled. Use ACP filesystem read/search capabilities only; consume recorded host evidence instead of running commands.\n"
     if read_only:
         prompt += "Read-only host mode: all tool activity stays inside AgentFS COW and every overlay change will be discarded. Zero repository paths are exported.\n"
+    workspace_mode = getattr(args, "workspace_mode", None) or "repository"
+    if workspace_mode == "home":
+        prompt += HOME_WORKSPACE_INSTRUCTION
     write_private(prompt_file, prompt)
     config_path = attempt_dir / "worker-config.json"
     result_path = attempt_dir / "worker-result.json"
@@ -803,6 +817,7 @@ def prepare_acpx_attempt(
         "result_contract": result_contract,
         "base_dir": str(cwd),
         "base_revision": base_revision or None,
+        "workspace_mode": workspace_mode,
         "checkpoint_path": operational_checkpoint_path(args.command_json, cwd),
         "owned_paths": owned_paths,
         "ignored_paths": ignored_paths,
@@ -1771,6 +1786,34 @@ def settlement_base_dir(resource: dict[str, Any]) -> str:
     return base_dir
 
 
+def require_settlement_base(resource: dict[str, Any], kind: str) -> None:
+    """A repository coding settlement diffs against the Git HEAD recorded at dispatch; a home run has none and needs none."""
+    if kind == "coding" and resource.get("workspace_mode") != "home" and not resource.get("base_revision"):
+        raise DelegateError("coding settlement requires a Git base revision recorded at dispatch")
+
+
+def runtime_settle_config(resource: dict[str, Any], kind: str, snapshot: Path | None, evidence_path: Path) -> dict[str, Any]:
+    """The runtime-settle.json body for one attempt. A home run's coding settlement owns its whole working directory."""
+    require_settlement_base(resource, kind)
+    config: dict[str, Any] = {
+        "schemaVersion": 1,
+        "attemptKey": resource["acpx_attempt_key"],
+        "workerResultPath": resource["worker_result"],
+        "kind": kind,
+        "baseDir": settlement_base_dir(resource),
+        "baseRevision": resource.get("base_revision") or "none",
+        "checkpointPath": resource.get("checkpoint_path") if kind == "operational" else None,
+        "ownedPaths": resource.get("owned_paths", []),
+        "readOnly": resource.get("read_only") is True,
+        "snapshotPath": str(snapshot) if snapshot else None,
+        "agentFsExecutable": shutil.which("agentfs") or "agentfs",
+        "evidencePath": str(evidence_path),
+    }
+    if kind == "coding" and resource.get("workspace_mode") == "home":
+        config["ownWholeBase"] = True
+    return config
+
+
 def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str, Any]:
     """Retain the worker's answer and audited changes first; close, verify and clean up afterwards.
 
@@ -1794,24 +1837,10 @@ def settle_runtime_attempt(run_dir: Path, resource: dict[str, Any]) -> dict[str,
         if kind in ("coding", "operational"):
             if resource.get("read_only") is True:
                 raise DelegateError(f"{kind} settlement requires an owned-write attempt")
-            if kind == "coding" and not resource.get("base_revision"):
-                raise DelegateError("coding settlement requires a Git base revision recorded at dispatch")
+            require_settlement_base(resource, kind)
             snapshot = snapshot_agentfs_db(resource)
         settle_config = Path(str(resource["attempt_dir"])) / "runtime-settle.json"
-        write_private(settle_config, json.dumps({
-            "schemaVersion": 1,
-            "attemptKey": resource["acpx_attempt_key"],
-            "workerResultPath": resource["worker_result"],
-            "kind": kind,
-            "baseDir": settlement_base_dir(resource),
-            "baseRevision": resource.get("base_revision") or "none",
-            "checkpointPath": resource.get("checkpoint_path") if kind == "operational" else None,
-            "ownedPaths": resource.get("owned_paths", []),
-            "readOnly": resource.get("read_only") is True,
-            "snapshotPath": str(snapshot) if snapshot else None,
-            "agentFsExecutable": shutil.which("agentfs") or "agentfs",
-            "evidencePath": str(evidence_path),
-        }, indent=2, sort_keys=True) + "\n")
+        write_private(settle_config, json.dumps(runtime_settle_config(resource, kind, snapshot, evidence_path), indent=2, sort_keys=True) + "\n")
         if not evidence_path.exists():
             settled = run([NODE, "--experimental-strip-types", str(RUNTIME_SETTLE)], env={**os.environ, "PI_RUNTIME_SETTLE_CONFIG": str(settle_config)}, check=False)
             if settled.returncode != 0 or parse_json_action(settled.stdout, "runtime_settled") is None:
@@ -1940,6 +1969,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--owned-paths-json", help="JSON array of graph-owned paths")
     start_parser.add_argument("--ignored-paths-json", help="JSON array of overlay paths discarded without export or violation; defaults to no ignored paths")
     start_parser.add_argument("--access-mode", choices=("read-only", "owned-write"), help="persisted graph operation access mode; legacy launches default to read-only except implement/source_search")
+    start_parser.add_argument("--workspace-mode", choices=("repository", "home"), default="repository", help="home: the run's working directory is the operator's home workspace; every change in it is owned, placed without Git and undoable")
     start_parser.add_argument("--model-attempt", type=int, default=0)
     start_parser.add_argument("--transient-attempt", type=int, default=0)
     start_parser.add_argument("--fallback-reason")

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GraphStore } from "../store.ts";
+import { Database } from "../sqlite.ts";
 import { closeRunTabs, type ExecResult } from "../herdr.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
 import { selectAcpAgent } from "../lib/acpx-select.ts";
@@ -84,11 +85,15 @@ describe("tab cleanup through the tool", () => {
 			const run = store.initRun("tabs", "build", "Plan the change", policy as never, undefined, "runtime-v1");
 			const runId = run.runId;
 			const operation = store.next(runId).operations[0];
+			// The same-model budget is already spent (one-model chain), so the orphan's transient retry parks
+			// the run by exhaustion and `resolve abort` is reachable.
+			const seed = new Database(process.env.DELEGATE_GRAPH_DB);
+			try { seed.query("UPDATE operations SET transient_attempts=3 WHERE id=?").run(operation.id); } finally { seed.close(); }
 			const cancelScript = join(root, "run-private", "acpx", "dg-tab-worker", "cancel-acpx.sh");
 			mkdirSync(join(root, "run-private", "acpx", "dg-tab-worker"), { recursive: true });
 			writeFileSync(cancelScript, "#!/bin/sh\nexit 1\n");
 			chmodSync(cancelScript, 0o700);
-			const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: model, agent: selectAcpAgent(model) });
+			const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 3, selectedModel: model, agent: selectAcpAgent(model) });
 			const agentId = store.registerAgent({ runId, name: "dg-tab-worker", node: "thinker_plan", role: "thinker", transport: "herdr", herdrAgent: "dg-tab-worker", tabId: "w1:tB", herdrPaneId: "w1:pB", policyDigest: store.policy(runId).digest, selectedModel: model, modelAttempt: 0, currentTask: operation.task, acpAgent: identity.agent, acpxRecordId: "s", acpxSessionId: "s", acpxState: "alive", acpxAttemptKey: identity.attemptKey, agentFsSessionId: "s", agentFsDbPath: join(root, "delta.db"), acpxCancelScript: cancelScript });
 			store.beginRuntimeAttempt({ identity, sessionId: "s", requestId: null, policyDigest: store.policy(runId).digest, agentId });
 			// An earlier, already-settled worker of the same run whose tab is still open.

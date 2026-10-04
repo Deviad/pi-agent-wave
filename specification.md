@@ -238,9 +238,9 @@ the launchd job is present code that is not on a dispatchable path.
 
 ## 2. The store schema and its migrations
 
-`store.ts:CURRENT_SCHEMA_VERSION = 12`. `GraphStore.migrate()` issues a base
+`store.ts:CURRENT_SCHEMA_VERSION = 13`. `GraphStore.migrate()` issues a base
 `CREATE TABLE IF NOT EXISTS` block, seeds `schema_version(version)` to 1 when empty, then runs
-`migrateToV2()` … `migrateToV12()` in order. Each migration inspects columns so an interrupted
+`migrateToV2()` … `migrateToV13()` in order. Each migration inspects columns so an interrupted
 migration repairs idempotently, and `migrate()` throws if the final `schema_version` is not
 `CURRENT_SCHEMA_VERSION`. The base block is evolved with the build: it already contains some columns
 that an older store received through a later migration (notably `operations.command_json`), so the
@@ -408,6 +408,12 @@ allowing a gap. `store.ts:auditStoryLedger` recomputes `numerator/denominator*10
 `AGGREGATE_INVALID` (a non-finite figure or a zero denominator). `scripts/story-ledger.mjs` is the
 CLI over `recordLedgerEntry`, `auditStoryLedger` and `storyLedger`.
 
+### 2.12a v13 — home workspace root
+
+`migrateToV13` adds `runs.workspace_root TEXT` additively (`ensureColumn`, one immediate transaction,
+`schema_version` 13). NULL for every existing run and every repository run; a home run records its
+real working directory (§5.1a). No row is rewritten.
+
 ### 2.13 Single-writer, transaction and retention rules
 
 - Every state change is inside `BEGIN IMMEDIATE` (`store.ts:transaction`, migration bodies,
@@ -427,6 +433,10 @@ CLI over `recordLedgerEntry`, `auditStoryLedger` and `storyLedger`.
   directory. Filesystem removal runs after the commit. The `ledger_*` rows are never pruned, and
   `runtime-content/` is content-addressed and is not reclaimed by `prune` (only `evidence/`,
   `failures/` and the transient run directories are).
+  **Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §3): once
+  run directories live under `<graph home>/runs/` (§5.1), `prune` is their only reclaimer — they no
+  longer sit on a self-clearing volume. The resolution path through `agents.acpx_cancel_script` is
+  unchanged, so this adds no new retention mechanism and no new knob.
 - The launcher's own `state.json` is serialized by a directory lock with an orphan check and written
   by atomic rename (`scripts/delegate_core.py:mutate_state`, `clear_orphaned_state_lock`,
   `write_state`).
@@ -554,7 +564,10 @@ resume: it is resumed by the operator, or it stays deferred until pruned.
    (`ACPX worker failed|terminal=failed|QUEUE_RUNTIME_PROMPT_FAILED`), `provider-link-churn`
    (`provider credential target changed`), `worker-report-missing`, `worker-credential-preflight`
    (`worker preflight|no usable credential`), `worker-report-unavailable` (`REPORT_UNAVAILABLE`),
-   `worker-exited-before-result`, `worker-empty-answer` (`exited without a candidate`),
+   `worker-exited-before-result`, `worker-gone` (`attempt directory removed before result`,
+   `no longer registered before result`, or a message starting `worker orphaned:` — the same death
+   noticed by Herdr's wait or by `collect` after a reboot), `worker-empty-answer`
+   (`exited without a candidate`),
    `runtime-snapshot-churn` (`runtime configuration snapshot changed`), `agentfs-audit-error`
    (`AgentFS audit error`), `agentfs-snapshot-error` (`AgentFS snapshot failed`), and `timeout` for
    `ACPX worker result present but worker process <n> did not exit within`. A genuine "unowned
@@ -657,6 +670,35 @@ versions below), or Herdr identity for the Herdr transport (`require_herdr`, whi
 directory only when its resolved parent is `/tmp` and its name starts with `delegate-graph-herdr-`
 and it contains `state.json`.
 
+**Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §3): the run
+root moves from `/tmp` to `<graph home>/runs/` (mode 700), where the graph home is the directory
+containing `DELEGATE_GRAPH_DB`, defaulting to `~/.local/share/delegate-graph/`. `/tmp` is volatile —
+a host reboot on 2026-10-03 cleared the only copy of an unsettled attempt's stream, answer sink,
+AgentFS delta and `state.json`, making `run_ab8675e8`'s `thinker_plan` answer unrecoverable. The
+directory name is unchanged, so the cancel-script-to-run-directory relationship used by `prune` and
+by the liveness reaper is unaffected; `require_run_dir` accepts the new root and, for one release,
+`/tmp`. The Python launcher's default must equal `store.ts:DEFAULT_DB_PATH` and the two are pinned
+by a test. The AgentFS grant stays `--no-default-allows --allow <run-dir>`, which makes the run
+directory a sibling of the database, `runtime-content/`, `evidence/` and `failures/` and must reach
+none of them.
+
+### 5.1a Home runs (`workspace_root`)
+
+A run initialized with `workspaceRoot` (`delegate_graph op=init`; `store.ts:initRun` option
+`workspaceRoot`) is a home run. `store.ts:homeWorkspaceRoot` requires the `build` or `research` graph,
+expands `~`, and records the realpath only when it is an existing directory equal to or under the
+realpath of `$HOME` (`os.homedir()`). For every operation of a home run the dispatch branch of
+`index.ts` uses `workspace_root` as the working directory regardless of `ctx.cwd`, skips the
+owned-path and Git preconditions, launches with `--workspace-mode home`, and passes
+`--owned-paths-json ["."]` to owned-write operations. Slices still declare disjoint `ownedPaths` as a
+statement of intent; they do not limit what the slice may write. `scripts/delegate_core.py` records
+`workspace_mode` on the resource, appends `HOME_WORKSPACE_INSTRUCTION` to the prompt (address files
+relative to the working directory because `~` and `$HOME` are private; changes are placed after review
+and undoable; do not commit inside repositories), and `require_settlement_base` waives the Git base
+revision. `commands.ts:renderStatus` ends the run line with `| workspace=home:<root>`. Verified
+2026-10-03 for a workspace under `$HOME`: an absolute write into the workspace's host path, with or
+without a `cd` into it, is refused inside the sandbox rather than reaching the host.
+
 ### 5.2 `start` — materialize and launch one attempt
 
 `scripts/delegate_core.py:command_start` validates the run directory and task file (mode must be
@@ -716,6 +758,16 @@ disagree. Read-only is enforced structurally: settlement only snapshots and stag
 operational (owned-write) attempts (§5.5), and `settle_runtime_attempt` refuses a read-only
 coding/operational attempt.
 
+What the sandbox does not confine (verified 2026-10-03 against `agentfs v0.6.4` on macOS, launched
+as above; `tasks/handoff-durable-worker-record.md` §7 question 5). Only writes relative to the working
+directory go to the overlay and are audited. Writes to `/tmp`, `/private/tmp` and the per-user temp
+directory `/var/folders/<user>/T/` succeed and land on the host without appearing in the delta,
+whatever `TMPDIR` is set to; the run directory is host-writable by design (`--allow`). Absolute
+writes elsewhere under `$HOME` are refused. Every host file is readable, including the graph database
+and `~/.pi/agent/auth.json`. `agentfs run` 0.6.4 has no option that denies `/tmp` or reads. While run
+directories live under `/tmp` (§5.1), a worker can therefore write into another attempt's run
+directory.
+
 ### 5.4 Audit and staging
 
 At settlement, `scripts/delegate_core.py:snapshot_agentfs_db` creates one consistent SQLite backup of
@@ -773,6 +825,13 @@ Git-internal paths.
    (refusing an existing record for another attempt), remove the temp, chmod 600, and fsync the
    directory.
 
+For a home run the configuration carries `ownWholeBase: true` (coding only;
+`delegate_core.py:runtime_settle_config`), and `runtime-settle.ts` passes it to
+`lib/runtime-staging.ts:stageRuntimeAgentFs` with the graph home as an excluded root. Staging then owns
+every changed path except paths with a `.git` segment, platform sidecars (`._*`, `.DS_Store`, which the
+NFS mount writes beside every file) and paths under the graph home, and records the staged paths
+themselves as the manifest's `ownedPaths`, because the whole base has no relative spelling.
+
 `scripts/delegate_core.py:settle_runtime_attempt` wraps this: it waits for the worker
 (`wait_for_settled_agent`), writes the `runtime-settle.json` config and invokes the script with
 `PI_RUNTIME_SETTLE_CONFIG`, retains a bounded capture tail when capture was incomplete or produced no
@@ -780,6 +839,19 @@ candidate (`retain_incomplete_capture`), writes a failure bundle when there is n
 (`write_failure_diagnostics`), then closes/verifies/cleans up (§5.7) and returns the paths plus any
 `postSettlementFailures`. A failure after content retention is reported, never used to discard the
 candidate.
+
+**Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §4):
+settlement gains a recovery branch for an attempt whose worker is not alive and whose
+`worker-result.json` is absent or unparseable — the file `acpx-worker.ts` writes only at the end of
+a prompt run, so a worker killed mid-turn writes none. The branch replays the retained
+`runtime-output/worker.stdout.ndjson` through `lib/runtime-capture.ts:RuntimePublicCapture` and
+settles from the replayed summary: the outcome stays the real process failure, a non-empty replayed
+answer is retained as a candidate with `captureStatus: "incomplete"` and an explicit recovered
+marker, and an empty replay stays the transient `worker-empty-answer` failure. A `VERDICT:` line is
+honored only when the worker itself wrote it; recovery never fabricates one, so a positive semantic
+verdict still never originates from the runtime. Recovery is reachable only through `op=collect`,
+adds no verb, and needs no schema change. It depends on §5.1's durable run root: without it there is
+nothing left to replay.
 
 ### 5.6 Process outcome capture
 
@@ -885,6 +957,21 @@ validate that the candidate settled, that it retains the manifest and every stag
 manifest matches the candidate's identity and base revision, that `realpath(workspace)` is
 unchanged, and that the operation is still current.
 
+**Placement without Git checks.** `gitChecks` is false for operational candidates and for coding
+candidates of a home run (`store.ts:prepareIntegration`). Such a placement treats a file under a missing
+parent as absent and creates the parents when it writes the file, and it does not refuse a path under a
+nested repository; with Git checks both refusals stand (`RuntimeIntegration.target`). Rollback of a
+created file removes the file and leaves created directories in place.
+
+**Undo of an applied placement.** `rollback` reverses only a `prepared` or `applying` integration.
+`RuntimeIntegration.undo` also reverses an `applied` one, only without Git checks and only while no
+other integration of the workspace is active, through the same per-file step: a file that is neither
+the placed image nor the preimage stops it in `needs_reconciliation` and nothing is overwritten.
+`store.ts:applyRuntimeIntegration(…, "rollback")`, which `op=integrate decision=rejected` calls, first
+tries `undoRuntimeIntegration`: when the candidate has an applied placement it is undone whatever the
+graph or run has done since, no graph state changes, and an `integration_undone` event is recorded;
+otherwise the ordinary rollback applies.
+
 **The live-sibling guard.** Creating an integration writes into the workspace that a still-running
 sibling worker's settlement audit reads, which fails that worker permanently with `AgentFS contains
 unowned changes` (2026-09-21 incident, `tasks/handoff-settlement-and-integration-races.md`).
@@ -985,6 +1072,11 @@ configuration overrides and tests use temporary agent directories.
 | `CLAUDE_CODE_ENTRYPOINT` | Claude provider | billing/entrypoint metadata; default `sdk-cli` | `lib/claude-auth-headers.ts:buildClaudeRequestMetadata` |
 | `PI_FAILOVER_LOCKED`, `PI_FAILOVER_ROUTE`, `PI_FAILOVER_TIER`, `PI_FAILOVER_ROLE`, `PI_DELEGATION_KIND` | model-failover | worker failover arming | `model-failover.ts` (`session_start`, `/failover`) |
 | `PI_DELEGATION_LABEL`, `PI_DELEGATION_MODEL`, `PI_DELEGATION_POLICY`, `PI_DELEGATION_POLICY_DIGEST`, `PI_DELEGATION_ROLE`, `PI_FAILOVER_LOCKED` | worker's Pi session | frozen delegation identity written by the launcher | `scripts/delegate_core.py:delegation_environment`, consumed by `model-failover.ts` |
+
+**Recorded 2026-10-03, not yet implemented** (`tasks/handoff-durable-worker-record.md` §3):
+`DELEGATE_GRAPH_DB` additionally determines the private run root, `<graph home>/runs/` (§5.1). No new
+variable is introduced: deriving the root from the database path gives the tests and measurement
+drivers, which already set it to a temporary path, their isolation for free.
 
 `PI_FAILOVER_ROUTE` etc. are set by `scripts/delegate_core.py:delegation_environment` when a Herdr tab
 is created (`tab_create_argv` passes them as `--env KEY=VALUE`), and the same values are set in the
