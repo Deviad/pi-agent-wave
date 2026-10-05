@@ -36,6 +36,64 @@ Worker instructions name supplied resources and report missing dependencies. Sup
 preserve task-declared host-service attachments on relevant dispatches and retries. Input bytes survive
 cancellation and prune in the shared content store; this increment adds no garbage collection.
 
+## Automatic workspace preparation
+
+The work order is `tasks/handoff-automatic-workspace-preparation.md`.
+`lib/workspace-preparation.ts:prepareWorkspace` runs before launcher `init`/`start` for repository
+build/research operations, on both transports and retries. Home/operational dispatch is unchanged.
+The operator-owned private `<PI_CODING_AGENT_DIR>/workspace-preparation.jsonc` maps canonical
+workspaces to explicit absolute executables and argv arrays: ordered `install`, `baseline`, one
+read-only dependency-loading `readiness`, `dependencyInputs`, `scriptInputs`, `writePaths`, and
+per-command `timeoutMs`. `scripts/workspace-preparation.ts:preparationCli` exposes operator-only
+`status`, `approve --workspace <root> --host-access`, and `revoke`. Approval is separate private
+state under the agent directory's `workspace-preparation-approvals/`, outside the workspace.
+
+Approval identity hashes the normalized recipe, declared script/config bytes and root npm script
+definitions separately from dependency versions. It is rechecked before/after each command;
+changed commands or scripts require renewed approval. Repository executables (including extensionless
+scripts) and direct repository script arguments require `scriptInputs`; completeness of arbitrary transitive script/config execution is operator-attested,
+not automatically discoverable. Approval accepts arbitrary host access. Registry/approval files are
+opened no-follow, bounded and checked for operator ownership/private permissions. Input paths are
+workspace-contained and dependency/script inputs cannot be writable state. Dependency freshness is
+a separate digest over bounded input contents, including absence; it changes preparation readiness
+without changing command authority.
+
+The workspace's real Git metadata contains private `pi-agent-wave-preparation/` state. A mkdir lock
+covers preparation through worker registration even without a configured recipe. A live process's
+lock is never reclaimed; exclusive stale-reclamation serialization prevents removing a replacement
+lock. Launch references name operation IDs and graph databases. The reservation is retained before
+`start`; a confirmed unsuccessful launcher exit clears it, but an exception or registration failure
+keeps it for reconciliation. Read-only SQLite queries detect unsettled attempts across runs and
+recorded databases. Missing databases or unregistered reservations block refresh conservatively.
+A busy lock reports retry guidance, rather than queuing another installer.
+
+Receipts bind workspace, run, approval and dependency inputs, retain successful command diagnostic
+references and validate those records before reuse. Only completed preparation writes `ready:true`.
+Successful installation checkpoints survive baseline failure when readiness still succeeds. New runs,
+changed inputs, missing evidence or missing dependencies require preparation again; an active
+workspace worker prohibits refresh/baseline. Every reuse executes the real readiness command.
+`runCommand` uses shell-free spawn, captures a bounded output tail, retains phase/argv/outcome, and
+terminates the process group on cancellation or per-command timeout. No runtime worker identity or
+provider failover is synthesized. Diagnostics and receipts persist in workspace metadata, not the
+run-pruned evidence tree.
+
+Before/after each command, `sourceSnapshot` hashes tracked, untracked and ignored worktree files
+outside declared dependency/scratch `writePaths`, plus HEAD and staged-index identities. Declaring
+tracked source writable is refused. Unexpected changes invalidate readiness and remain in place;
+no reset/stash/delete conceals them. This audits the worktree of an approved host process, not its
+writes outside the workspace. Readiness is an operator-approved read-only check, not an installer.
+
+Implementation dispatch first queries `RuntimeIntegration.dirtyAppliedPaths`: validated applied
+journal manifests intersect canonical file/directory ownership, then literal Git status catches dirty
+output, including deletions. For Git-checked entries, the path's latest commit at the integration base
+must still match its latest HEAD commit: later operator dirt on a committed/superseded path is not
+misattributed to that integration. Overlap blocks before preparation with affected paths and an authorized
+commit/replacement-worker remedy; disjoint output and ordinary operator dirt are untouched.
+Both new blockers leave pending operations and provider budgets unchanged, return named reasons and
+phase diagnostics, and emit progress. The supervisor reports the blocker and redispatches after repair,
+rather than retrying a nonexistent attempt. Settlement asks to discard the launched candidate before
+repair; existing HEAD/preimage checks, sibling fences, topology and ownership defaults are unchanged.
+
 ---
 
 ## 1. Process model and IPC
@@ -1077,9 +1135,9 @@ manifest-immutability trigger described in §1.4. `prepare` takes a `validate` c
   keep their digest). A directory the integration creates is new and empty, so it holds no nested
   repository and nothing in Git's index; the refusals protect existing paths only;
 - reports a dirty preimage that an earlier `applied` integration in the same workspace wrote
-  (`appliedHere`) as uncommitted output of that integration, naming the duty to commit the previous
-  round's integrated files, rather than as a bare dirty-or-untracked refusal: the graph's rounds hand
-  their output to each other through the working tree, so the duty is the graph's to state;
+  (`appliedHere`) as uncommitted output of that integration, requiring the launched candidate to be
+  discarded before an authorized commit and a replacement worker. Dispatch catches this overlap before
+  launch through `dirtyAppliedPaths`; settlement never recommends committing under a candidate;
 - retains each preimage with `RuntimeContentStore.retain`, records the caller's `overrideReason`
   (nullable `override_reason`, added additively on open and outside the manifest so it never changes
   the digest two identical candidates share), and writes the manifest.

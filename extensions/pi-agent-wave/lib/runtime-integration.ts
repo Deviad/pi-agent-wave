@@ -4,6 +4,7 @@ import { chmodSync, closeSync, constants, fchmodSync, fstatSync, fsyncSync, lsta
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Database } from "../sqlite.ts";
 import { RuntimeContentStore } from "./runtime-content.ts";
+import { realpathExistingPrefix } from "./agentfs-sandbox.ts";
 import { canonical, parseRuntimeContent, runtimeDigest, type RuntimeContent } from "./runtime-results.ts";
 
 interface FileImage { readonly content: RuntimeContent; readonly mode: number }
@@ -152,6 +153,27 @@ export class RuntimeIntegration {
 		});
 	}
 
+	/** Dirty applied output covered by prospective file or directory ownership, including deletions. */
+	dirtyAppliedPaths(workspace: string, ownedPaths: readonly string[]): string[] {
+		const root = realpathSync(resolve(workspace));
+		const owned = ownedPaths.map((path) => realpathExistingPrefix(resolve(root, path)));
+		const rows = this.db.query<{ id: string }, [string]>("SELECT id FROM runtime_integrations WHERE workspace=? AND state='applied'").all(root);
+		const paths = new Set<string>();
+		for (const row of rows) {
+			const manifest = parseManifest(this.row(row.id).manifest_json);
+			for (const entry of manifest.entries) {
+				const target = resolve(root, entry.path);
+				if (!owned.some((path) => target === path || target.startsWith(`${path}/`) || path.startsWith(`${target}/`))) continue;
+				const options = { encoding: "utf8" as const, timeout: 10_000, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } };
+				const status = execFileSync("git", ["--literal-pathspecs", "-C", root, "status", "--porcelain", "--untracked-files=all", "--", entry.path], options);
+				if (!status.trim()) continue;
+				const lastCommit = (revision: string) => execFileSync("git", ["--literal-pathspecs", "-C", root, "log", "-1", "--format=%H", revision, "--", entry.path], options).trim();
+				if (!manifest.gitChecks || lastCommit(manifest.baseRevision) === lastCommit("HEAD")) paths.add(entry.path);
+			}
+		}
+		return [...paths].sort();
+	}
+
 	/** The integration journaled for a candidate in a workspace, if any, and whether it ran Git checks. */
 	forCandidate(workspace: string, candidateId: string): (IntegrationStatus & { readonly gitChecks: boolean }) | null {
 		const row = this.db.query<JournalRow, [string, string]>("SELECT * FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?").get(realpathSync(resolve(workspace)), candidateId);
@@ -284,7 +306,7 @@ export class RuntimeIntegration {
 					// A path this journal already applied and nobody committed is the graph's own doing, not the
 					// operator's: rounds hand their output to each other through the workspace, so the duty to commit
 					// between them is named here rather than surfacing as a bare dirty-preimage refusal.
-					if (status.trim() && this.appliedHere(workspace, path)) throw new Error(`candidate preimage ${path} is uncommitted output of an earlier applied integration in this workspace; commit the previous round's integrated files before integrating this round`);
+					if (status.trim() && this.appliedHere(workspace, path)) throw new Error(`candidate preimage ${path} is uncommitted output of an earlier applied integration in this workspace; discard this candidate, obtain an authorized commit of the previous integration, then dispatch a replacement worker; committing beneath this candidate invalidates its base revision`);
 					if (status.trim()) throw new Error("candidate preimage is dirty or untracked");
 					if (before) {
 						try { execFileSync("git", ["--literal-pathspecs", "-C", workspace, "ls-files", "--error-unmatch", "--", path], { stdio: "pipe", timeout: 10_000 }); }

@@ -175,7 +175,7 @@ test("a rollback is never refused by a running sibling, because it is the way ou
 	} finally { fx.store.close(); rmSync(fx.root, { recursive: true, force: true }); }
 });
 
-test("a candidate whose preimage is a previous round's uncommitted integration says to commit it", () => {
+test("a candidate whose preimage is a previous round's uncommitted integration requires replacement after an authorized commit", () => {
 	const fx = fixture("round-commit-");
 	try {
 		const [first, second] = twoSlices(fx);
@@ -198,8 +198,8 @@ test("a candidate whose preimage is a previous round's uncommitted integration s
 		const round2 = settleSlice(fx, runningSlice.id, "product.md", "product revised", undefined, "-r2");
 		assert.throws(
 			() => fx.store.prepareRuntimeIntegration(round2.attemptKey, round2.manifest),
-			(error: Error) => /uncommitted output of an earlier applied integration/.test(error.message) && /commit the previous round/.test(error.message),
-			"the refusal tells the operator to commit the previous round's integrated files",
+			(error: Error) => /uncommitted output of an earlier applied integration/.test(error.message) && /discard this candidate/.test(error.message) && /authorized commit/.test(error.message) && /replacement worker/.test(error.message),
+			"the refusal must not suggest committing underneath an already-launched candidate",
 		);
 	} finally { fx.store.close(); rmSync(fx.root, { recursive: true, force: true }); }
 });

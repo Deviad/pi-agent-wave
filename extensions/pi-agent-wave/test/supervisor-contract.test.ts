@@ -64,6 +64,11 @@ test("the supervisor contract describes the runtime-v1 loop the tool accepts", (
 	assert.equal(text.includes("acpxSettlementEvidencePath"), false);
 	assert.match(text, /op=record is refused on runtime-v1 runs; cancellation is op=cancel/);
 	assert.match(text, /op=resolve[^.]*refused while the run is active/);
+	assert.match(text, /approved workspace preparation/);
+	assert.match(text, /blocked.*preparation.*integration/);
+	assert.match(text, /redispatch the same pending operation/);
+	assert.match(text, /never grant recipe approval or commit automatically/);
+	assert.match(text, /unconfirmed launcher is an operator blocker/);
 });
 
 test("op=decide refuses recovery choices with a message that names op=resolve", async () => {

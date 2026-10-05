@@ -222,7 +222,7 @@ describe("dispatch requires owned paths inside the working directory", () => {
 		try {
 			const invocations: { command: string; args: string[] }[] = [];
 			const tool = await toolIn(dir, invocations);
-			const init = parsed(await tool.execute("init", { op: "init", story: "owned-path-empty", graph: "research", task: "Survey the field" }, undefined, () => {}, {} as ExtensionContext));
+			const init = parsed(await tool.execute("init", { op: "init", story: "owned-path-empty", graph: "research", task: "Survey the field" }, undefined, () => {}, { cwd: workspace } as ExtensionContext));
 			assert.equal(init.error, undefined, JSON.stringify(init));
 			const runId: string = init.state.runId;
 			const store = new GraphStore({ dbPath: process.env.DELEGATE_GRAPH_DB });

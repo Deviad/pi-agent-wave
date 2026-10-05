@@ -12,6 +12,7 @@ This document is the reference for installing, configuring, and operating the pa
 | [Install](#install) | Runtimes, the package, optional Herdr |
 | [First run](#first-run) | Restart, enable an adapter, start a run, watch it |
 | [Configure](#configure) | Initializer, doctor, migration, environment variables |
+| [Workspace preparation](#automatic-workspace-preparation) | Approve host dependency installation once; readiness and dispatch blockers |
 | [Environment and storage](#environment-and-storage) | Every variable the package reads and where it writes |
 | [Commands](#pi-commands) | `/delegate`, `/graph`, `/failover` |
 | [Tools](#tools) | `delegate_graph`, `questionnaire`, cmux hooks |
@@ -344,7 +345,7 @@ Every run uses `runtime-v1`: workers author no report, the runtime retains what 
 
 **Attempts.** `dispatch` registers the attempt with the worker's frozen identity (run, operation, role, model attempt, transient attempt, model, agent); the ACP request id binds later from the worker's own stream. `collect` waits for the worker and, before the session is closed, the provider boundary is verified, or anything is cleaned up, retains the public answer and (for `implement`) the audited AgentFS changes as content-addressed private files. The process outcome, candidate, and observed session identity (`loaded`, `created`, `resumed`, `expected`) are then settled immutably. A close, provider-boundary, or cleanup failure after that point comes back as `postSettlementFailures` and never discards the candidate. Collecting again returns the same settlement.
 
-**Decisions.** An `exited` attempt is completed or parked only by `decide`. `accepted` with a `reason` (and, for review, test, audit and source-search nodes the `verdict` you read from the answer, and for thinker_synthesize on the operations graph `verdict: DONE` when the synthesis is complete; the worker prompt asks those roles to end with one line `VERDICT: <value>`) completes the operation through the graph's join and transition logic. `rejected` marks the operation failed and parks the run with the candidate retained. A coding or operational candidate with file changes must be applied with `integrate` first; the journal reserves the Git workspace, keeps preimages, recovers or rolls back interrupted writes from private staging on the same filesystem, and refuses changed bases, dirty affected files, symlinks, Git-internal paths, parents that are symlinks or nested repositories (the error names the parent and the entry), and files over 16 MiB. A candidate file in a directory that does not exist yet is integrated by creating the directory; rolling the integration back removes the directories it created once they are empty again, and never one that existed before. Do not run a command that changes the workspace in the same parallel tool batch as the `integrate` that depends on it: the integration may run first. Integration writes into the workspace that a still-running sibling worker's settlement audit reads, so it is refused while any sibling operation of the same node and round still has a live worker; collect them first, or pass `overrideRunningSiblings: true` with the `reason` you know they are dead, which is recorded on the integration row. A dirty preimage that an earlier integration in this workspace applied and nobody committed is reported as exactly that, because rounds hand their output to each other through the working tree: commit the previous round's integrated files before integrating the next round's candidates. A candidate without changes needs no integration. A candidate that retained neither an answer nor a change cannot be accepted at all: settlement no longer mints one, and `decide accepted` against a row written before that refuses with `empty candidate`, leaving rejection followed by a retry as the only exit.
+**Decisions.** An `exited` attempt is completed or parked only by `decide`. `accepted` with a `reason` (and, for review, test, audit and source-search nodes the `verdict` you read from the answer, and for thinker_synthesize on the operations graph `verdict: DONE` when the synthesis is complete; the worker prompt asks those roles to end with one line `VERDICT: <value>`) completes the operation through the graph's join and transition logic. `rejected` marks the operation failed and parks the run with the candidate retained. A coding or operational candidate with file changes must be applied with `integrate` first; the journal reserves the Git workspace, keeps preimages, recovers or rolls back interrupted writes from private staging on the same filesystem, and refuses changed bases, dirty affected files, symlinks, Git-internal paths, parents that are symlinks or nested repositories (the error names the parent and the entry), and files over 16 MiB. A candidate file in a directory that does not exist yet is integrated by creating the directory; rolling the integration back removes the directories it created once they are empty again, and never one that existed before. Do not run a command that changes the workspace in the same parallel tool batch as the `integrate` that depends on it: the integration may run first. Integration writes into the workspace that a still-running sibling worker's settlement audit reads, so it is refused while any sibling operation of the same node and round still has a live worker; collect them first, or pass `overrideRunningSiblings: true` with the `reason` you know they are dead, which is recorded on the integration row. A dirty preimage that an earlier integration in this workspace applied and nobody committed is reported as exactly that, because rounds hand their output to each other through the working tree: discard the already-launched candidate, obtain an authorized commit of the previous integration, then dispatch a replacement worker. Committing underneath that candidate invalidates its base. Implementation dispatch now catches overlapping dirty applied output before launch, including directory ownership and deletions; disjoint slices and ordinary operator edits remain untouched. A candidate without changes needs no integration. A candidate that retained neither an answer nor a change cannot be accepted at all: settlement no longer mints one, and `decide accepted` against a row written before that refuses with `empty candidate`, leaving rejection followed by a retry as the only exit.
 
 **Retry and fallback.** A `failed` or `interrupted` attempt, or an `exited` attempt whose capture produced no candidate, is replaced only by `retry`. Its recorded failure text is classified: transient failures spend the three-attempt same-model budget, then advance to the next model of the frozen chain, then park the run in `awaiting_user`; permanent failures park at once; exact-model locks never advance. A replacement stamps the old attempt `superseded`, returns the operation to `pending` with a `retry_not_before` backoff, and the next `dispatch` mints a new attempt key and ACPX session from the advanced counters. Old identities can no longer register. A dispatch preflight failure with no worker registered goes through the same classification, fenced to the exact counters that were dispatched so one failure can never spend the budget twice. A failed coding attempt whose partial candidate was prepared or applied cannot be replaced until that integration is rolled back, and a superseded attempt's candidate can only ever be rolled back, never applied. A parked run resumes only through the operator's `resolve` with `retry` or `/graph resume`, which advance the transient counter so the replacement identity is fresh without restoring the budget; `defer`, `abort` and `escalate` are graph transitions. `record` accepts only cancellation.
 
@@ -535,6 +536,84 @@ A run initialized with `workspaceRoot` set to `$HOME` or a directory under it (`
 - `status` ends the run line with `workspace=home:<root>`.
 
 Limits: symlinked or hard-linked targets (for example stow-managed dotfiles) and files over 16 MiB are refused by the journal, and two slices running in parallel that edit the same file conflict at integration rather than merging.
+
+### Automatic workspace preparation
+
+Repository build and research dispatches can prepare host dependencies before launcher creation.
+Home and operations runs are unchanged. Preparation is optional: an unconfigured workspace reports
+`preparation.status: "unconfigured"`, without guessing a package manager. Dependencies stay outside
+worker ownership; a prepared worker reports missing dependencies rather than installing them.
+
+Create a private, operator-owned `workspace-preparation.jsonc` in the Pi agent directory
+(`PI_CODING_AGENT_DIR`, default `~/.pi/agent`). Keep the registry outside the workspace and use
+mode 600. The following is a **template**: replace the absolute workspace/tool paths, dependency
+module and script inputs with those of your project; paths and argv have no variable expansion.
+
+```json
+{
+  "workspaces": [{
+    "workspace": "/absolute/repository",
+    "install": [{ "executable": "/absolute/npm", "args": ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", ".preparation-scratch/npm-cache"] }],
+    "baseline": [{ "executable": "/absolute/node", "args": ["baseline.cjs"] }],
+    "readiness": { "executable": "/absolute/node", "args": ["-e", "require('your-installed-module')"] },
+    "dependencyInputs": ["package.json", "package-lock.json"],
+    "scriptInputs": ["baseline.cjs"],
+    "writePaths": ["node_modules", ".preparation-scratch"],
+    "timeoutMs": 300000
+  }]
+}
+```
+
+`install` and `baseline` are ordered arrays, `readiness` is a read-only dependency-loading command,
+and `timeoutMs` applies to each command. Declare **every** repository script and transitive
+script/config input executed by these commands in `scriptInputs`. Repository executables, including
+extensionless scripts, and direct repository script arguments must be declared; npm script definitions from the root `package.json` are bound
+separately from dependency versions. The package cannot discover arbitrary dynamic imports or
+shell-script call chains: approval attests that this declaration is complete. Installer lifecycle
+scripts have arbitrary host access too; `--ignore-scripts` avoids running them in this npm template.
+
+Approve once from the package directory, or substitute its absolute script path:
+
+```bash
+node --experimental-strip-types scripts/workspace-preparation.ts status --workspace /absolute/repository
+node --experimental-strip-types scripts/workspace-preparation.ts approve --workspace /absolute/repository --host-access
+node --experimental-strip-types scripts/workspace-preparation.ts revoke --workspace /absolute/repository
+```
+
+`approve --host-access` explicitly accepts arbitrary host access and completeness of `scriptInputs`.
+Approval lives separately in `workspace-preparation-approvals/` under the agent directory; dispatch,
+repository data and worker messages never create it. Changed commands, boundaries, timeout, npm
+script definitions or declared script bytes require renewed approval. Dependency-input content
+changes invalidate readiness, not command authority. Keep `dependencyInputs` and `scriptInputs`
+outside `writePaths`; tracked source cannot be declared writable dependency state.
+
+An unchanged recipe/input set in the same run reuses completed installation and baseline **only**
+when retained phase evidence verifies and the actual readiness command succeeds. A new run, changed
+inputs, missing evidence or missing dependencies triggers preparation again. A successful installation
+can be reused after a failed baseline when readiness still succeeds. Failure, timeout, cancellation
+or an unexpected source write blocks launch and retains bounded diagnostics; no provider retry or
+fallback budget is spent. Partial dependencies remain not ready. Unexpected worktree changes remain
+in place for inspection; preparation never resets, stashes or deletes operator edits. This is auditing
+of a trusted host command, not confinement of its writes outside the workspace.
+
+The real Git metadata directory contains private `pi-agent-wave-preparation/` state: a cross-process
+lock, run-scoped receipts, diagnostics and launch references to graph databases. The lock is held
+through registration on both transports, including unconfigured repository dispatches. A busy or
+unconfirmed lock blocks instead of running concurrent installers; a live owner's lock is never
+reclaimed. Refresh or baseline execution is refused while workspace workers are unsettled across
+runs and recorded graph databases. Collect/stop those workers first. A launcher exception or
+interrupted execution can leave an unconfirmed launch reference; reconcile it against the worker and graph before removing that
+reference. Missing graph databases are not treated as proof that their workers stopped. Receipts,
+diagnostics and launch references are workspace metadata and are not reclaimed by `/graph prune`.
+Prune can remove their referenced attempt rows; a remaining reference then conservatively blocks
+refresh until you verify worker shutdown and reconcile the reference.
+
+`workspace_preparation` progress events name the phase; success returns a `preparation` result.
+`dispatched: false, blocked: "preparation"` returns the failed phase, reason and diagnostic path;
+`blocked: "integration"` names dirty applied output overlapping implementation ownership and asks
+for an authorized commit **before** a replacement worker is dispatched. Both leave the operation
+pending: repair the named blocker and redispatch that operation, not `op=retry` for an attempt that
+never launched. No commits or approvals are automatic.
 
 ### Host services
 

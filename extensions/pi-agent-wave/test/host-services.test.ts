@@ -111,8 +111,8 @@ async function toolIn(dir: string, invocations: { command: string; args: string[
 }
 
 /** A research run with its thinker pending, ready for op=dispatch. */
-async function pendingThinker(tool: Record<string, any>): Promise<{ runId: string; operationId: string }> {
-	const init = parsed(await tool.execute("init", { op: "init", story: "host-services", graph: "research", task: "Look something up" }, undefined, () => {}, {} as ExtensionContext));
+async function pendingThinker(tool: Record<string, any>, cwd: string): Promise<{ runId: string; operationId: string }> {
+	const init = parsed(await tool.execute("init", { op: "init", story: "host-services", graph: "research", task: "Look something up" }, undefined, () => {}, { cwd } as ExtensionContext));
 	assert.equal(init.error, undefined, JSON.stringify(init));
 	const store = new GraphStore({ dbPath: process.env.DELEGATE_GRAPH_DB });
 	try {
@@ -138,7 +138,7 @@ describe("op=dispatch with host services", () => {
 		const dir = scratch("host-services-dispatch-");
 		const invocations: { command: string; args: string[] }[] = [];
 		const tool = await toolIn(dir, invocations);
-		const { runId, operationId } = await pendingThinker(tool);
+		const { runId, operationId } = await pendingThinker(tool, dir);
 		invocations.length = 0;
 		const result = parsed(await tool.execute("dispatch", { op: "dispatch", runId, operationId, transport: "headless", hostServices: ["db"] }, undefined, () => {}, { cwd: dir } as ExtensionContext));
 		assert.match(String(result.error), /host services: service db: is not registered \(registered: browser\)/);
@@ -156,7 +156,7 @@ describe("op=dispatch with host services", () => {
 		const dir = scratch("host-services-dispatch-");
 		const invocations: { command: string; args: string[] }[] = [];
 		const tool = await toolIn(dir, invocations);
-		const { runId, operationId } = await pendingThinker(tool);
+		const { runId, operationId } = await pendingThinker(tool, dir);
 		invocations.length = 0;
 		await tool.execute("dispatch", { op: "dispatch", runId, operationId, transport: "headless", hostServices: ["browser"] }, undefined, () => {}, { cwd: dir } as ExtensionContext);
 		const start = invocations.find((call) => call.args.includes("start"));

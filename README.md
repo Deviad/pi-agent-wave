@@ -128,6 +128,26 @@ Read-only permissions deter accidental writes, not same-user replacement. Input 
 selected provider and remain in `runtime-content/` after cancellation or prune; there is no input
 content garbage collection. Details: the package README, "Declared inputs and resource preparation".
 
+### Prepare workspace dependencies automatically
+
+An optional operator-owned `workspace-preparation.jsonc` in the Pi agent directory defines explicit
+host installation, baseline and dependency-loading readiness commands for a canonical repository.
+Approve the recipe once with `scripts/workspace-preparation.ts approve --workspace <root>
+--host-access` from the package directory, using Node's `--experimental-strip-types` flag. Approval
+acknowledges arbitrary host access and complete declared script inputs; changed commands or scripts
+need renewed approval. Dispatch never authorizes repository hooks on its own.
+
+Build/research dispatch runs approved preparation before worker creation and reuses it within a run
+only after validating dependency inputs, retained phase evidence and actual readiness. A shared
+workspace lock prevents concurrent installs and launch races; active workers prohibit dependency
+refresh. Failure leaves the operation pending, returns retained diagnostics and spends no worker
+fallback budget. Unconfigured workspaces, home runs and operations runs retain their existing flow.
+
+Implementation dispatch also blocks ownership overlapping an earlier integration's uncommitted
+output. Obtain an authorized commit before dispatching a replacement worker; it never commits for
+you or loosens candidate HEAD/preimage checks. Configuration, approval commands and recovery:
+the [package README](extensions/pi-agent-wave/README.md#automatic-workspace-preparation).
+
 ### What a run keeps, and what it tears down
 
 ```mermaid

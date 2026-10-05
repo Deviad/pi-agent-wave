@@ -7,6 +7,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { liveViewFor, refreshLiveView, streamRunDirectory } from "./lib/live-stream.ts";
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
+import { RuntimeIntegration } from "./lib/runtime-integration.ts";
+import { prepareWorkspace, WorkspacePreparationError, type PreparationGuard } from "./lib/workspace-preparation.ts";
 import { captureRunInputs, INPUT_FILE_LIMIT } from "./lib/run-inputs.ts";
 import { taskPathIssues, TaskPreparationError } from "./lib/task-host-paths.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
@@ -1046,85 +1048,114 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 							progress("dispatch_refused_by_precondition", { runId, operationId, baseDir, status: refused.state.status });
 							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, baseDir, state: refused.state, operation: refused.operation });
 						}
-					}
-					const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
-					const initialized = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "init", `${runId}-${operationId}`]);
-					if (initialized.exitCode !== 0) throw new Error(initialized.stderr || initialized.stdout || "headless init failed");
-					const privateRunDir = initialized.stdout.trim();
-					const taskFile = join(privateRunDir, "task.md");
-					let evidence: ReturnType<typeof materializeRuntimeEvidence>;
-					try {
-						evidence = materializeRuntimeEvidence(graphStore, runId, privateRunDir);
-						writeFileSync(taskFile, `${operation.task}\n${evidence.taskSuffix}`, { mode: 0o600 });
-						chmodSync(taskFile, 0o600);
-					} catch (error) {
-						discardUnlaunchedRunDirectory(privateRunDir);
-						throw error;
-					}
-					progress("runtime_evidence_materialized", { runId, operationId, ledgerPath: evidence.ledgerPath, answers: evidence.answers.length });
-					const role = roleForNode(operation.node);
-					const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", homeRoot && operation.read_only !== 1 ? JSON.stringify(["."]) : operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--workspace-mode", homeRoot ? "home" : "repository", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
-					if (operation.command_json) startArgs.push("--command-json", operation.command_json);
-					if (hostServices.length) startArgs.push("--host-services-json", JSON.stringify(hostServices));
-					const started = await execute(process.execPath, startArgs);
-					if (started.exitCode !== 0) {
-						const startOutput = `${started.stderr ?? ""}${started.stdout ?? ""}`;
-						// The launcher refuses an attempt whose worker pi could not start in (delegate_core.py:worker_cwd_precondition);
-						// like a credential preflight block, nothing was registered, so the refusal goes through the fenced path.
-						const precondition = /\[dispatch_precondition\]/.exec(startOutput);
-						if (precondition) {
-							const reason = startOutput.slice(precondition.index).split("\n")[0].trim();
-							const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
-							progress("dispatch_refused_by_precondition", { runId, operationId, status: refused.state.status });
-							discardUnlaunchedRunDirectory(privateRunDir);
-							return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, state: refused.state, operation: refused.operation });
+						const journal = new RuntimeIntegration(graphStore.dbPath);
+						let paths: string[];
+						try { paths = journal.dirtyAppliedPaths(baseDir, Array.isArray(declaredOwnership) ? declaredOwnership.map(String) : []); }
+						finally { journal.close(); }
+						if (paths.length) {
+							const reason = `dispatch refused in ${baseDir}: uncommitted output of an earlier applied integration overlaps ownership (${paths.join(", ")}); obtain an authorized commit before dispatching a replacement worker. No candidate has been launched.`;
+							progress("dispatch_blocked_by_integration", { runId, operationId, workspace: baseDir, paths, reason });
+							return textResult({ runId, operationId, dispatched: false, blocked: "integration", reason, baseDir, paths });
 						}
-						const preflight = /worker preflight:/.exec(startOutput);
-						if (preflight) {
-							const reason = startOutput.slice(preflight.index).split("\n")[0].trim();
-							// No worker was registered, so the launch failure is classified through the fenced replacement path.
-							const blocked = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
-							progress("dispatch_blocked_by_preflight", { runId, operationId, reason, status: blocked.state.status, modelAttempt: blocked.operation.model_attempt });
-							discardUnlaunchedRunDirectory(privateRunDir);
-							return textResult({
-								runId,
-								operationId,
-								dispatched: false,
-								blocked: "preflight",
-								reason,
-								state: blocked.state,
-								operation: blocked.operation,
-								retry: blocked.retry ?? null,
-							});
-						}
-						discardUnlaunchedRunDirectory(privateRunDir);
-						throw new Error(started.stderr || started.stdout || "headless start failed");
 					}
-					const launch: unknown = JSON.parse(started.stdout);
-					if (!isRecord(launch)) throw new Error("headless start returned invalid identity");
-					const launchText = (key: string): string => {
-						const value = launch[key];
-						if (typeof value !== "string" || !value) throw new Error(`headless start requires ${key}`);
-						return value;
-					};
-					const agentName = launchText("agent");
-					const sessionId = launchText("acpx-session");
-					const agentId = graphStore.registerAgent({ runId, name: agentName, node: operation.node, role, transport: workerTransport, herdrAgent: workerTransport === "herdr" ? launchText("agent") : undefined, tabId: workerTransport === "herdr" ? launchText("tab") : undefined, herdrPaneId: workerTransport === "herdr" ? launchText("pane") : undefined, policyDigest: next.policy.digest, selectedModel, modelAttempt: operation.model_attempt, acpAgent: parseAcpAgent(launchText("acp-agent")), acpxRecordId: sessionId, acpxSessionId: sessionId, acpxState: "alive", acpxAttemptKey: launchText("acpx-attempt-key"), agentFsSessionId: launchText("agentfs-session"), agentFsDbPath: launchText("agentfs-db"), acpxCancelScript: launchText("acpx-cancel-script"), currentTask: operation.task });
-					{
-						// The launch identity is re-derived from frozen graph facts and must reproduce the worker's attempt key.
-						const identity = resolveAcpxPlan({ runId, operationId, role, modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts, selectedModel, transport: workerTransport, herdrAgent: workerTransport === "herdr" ? launchText("agent") : undefined, herdrTabId: workerTransport === "herdr" ? launchText("tab") : undefined, herdrPaneId: workerTransport === "herdr" ? launchText("pane") : undefined });
-						if (identity.attemptKey !== launchText("acpx-attempt-key")) throw new Error("launched worker attempt key does not match the frozen operation identity");
-						const attempt = graphStore.beginRuntimeAttempt({ identity, sessionId, requestId: null, policyDigest: next.policy.digest, agentId });
-						progress("runtime_attempt_registered", { runId, operationId, agentName, transport: workerTransport, attemptKey: attempt.attemptKey });
-						// The worker is registered; presentation runs after that fact and a UI failure cannot reclassify the dispatch.
+					let preparation: PreparationGuard | undefined;
+					if (!homeRoot && run.graph_name !== "operations") {
 						try {
-							if (ctx.mode === "tui") stopFollow("replaced by agent list");
-							noteRegisteredAttempt(graphStore, ctx, { attemptKey: attempt.attemptKey, runId, operationId }, watchIntervalMs(), listActions(graphStore, pi));
+							preparation = await prepareWorkspace({ workspace: dispatchCwd, agentDir: resolveAgentDir(), dbPath: graphStore.dbPath, runId, operationId, signal: _signal, progress: (phase, details) => progress("workspace_preparation", { phase, ...details }) });
+							progress("workspace_preparation_complete", { runId, operationId, ...preparation.result });
 						} catch (error) {
-							ctx.ui.notify(`agent list unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+							const reason = error instanceof Error ? error.message : String(error);
+							const phase = error instanceof WorkspacePreparationError ? error.phase : "configuration";
+							const diagnosticsPath = error instanceof WorkspacePreparationError ? error.diagnosticsPath : null;
+							progress("dispatch_blocked_by_preparation", { runId, operationId, reason, phase, diagnosticsPath });
+							return textResult({ runId, operationId, dispatched: false, blocked: "preparation", reason, phase, diagnosticsPath });
 						}
-						return textResult({ state: graphStore.getState(runId), operation: graphStore.getOperation(operationId), attempt, agentId, agentName, transport: workerTransport, launch, hostServices: hostServices.map((service) => service.name) });
 					}
+					try {
+						preparation?.beginLaunch();
+						const delegate = join(EXTENSION_DIR, "scripts", "delegate.ts");
+						const initialized = await execute(process.execPath, ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "init", `${runId}-${operationId}`]);
+						if (initialized.exitCode !== 0) throw new Error(initialized.stderr || initialized.stdout || "headless init failed");
+						const privateRunDir = initialized.stdout.trim();
+						const taskFile = join(privateRunDir, "task.md");
+						let evidence: ReturnType<typeof materializeRuntimeEvidence>;
+						try {
+							evidence = materializeRuntimeEvidence(graphStore, runId, privateRunDir);
+							writeFileSync(taskFile, `${operation.task}\n${evidence.taskSuffix}${preparation?.result.status === "ready" ? "\nDependencies are host-prepared. Report missing dependencies to the supervisor; do not install them in the worker.\n" : ""}`, { mode: 0o600 });
+							chmodSync(taskFile, 0o600);
+						} catch (error) {
+							discardUnlaunchedRunDirectory(privateRunDir);
+							throw error;
+						}
+						progress("runtime_evidence_materialized", { runId, operationId, ledgerPath: evidence.ledgerPath, answers: evidence.answers.length });
+						const role = roleForNode(operation.node);
+						const startArgs = ["--experimental-strip-types", delegate, "--transport", workerTransport, "--", "start", privateRunDir, role, "--policy", "auto", "--policy-digest", next.policy.digest, "--model", selectedModel, "--reason", "Air/headless extension-owned dispatch", "--thinking", operation.route.thinking, "--session", String(operation.route.session), "--node", operation.node, "--run-id", runId, "--operation-id", operationId, "--owned-paths-json", homeRoot && operation.read_only !== 1 ? JSON.stringify(["."]) : operation.owned_paths_json, "--ignored-paths-json", JSON.stringify(DEFAULT_IGNORED_PATHS), "--access-mode", operation.read_only === 1 ? "read-only" : "owned-write", "--workspace-mode", homeRoot ? "home" : "repository", "--model-attempt", String(operation.model_attempt), "--transient-attempt", String(operation.transient_attempts), "--task-file", taskFile];
+						if (operation.command_json) startArgs.push("--command-json", operation.command_json);
+						if (hostServices.length) startArgs.push("--host-services-json", JSON.stringify(hostServices));
+						preparation?.retainLaunch();
+						const startResult = await pi.exec(process.execPath, startArgs, { cwd: dispatchCwd });
+						if (preparation && startResult.killed) throw new Error(`launcher execution interrupted; worker status unconfirmed. Keep ${privateRunDir} and reconcile the worker before redispatch or dependency refresh`);
+						const started = { exitCode: startResult.code, stdout: startResult.stdout, stderr: startResult.stderr };
+						if (started.exitCode !== 0) {
+							preparation?.failedLaunch();
+							const startOutput = `${started.stderr ?? ""}${started.stdout ?? ""}`;
+							// The launcher refuses an attempt whose worker pi could not start in (delegate_core.py:worker_cwd_precondition);
+							// like a credential preflight block, nothing was registered, so the refusal goes through the fenced path.
+							const precondition = /\[dispatch_precondition\]/.exec(startOutput);
+							if (precondition) {
+								const reason = startOutput.slice(precondition.index).split("\n")[0].trim();
+								const refused = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
+								progress("dispatch_refused_by_precondition", { runId, operationId, status: refused.state.status });
+								discardUnlaunchedRunDirectory(privateRunDir);
+								return textResult({ runId, operationId, dispatched: false, blocked: "precondition", reason, state: refused.state, operation: refused.operation });
+							}
+							const preflight = /worker preflight:/.exec(startOutput);
+							if (preflight) {
+								const reason = startOutput.slice(preflight.index).split("\n")[0].trim();
+								// No worker was registered, so the launch failure is classified through the fenced replacement path.
+								const blocked = graphStore.retryRuntimeAttempt({ runId, operationId, error: reason, launched: { modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts } });
+								progress("dispatch_blocked_by_preflight", { runId, operationId, reason, status: blocked.state.status, modelAttempt: blocked.operation.model_attempt });
+								discardUnlaunchedRunDirectory(privateRunDir);
+								return textResult({
+									runId,
+									operationId,
+									dispatched: false,
+									blocked: "preflight",
+									reason,
+									state: blocked.state,
+									operation: blocked.operation,
+									retry: blocked.retry ?? null,
+								});
+							}
+							discardUnlaunchedRunDirectory(privateRunDir);
+							throw new Error(started.stderr || started.stdout || "headless start failed");
+						}
+						const launch: unknown = JSON.parse(started.stdout);
+						if (!isRecord(launch)) throw new Error("headless start returned invalid identity");
+						const launchText = (key: string): string => {
+							const value = launch[key];
+							if (typeof value !== "string" || !value) throw new Error(`headless start requires ${key}`);
+							return value;
+						};
+						const agentName = launchText("agent");
+						const sessionId = launchText("acpx-session");
+						const agentId = graphStore.registerAgent({ runId, name: agentName, node: operation.node, role, transport: workerTransport, herdrAgent: workerTransport === "herdr" ? launchText("agent") : undefined, tabId: workerTransport === "herdr" ? launchText("tab") : undefined, herdrPaneId: workerTransport === "herdr" ? launchText("pane") : undefined, policyDigest: next.policy.digest, selectedModel, modelAttempt: operation.model_attempt, acpAgent: parseAcpAgent(launchText("acp-agent")), acpxRecordId: sessionId, acpxSessionId: sessionId, acpxState: "alive", acpxAttemptKey: launchText("acpx-attempt-key"), agentFsSessionId: launchText("agentfs-session"), agentFsDbPath: launchText("agentfs-db"), acpxCancelScript: launchText("acpx-cancel-script"), currentTask: operation.task });
+						{
+							// The launch identity is re-derived from frozen graph facts and must reproduce the worker's attempt key.
+							const identity = resolveAcpxPlan({ runId, operationId, role, modelAttempt: operation.model_attempt, transientAttempt: operation.transient_attempts, selectedModel, transport: workerTransport, herdrAgent: workerTransport === "herdr" ? launchText("agent") : undefined, herdrTabId: workerTransport === "herdr" ? launchText("tab") : undefined, herdrPaneId: workerTransport === "herdr" ? launchText("pane") : undefined });
+							if (identity.attemptKey !== launchText("acpx-attempt-key")) throw new Error("launched worker attempt key does not match the frozen operation identity");
+							const attempt = graphStore.beginRuntimeAttempt({ identity, sessionId, requestId: null, policyDigest: next.policy.digest, agentId });
+							progress("runtime_attempt_registered", { runId, operationId, agentName, transport: workerTransport, attemptKey: attempt.attemptKey });
+							// The worker is registered; presentation runs after that fact and a UI failure cannot reclassify the dispatch.
+							try {
+								if (ctx.mode === "tui") stopFollow("replaced by agent list");
+								noteRegisteredAttempt(graphStore, ctx, { attemptKey: attempt.attemptKey, runId, operationId }, watchIntervalMs(), listActions(graphStore, pi));
+							} catch (error) {
+								ctx.ui.notify(`agent list unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+							}
+							return textResult({ state: graphStore.getState(runId), operation: graphStore.getOperation(operationId), attempt, agentId, agentName, transport: workerTransport, launch, hostServices: hostServices.map((service) => service.name), preparation: preparation?.result ?? null });
+						}
+					} finally { preparation?.release(); }
 				}
 				if (params.op === "collect") {
 					const operationId = required(params.operationId, "operationId");

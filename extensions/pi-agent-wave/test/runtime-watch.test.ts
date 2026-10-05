@@ -200,9 +200,9 @@ async function harnessWith(dir: string, exec: Exec): Promise<Record<string, any>
 }
 
 interface FakeTui { ctx: ExtensionContext; widgets: (string[] | undefined)[]; notices: string[]; input: (data: string) => unknown; unsubscribed: number; last: () => string[] | undefined; editorText: string }
-function fakeTui(mode: "tui" | "headless" = "tui"): FakeTui {
+function fakeTui(mode: "tui" | "headless" = "tui", cwd = process.cwd()): FakeTui {
 	const tui: FakeTui = { widgets: [], notices: [], unsubscribed: 0, input: () => { throw new Error("no terminal input handler"); }, last: () => tui.widgets.at(-1), ctx: undefined as unknown as ExtensionContext, editorText: "" };
-	tui.ctx = { mode, cwd: process.cwd(), ui: { getEditorText: () => tui.editorText, notify: (message: string) => tui.notices.push(message), setWidget: (key: string, content: string[] | undefined) => { assert.equal(key, AGENT_LIST_WIDGET); tui.widgets.push(content); }, onTerminalInput: (handler: (data: string) => unknown) => { tui.input = handler; return () => { tui.unsubscribed += 1; }; } } } as unknown as ExtensionContext;
+	tui.ctx = { mode, cwd, ui: { getEditorText: () => tui.editorText, notify: (message: string) => tui.notices.push(message), setWidget: (key: string, content: string[] | undefined) => { assert.equal(key, AGENT_LIST_WIDGET); tui.widgets.push(content); }, onTerminalInput: (handler: (data: string) => unknown) => { tui.input = handler; return () => { tui.unsubscribed += 1; }; } } } as unknown as ExtensionContext;
 	return tui;
 }
 
@@ -254,7 +254,7 @@ test("agent list opens on registered dispatch only", async () => {
 			}
 			throw new Error(`unexpected execution: ${args.join(" ")}`);
 		});
-		const tui = fakeTui();
+		const tui = fakeTui("tui", dir);
 		const init = parsed(await tool.execute("init", { op: "init", story: "list", graph: "research", task: "Investigate", modelPolicy: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "fixture" } }, undefined, () => {}, tui.ctx));
 		assert.equal(init.error, undefined, JSON.stringify(init));
 		const runId: string = init.state.runId; const operation = init.next.operations[0];

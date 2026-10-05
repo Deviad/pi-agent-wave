@@ -83,10 +83,10 @@ describe("provider preflight at dispatch", () => {
 			const invocations: { command: string; args: string[] }[] = [];
 			const { tool } = await toolIn(dir, ["nosuchproviderxyz/dead-route", "alibaba/live-route"], invocations);
 			const commands = graph === "operations" ? [{ id: "access", name: "access", command: { executable: process.execPath, args: ["-e", "process.exit(0)"], cwd: dir }, ownedPaths: [join(dir, "result.txt")] }] : undefined;
-			const init = parsed(await tool.execute("init", { op: "init", story: "preflight-block", graph, task: "Plan the wave", commands }, undefined, () => {}, {} as ExtensionContext));
+			const init = parsed(await tool.execute("init", { op: "init", story: "preflight-block", graph, task: "Plan the wave", commands }, undefined, () => {}, { cwd: dir } as ExtensionContext));
 			assert.equal(init.error, undefined, `init must succeed, got ${JSON.stringify(init)}`);
 			const operation = init.next.operations[0];
-			const blocked = parsed(await tool.execute("dispatch", { op: "dispatch", runId: init.state.runId, operationId: operation.id, transport: "headless" }, undefined, () => {}, {} as ExtensionContext));
+			const blocked = parsed(await tool.execute("dispatch", { op: "dispatch", runId: init.state.runId, operationId: operation.id, transport: "headless" }, undefined, () => {}, { cwd: dir } as ExtensionContext));
 			assert.equal(blocked.error, undefined, `dispatch must converge on a named block, got ${JSON.stringify(blocked)}`);
 			assert.equal(blocked.dispatched, false);
 			assert.equal(blocked.blocked, "preflight");
