@@ -58,6 +58,7 @@ export interface RuntimeObservation {
 }
 
 export interface RuntimeSettlementInput {
+	readonly droppedPaths?: readonly string[];
 	readonly attemptKey: string;
 	readonly outcome: RuntimeOutcome;
 	readonly candidate?: RuntimeCandidate;

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Database } from "../sqlite.ts";
 import { RuntimeContentStore } from "./runtime-content.ts";
@@ -35,7 +35,9 @@ export interface IntegrationStatus {
 	/** The operator's stated reason for integrating past a running sibling, or null when none was needed. */
 	readonly overrideReason: string | null;
 }
+export interface IntegrationProgress { index: number; total: number; path: string }
 export interface IntegrationInput {
+	readonly overrideLargeCandidate?: boolean;
 	readonly workspace: string;
 	readonly baseRevision: string;
 	readonly candidateId: string;
@@ -108,6 +110,8 @@ export class RuntimeIntegration {
 	private readonly db: Database;
 	private readonly content: RuntimeContentStore;
 	private readonly stagingRoot: string;
+	private readonly manifests = new Map<string, Manifest>();
+	private cursor?: { id: string; direction: Direction; next: number };
 
 	constructor(dbPath: string) {
 		this.content = new RuntimeContentStore(dbPath);
@@ -130,6 +134,11 @@ export class RuntimeIntegration {
 		if (!this.db.query("SELECT 1 FROM pragma_table_info('runtime_integrations') WHERE name='override_reason'").get()) {
 			this.db.exec("ALTER TABLE runtime_integrations ADD COLUMN override_reason TEXT");
 		}
+		if (!this.db.query("SELECT 1 FROM pragma_table_info('runtime_integrations') WHERE name='undo_started'").get()) {
+			this.transaction(() => {
+				if (!this.db.query("SELECT 1 FROM pragma_table_info('runtime_integrations') WHERE name='undo_started'").get()) this.db.exec("ALTER TABLE runtime_integrations ADD COLUMN undo_started INTEGER NOT NULL DEFAULT 0");
+			});
+		}
 	}
 
 	private transaction<T>(work: () => T): T {
@@ -138,10 +147,14 @@ export class RuntimeIntegration {
 		catch (error) { this.db.exec("ROLLBACK"); throw error; }
 	}
 
-	private row(id: string): JournalRow {
-		const row = this.db.query<JournalRow, [string]>("SELECT * FROM runtime_integrations WHERE id=?").get(id);
+	private row(id: string): Omit<JournalRow, "manifest_json"> {
+		const row = this.db.query<JournalRow, [string]>(this.manifests.has(id) ? "SELECT id,state,direction,error,override_reason FROM runtime_integrations WHERE id=?" : "SELECT * FROM runtime_integrations WHERE id=?").get(id);
 		if (!row) throw new Error("unknown integration");
-		if (runtimeDigest(parseManifest(row.manifest_json)) !== id) throw new Error("integration manifest digest mismatch");
+		if (!this.manifests.has(id)) {
+			const manifest = parseManifest(row.manifest_json);
+			if (runtimeDigest(manifest) !== id) throw new Error("integration manifest digest mismatch");
+			this.manifests.set(id, manifest);
+		}
 		return row;
 	}
 
@@ -160,7 +173,8 @@ export class RuntimeIntegration {
 		const rows = this.db.query<{ id: string }, [string]>("SELECT id FROM runtime_integrations WHERE workspace=? AND state='applied'").all(root);
 		const paths = new Set<string>();
 		for (const row of rows) {
-			const manifest = parseManifest(this.row(row.id).manifest_json);
+			this.row(row.id);
+			const manifest = this.manifests.get(row.id)!;
 			for (const entry of manifest.entries) {
 				const target = resolve(root, entry.path);
 				if (!owned.some((path) => target === path || target.startsWith(`${path}/`) || path.startsWith(`${target}/`))) continue;
@@ -175,9 +189,9 @@ export class RuntimeIntegration {
 	}
 
 	/** The integration journaled for a candidate in a workspace, if any, and whether it ran Git checks. */
-	forCandidate(workspace: string, candidateId: string): (IntegrationStatus & { readonly gitChecks: boolean }) | null {
-		const row = this.db.query<JournalRow, [string, string]>("SELECT * FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?").get(realpathSync(resolve(workspace)), candidateId);
-		return row ? { ...this.get(row.id), gitChecks: parseManifest(row.manifest_json).gitChecks } : null;
+	forCandidate(workspace: string, candidateId: string): (IntegrationStatus & { readonly gitChecks: boolean; readonly undoStarted: boolean }) | null {
+		const row = this.db.query<JournalRow & { undo_started: number }, [string, string]>("SELECT * FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?").get(realpathSync(resolve(workspace)), candidateId);
+		return row ? { ...this.get(row.id), gitChecks: parseManifest(row.manifest_json).gitChecks, undoStarted: row.undo_started === 1 } : null;
 	}
 
 	get(id: string): IntegrationStatus {
@@ -276,8 +290,15 @@ export class RuntimeIntegration {
 		const gitChecks = input.gitChecks !== false;
 		if (!input.changes.length) throw new Error("integration requires file changes");
 		return this.transaction(() => {
-			validate();
 			const previous = this.db.query<JournalRow, [string, string]>("SELECT * FROM runtime_integrations WHERE workspace=? AND json_extract(manifest_json,'$.candidateId')=?").get(workspace, input.candidateId);
+			if (!previous) {
+				const total = input.changes.reduce((sum, change) => sum + (change.after?.bytes ?? 0), 0);
+				if ((input.changes.length > 200 || total > 25_000_000) && !(input.overrideLargeCandidate && input.overrideReason?.trim())) {
+					const largest = [...input.changes].sort((a, b) => (b.after?.bytes ?? 0) - (a.after?.bytes ?? 0)).slice(0, 5);
+					throw new Error(`integration refused: ${input.changes.length} entries, ${total} bytes; largest: ${largest.map(c => `${c.path} (${c.after?.bytes ?? 0})`).join(", ")}; supply overrideLargeCandidate and a reason`);
+				}
+			}
+			validate();
 			if (previous) {
 				const manifest = parseManifest(previous.manifest_json);
 				const changes = manifest.entries.map((entry) => ({ path: entry.path, after: entry.after?.content ?? null, mode: entry.after?.mode ?? 0o644 }));
@@ -333,15 +354,18 @@ export class RuntimeIntegration {
 
 	private stagingDirectory(workspace: string): void {
 		mkdirSync(this.stagingRoot, { recursive: true, mode: 0o700 });
-		const stat = lstatSync(this.stagingRoot);
-		if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("integration staging requires a private real directory");
-		if (stat.dev !== lstatSync(workspace).dev) throw new Error("integration staging and workspace must be on the same filesystem");
+		this.checkStagingDirectory(workspace);
 		syncDirectory(dirname(this.stagingRoot));
 	}
 
-	private temporary(manifest: Manifest, entry: Entry): string {
-		this.stagingDirectory(manifest.workspace);
-		return join(this.stagingRoot, runtimeDigest({ manifest, path: entry.path }));
+	private checkStagingDirectory(workspace: string): void {
+		const stat = lstatSync(this.stagingRoot);
+		if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error("integration staging requires a private real directory");
+		if (stat.dev !== lstatSync(workspace).dev) throw new Error("integration staging and workspace must be on the same filesystem");
+	}
+
+	private temporary(id: string, entry: Entry): string {
+		return join(this.stagingRoot, runtimeDigest({ manifestId: id, path: entry.path }));
 	}
 
 	private clearTemporary(path: string): void {
@@ -353,71 +377,92 @@ export class RuntimeIntegration {
 		} catch (error) { if (!absent(error)) throw error; }
 	}
 
-	private replace(manifest: Manifest, entry: Entry, image: FileImage | null): void {
+	private replace(id: string, manifest: Manifest, entry: Entry, image: FileImage | null): void {
 		const target = this.target(manifest.workspace, entry.path, manifest.gitChecks, image !== null);
 		if (target === null) throw new Error(`integration parent of ${entry.path} is missing`);
 		if (image === null) { unlinkSync(target); syncDirectory(dirname(target)); return; }
-		this.content.verify(image.content);
-		const contentFd = openSync(this.content.path(image.content), constants.O_RDONLY | constants.O_NOFOLLOW);
-		let bytes: Buffer;
-		try { bytes = readBounded(contentFd); } finally { closeSync(contentFd); }
-		if (bytes.length !== image.content.bytes || createHash("sha256").update(bytes).digest("hex") !== image.content.sha256) throw new Error("integration content digest mismatch");
-		const temporary = this.temporary(manifest, entry);
+		this.checkStagingDirectory(manifest.workspace);
+		const bytes = this.content.read(image.content, 16 * 1024 * 1024);
+		const temporary = this.temporary(id, entry);
 		this.clearTemporary(temporary);
 		const fd = openSync(temporary, "wx", 0o600);
 		try {
 			try { writeFileSync(fd, bytes); fchmodSync(fd, image.mode); fsyncSync(fd); }
 			finally { closeSync(fd); }
-			syncDirectory(this.stagingRoot);
 			renameSync(temporary, target); syncDirectory(dirname(target)); syncDirectory(this.stagingRoot);
 		}
 		finally { try { unlinkSync(temporary); } catch (error) { if (!absent(error)) throw error; } }
 	}
 
 	/** One filesystem step per transaction; content states remain authoritative after a lost acknowledgement. */
-	advance(id: string, direction: Direction): IntegrationStatus {
+	advance(id: string, direction: Direction, onProgress?: (step: IntegrationProgress) => void, validate?: () => void): IntegrationStatus {
 		// Commit the recovery direction before any filesystem mutation; a rollback intent must
 		// survive a crash even when the next file's acknowledgement never reaches SQLite.
 		this.transaction(() => {
 			const row = this.row(id);
 			if (row.state === "applied" || row.state === "rolled_back") return;
 			if (row.direction === "rollback" && direction === "apply") throw new Error("integration is rolling back");
-			this.db.query("UPDATE runtime_integrations SET direction=? WHERE id=?").run(direction, id);
+			if (row.direction !== direction) this.db.query("UPDATE runtime_integrations SET direction=? WHERE id=?").run(direction, id);
 		});
-		const result = this.transaction((): { status: IntegrationStatus; failure?: Error } => {
+		const result = this.transaction((): { status: IntegrationStatus; failure?: Error; step?: IntegrationProgress } => {
 			const row = this.row(id);
 			if (row.state === "applied" || row.state === "rolled_back") {
 				if ((row.state === "applied") !== (direction === "apply")) throw new Error(`integration is ${row.state}`);
 				return { status: this.get(id) };
 			}
 			if (row.direction === "rollback" && direction === "apply") throw new Error("integration is rolling back");
-			const manifest = parseManifest(row.manifest_json);
+			validate?.();
+			const manifest = this.manifests.get(id)!;
 			try {
 				if (realpathSync(manifest.workspace) !== manifest.workspace || (manifest.gitChecks && git(manifest.workspace, "HEAD") !== manifest.baseRevision)) throw new Error("integration base revision changed");
-				const observed = manifest.entries.map((entry) => {
-					this.clearTemporary(this.temporary(manifest, entry));
-					for (const image of [entry.before, entry.after]) if (image) this.content.verify(image.content);
-					const image = this.snapshot(manifest.workspace, entry.path, false, manifest.gitChecks);
-					if (canonical(image) !== canonical(entry.before) && canonical(image) !== canonical(entry.after)) throw new Error(`integration conflict at ${entry.path}`);
-					return image;
-				});
-				const index = manifest.entries.findIndex((entry, index) => canonical(observed[index]) !== canonical(direction === "apply" ? entry.after : entry.before));
-				if (index === -1) {
+				const pending = (entry: Entry) => {
+					const image = canonical(this.snapshot(manifest.workspace, entry.path, false, manifest.gitChecks));
+					if (image !== canonical(entry.before) && image !== canonical(entry.after)) throw new Error(`integration conflict at ${entry.path}`);
+					return image !== canonical(direction === "apply" ? entry.after : entry.before);
+				};
+				if (!this.cursor || this.cursor.id !== id || this.cursor.direction !== direction || row.state !== "applying") {
+					this.stagingDirectory(manifest.workspace);
+					const names = new Set(readdirSync(this.stagingRoot));
+					const prefix = names.size ? createHash("sha256").update(`{"manifest":${canonical(manifest)},"path":`) : null;
+					const verified = new Set<string>();
+					for (const entry of manifest.entries) {
+						if (prefix) {
+							const legacy = prefix.copy().update(`${JSON.stringify(entry.path)}}`).digest("hex");
+							if (names.has(legacy)) this.clearTemporary(join(this.stagingRoot, legacy));
+							this.clearTemporary(this.temporary(id, entry));
+						}
+						for (const image of [entry.before, entry.after]) if (image) {
+							const key = canonical(image.content);
+							if (!verified.has(key)) { this.content.verify(image.content); verified.add(key); }
+						}
+						pending(entry);
+					}
+					this.cursor = { id, direction, next: 0 };
+				}
+				let index = this.cursor.next;
+				while (index < manifest.entries.length && !pending(manifest.entries[index])) index++;
+				if (index === manifest.entries.length) {
+					for (const entry of manifest.entries) if (pending(entry)) throw new Error(`integration conflict at ${entry.path}`);
 					if (direction === "rollback") this.removeNewDirectories(manifest);
 					this.db.query("UPDATE runtime_integrations SET state=?,direction=?,error=NULL WHERE id=?").run(direction === "apply" ? "applied" : "rolled_back", direction, id);
 				} else {
 					const entry = manifest.entries[index];
-					this.replace(manifest, entry, direction === "apply" ? entry.after : entry.before);
-					this.db.query("UPDATE runtime_integrations SET state='applying',direction=?,error=NULL WHERE id=?").run(direction, id);
+					this.replace(id, manifest, entry, direction === "apply" ? entry.after : entry.before);
+					if (row.state !== "applying") this.db.query("UPDATE runtime_integrations SET state='applying',direction=?,error=NULL WHERE id=?").run(direction, id);
+					this.cursor.next = index + 1;
+					return { status: this.get(id), step: { index: index + 1, total: manifest.entries.length, path: entry.path } };
 				}
+				this.cursor = undefined;
 				return { status: this.get(id) };
 			} catch (error) {
+				this.cursor = undefined;
 				const failure = error instanceof Error ? error : new Error(String(error));
 				this.db.query("UPDATE runtime_integrations SET state='needs_reconciliation',direction=?,error=? WHERE id=?").run(direction, failure.message, id);
 				return { status: this.get(id), failure };
 			}
 		});
 		if (result.failure) throw result.failure;
+		if (result.step) onProgress?.(result.step);
 		return result.status;
 	}
 
@@ -430,16 +475,19 @@ export class RuntimeIntegration {
 	 * in `needs_reconciliation` and is never overwritten. Integrations with Git checks are reverted with Git.
 	 */
 	undo(id: string): IntegrationStatus {
+		this.beginUndo(id);
+		return this.finish(id, "rollback");
+	}
+	beginUndo(id: string): void {
 		this.transaction(() => {
 			const row = this.row(id);
-			const manifest = parseManifest(row.manifest_json);
+			const manifest = this.manifests.get(id)!;
 			if (manifest.gitChecks) throw new Error("undo applies only to placements without Git checks; revert this integration with Git");
 			if (row.state !== "applied") return;
 			const active = this.db.query("SELECT id FROM runtime_integrations WHERE workspace=? AND id<>? AND state IN ('prepared','applying','needs_reconciliation')").get(manifest.workspace, id);
 			if (active) throw new Error("undo refused: the workspace has an active integration");
-			this.db.query("UPDATE runtime_integrations SET state='applying',direction='rollback',error=NULL WHERE id=?").run(id);
+			this.db.query("UPDATE runtime_integrations SET state='applying',direction='rollback',undo_started=1,error=NULL WHERE id=?").run(id);
 		});
-		return this.finish(id, "rollback");
 	}
 	private finish(id: string, direction: Direction): IntegrationStatus {
 		let result = this.advance(id, direction);

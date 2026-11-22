@@ -298,6 +298,8 @@ Start Pi inside the Herdr workspace (Ghostty or any terminal Herdr manages). The
 
 Each worker owns one tab named after the story and role. The tab shows the worker's stream rendered as content, never the JSON-RPC envelope: assistant text as it streams, thoughts dimmed when the role's tier enables thinking, one line per tool call, and short rules at turn boundaries. `/graph focus` brings a tab forward; numbers in the agent list and the follow view open details instead.
 
+Home-workspace integration excludes ignored files at capture, reports each file placement, and requires an explicit override for more than 200 changes or 25 MB of staged content. The supervisor stays responsive during preparation and recovery. Cancelling a run stops further file placements; roll back to restore files already placed. See the [`integrate` options](extensions/pi-agent-wave/README.md).
+
 ## Worker execution and cleanup
 
 Worker execution is **ACPX-only** through one transport-neutral lifecycle:

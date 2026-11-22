@@ -11,7 +11,7 @@ import { createAcpxAttemptIdentity } from "./lib/acpx-types.ts";
 import { selectAcpAgent } from "./lib/acpx-select.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import { parseRunInputs } from "./lib/run-inputs.ts";
-import { RuntimeIntegration, type IntegrationStatus } from "./lib/runtime-integration.ts";
+import { RuntimeIntegration, type IntegrationProgress, type IntegrationStatus } from "./lib/runtime-integration.ts";
 import { parseRuntimeStagingManifest } from "./lib/runtime-staging.ts";
 import { canonical, candidateContents, type RuntimeLedger, type OperatorRuntimeLedger, parseRuntimeCandidate, parseRuntimeDecisionKind, parseRuntimeObservation, parseRuntimeOutcome, runtimeDigest, type ResultContract, type RuntimeAttempt, type RuntimeAttemptInput, type RuntimeContent, type RuntimeDecision, type RuntimeDecisionInput, type RuntimeRetryInput, type RuntimeRetryResult, type RuntimeSettlementInput } from "./lib/runtime-results.ts";
 import type {
@@ -1422,7 +1422,7 @@ export class GraphStore {
 			this.db.query("UPDATE runtime_attempts SET outcome_json=?,candidate_json=?,candidate_id=?,observation_json=?,finished_at=? WHERE attempt_key=? AND outcome_json IS NULL")
 				.run(canonical(outcome), candidate ? canonical(candidate) : null, candidateId, observation ? canonical(observation) : null, this.iso(), input.attemptKey);
 			if (current.agentId) this.db.query("UPDATE agents SET status=?,last_activity_at=? WHERE id=?").run(outcome.kind === "exited" ? "completed" : outcome.kind === "cancelled" ? "cancelled" : "failed", this.iso(), current.agentId);
-			this.event({ runId: current.runId, operationId: current.operationId, type: "runtime_attempt_settled", payload: { attemptKey: input.attemptKey, processState: outcome.kind, candidateId } });
+			this.event({ runId: current.runId, operationId: current.operationId, type: "runtime_attempt_settled", payload: { attemptKey: input.attemptKey, processState: outcome.kind, candidateId, ...(input.droppedPaths?.length ? { droppedPaths: input.droppedPaths } : {}) } });
 			return this.runtimeAttempt(input.attemptKey);
 		});
 	}
@@ -1457,7 +1457,7 @@ export class GraphStore {
 	}
 
 	/** Only a rollback may touch a superseded attempt's integration: the historical recovery route after replacement. */
-	private prepareIntegration(attemptKey: string, manifestReference: RuntimeContent, historicalRollback: boolean, overrideReason?: string): IntegrationStatus {
+	private prepareIntegration(attemptKey: string, manifestReference: RuntimeContent, historicalRollback: boolean, overrideReason?: string, largeReason?: string): IntegrationStatus {
 		const attempt = this.runtimeAttempt(attemptKey);
 		if (attempt.supersededAt && !historicalRollback) throw new Error("integration refused: the attempt was superseded by a replacement; only rollback remains available");
 		const override = overrideReason?.trim();
@@ -1482,12 +1482,11 @@ export class GraphStore {
 		const manifest = parseRuntimeStagingManifest(JSON.parse(content.read(manifestReference, 16 * 1024 * 1024).toString("utf8")));
 		if (manifest.attemptKey !== attemptKey || manifest.baseRevision !== candidate.baseRevision || manifest.readOnly) throw new Error("staging manifest conflicts with candidate identity");
 		if (realpathSync(manifest.workspace) !== manifest.workspace) throw new Error("staging workspace identity changed");
-		for (const change of manifest.changes) {
-			if (change.after && !candidate.artifacts.some((item) => canonical(item) === canonical(change.after))) throw new Error("candidate does not retain staged file");
-		}
 		const journal = new RuntimeIntegration(this.dbPath);
 		try {
-			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding" && this.getRun(attempt.runId).workspace_root === null, overrideReason: override ?? null }, () => {
+			return journal.prepare({ workspace: manifest.workspace, baseRevision: manifest.baseRevision, candidateId: attempt.candidateId, ownedPaths: manifest.ownedPaths, changes: manifest.changes, gitChecks: candidate.kind === "coding" && this.getRun(attempt.runId).workspace_root === null, overrideReason: override ?? largeReason ?? null, overrideLargeCandidate: Boolean(largeReason?.trim()) }, () => {
+				const retained = new Set(candidate.artifacts.map(item => canonical(item)));
+				for (const change of manifest.changes) if (change.after && !retained.has(canonical(change.after))) throw new Error("candidate does not retain staged file");
 				const run = this.getRun(attempt.runId);
 				const operation = this.getOperation(attempt.operationId);
 				if (run.status !== "active" || operation.status === "cancelled") throw new Error(`runtime integration unavailable: ${run.status === "active" ? operation.status : run.status}`);
@@ -1501,12 +1500,10 @@ export class GraphStore {
 	}
 
 	/**
-	 * Undoes a placement made without Git checks after it was applied, whatever the graph or the run has
-	 * done since: undoing is the operator's decision, and its point is to be available after the run
-	 * moved on. Returns null when the candidate has no applied placement, so the caller falls back to the
-	 * ordinary rollback. Changes no graph state and records `integration_undone`.
+	 * Recovery of an existing placement does not depend on a live operation. Only a fully applied
+	 * non-Git placement may start an undo; ordinary partial rollback must not publish an undo event.
 	 */
-	undoRuntimeIntegration(attemptKey: string, manifestReference: RuntimeContent): IntegrationStatus | null {
+	private existingRollback(attemptKey: string, manifestReference: RuntimeContent): { id: string; undo: boolean } | null {
 		const attempt = this.runtimeAttempt(attemptKey);
 		const candidate = attempt.candidate;
 		if (!candidate || (candidate.kind !== "coding" && candidate.kind !== "operational") || !attempt.candidateId) return null;
@@ -1516,24 +1513,52 @@ export class GraphStore {
 		const journal = new RuntimeIntegration(this.dbPath);
 		try {
 			const found = journal.forCandidate(staging.workspace, attempt.candidateId);
-			if (!found || found.gitChecks || found.state !== "applied") return null;
-			for (const reference of candidateContents(candidate)) content.verify(reference);
-			const status = journal.undo(found.id);
-			this.transaction(() => this.event({ runId: attempt.runId, type: "integration_undone", operationId: attempt.operationId, payload: { integrationId: found.id, attemptKey, state: status.state } }));
-			return status;
+			if (!found || (found.gitChecks && found.state === "applied")) return null;
+			if (staging.attemptKey !== attemptKey || staging.baseRevision !== candidate.baseRevision || staging.readOnly) throw new Error("staging manifest conflicts with candidate identity");
+			if (attempt.observation?.manifest) {
+				if (canonical(attempt.observation.manifest) !== canonical(manifestReference)) throw new Error("staging manifest conflicts with candidate identity");
+			} else {
+				journal.prepare({ workspace: staging.workspace, baseRevision: staging.baseRevision, candidateId: attempt.candidateId, ownedPaths: staging.ownedPaths, changes: staging.changes, gitChecks: found.gitChecks });
+			}
+			if (found.state === "applied") {
+				for (const reference of candidateContents(candidate)) content.verify(reference);
+				journal.beginUndo(found.id);
+			}
+			return { id: found.id, undo: found.undoStarted || found.state === "applied" };
 		} finally { journal.close(); }
 	}
 
 	/** Applies a prepared candidate integration to completion, or rolls it back; each file step is journaled. */
 	applyRuntimeIntegration(attemptKey: string, manifest: RuntimeContent, direction: "apply" | "rollback" = "apply", overrideReason?: string): IntegrationStatus {
-		if (direction === "rollback") {
-			const undone = this.undoRuntimeIntegration(attemptKey, manifest);
-			if (undone) return undone;
-		}
-		const prepared = this.prepareIntegration(attemptKey, manifest, direction === "rollback", overrideReason);
+		const steps = this.runtimeIntegrationSteps(attemptKey, manifest, direction, overrideReason);
+		let result = steps.next();
+		while (!result.done) result = steps.next();
+		return result.value;
+	}
+
+	*runtimeIntegrationSteps(attemptKey: string, manifest: RuntimeContent, direction: "apply" | "rollback", siblingReason?: string, largeReason?: string): Generator<IntegrationProgress, IntegrationStatus> {
+		const recovery = direction === "rollback" ? this.existingRollback(attemptKey, manifest) : null;
+		const id = recovery?.id ?? this.prepareIntegration(attemptKey, manifest, direction === "rollback", siblingReason, largeReason).id;
+		const { runId, operationId } = this.runtimeAttempt(attemptKey);
+		const validate = direction === "rollback" ? undefined : () => {
+			const { status } = this.getRun(runId);
+			if (status !== "active" || this.getOperation(operationId).status === "cancelled") throw new Error(`runtime integration unavailable: ${status === "active" ? "cancelled" : status}`);
+		};
 		const journal = new RuntimeIntegration(this.dbPath);
-		try { return direction === "apply" ? journal.apply(prepared.id) : journal.rollback(prepared.id); }
-		finally { journal.close(); }
+		try {
+			for (;;) {
+				let step: IntegrationProgress | undefined;
+				const status = journal.advance(id, direction, value => { step = value; }, validate);
+				if (step) yield step;
+				if (status.state === "applying") continue;
+				if (recovery?.undo) this.transaction(() => {
+					if (!this.db.query("SELECT 1 FROM events WHERE run_id=? AND operation_id=? AND type='integration_undone' AND json_extract(payload_json,'$.integrationId')=?").get(runId, operationId, id)) {
+						this.event({ runId, type: "integration_undone", operationId, payload: { integrationId: id, attemptKey, state: status.state } });
+					}
+				});
+				return status;
+			}
+		} finally { journal.close(); }
 	}
 
 	/** An integration that has touched or reserved the workspace for this candidate and has not been rolled back. */

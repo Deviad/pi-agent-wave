@@ -42,6 +42,7 @@ export interface RuntimeSettlementEvidence {
 	readonly observation: RuntimeObservation;
 	readonly answer: RuntimeContent | null;
 	readonly stagedFiles: number;
+	readonly droppedPaths?: readonly string[];
 	readonly diagnostics: readonly string[];
 }
 
@@ -106,12 +107,13 @@ export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlem
 	const answer = answerBytes.length ? content.retain(answerBytes) : null;
 	let manifest: RuntimeContent | null = null;
 	let files: readonly RuntimeContent[] = [];
+	let droppedPaths: readonly string[] = [];
 	let changes: readonly { readonly path: string }[] = [];
 	let checkpoint: RuntimeCheckpoint | null = null;
 	if (config.kind === "coding" || config.kind === "operational") {
 		if (config.snapshotPath === null) throw new Error(`${config.kind} settlement requires an AgentFS snapshot`);
 		const staged = stageRuntimeAgentFs({ agentFsExecutable: config.agentFsExecutable, snapshotPath: config.snapshotPath, baseDir: config.baseDir, baseRevision: config.baseRevision, attemptKey: config.attemptKey, ownedPaths: config.ownedPaths, readOnly: false, ownWholeBase: config.ownWholeBase, excludedRoots: config.ownWholeBase ? [dirname(dbPath)] : [] }, content);
-		manifest = staged.manifest; files = staged.files; changes = staged.changes;
+		manifest = staged.manifest; files = staged.files; changes = staged.changes; droppedPaths = staged.droppedPaths;
 		if (config.kind === "operational" && config.checkpointPath) checkpoint = observeCheckpoint(content, staged.changes, config.baseDir, config.checkpointPath);
 	}
 	// The staging manifest exists for every owned-write attempt, so it is never evidence of work on its own: a worker
@@ -131,7 +133,7 @@ export function settleRuntimeWorker(config: RuntimeSettleConfig): RuntimeSettlem
 		// bytes stay in the content store either way, and an empty attempt is diagnosed from its retained capture stream.
 		manifest: candidate ? manifest : null,
 	});
-	const evidence: RuntimeSettlementEvidence = { schemaVersion: 1, resultContract: "runtime-v1", attemptKey: config.attemptKey, outcome, candidate, observation, answer, stagedFiles: files.length, diagnostics };
+	const evidence: RuntimeSettlementEvidence = { schemaVersion: 1, resultContract: "runtime-v1", attemptKey: config.attemptKey, outcome, candidate, observation, answer, stagedFiles: files.length, diagnostics, ...(droppedPaths.length ? { droppedPaths } : {}) };
 	publishEvidence(config.evidencePath, evidence);
 	return evidence;
 }
