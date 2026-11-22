@@ -25,6 +25,44 @@ function fixture() {
 	return { root, workspace, dbPath, content, journal };
 }
 
+test("large apply completes within thirty seconds against the real journal", (t) => {
+	const { workspace, content, journal, dbPath } = fixture();
+	try {
+		const after = content.retain(Buffer.from("candidate"));
+		const changes = Array.from({ length: 1000 }, (_, i) => ({ path: `batch/f${i}`, after, mode: 0o644 }));
+		const prepared = journal.prepare({ workspace, baseRevision: "home", candidateId: "batch", ownedPaths: ["batch"], changes, gitChecks: false, overrideLargeCandidate: true, overrideReason: "performance fixture" });
+		const child = spawnSync(process.execPath, ["--experimental-strip-types", join(import.meta.dirname, "support/measure-large-integration.mjs"), dbPath, prepared.id], { encoding: "utf8", timeout: 35_000 });
+		assert.ifError(child.error);
+		assert.equal(child.status, 0, child.stderr);
+		const { state, elapsed, contentBytes, manifestDigests } = JSON.parse(child.stdout);
+		assert.equal(state, "applied");
+		assert.equal(manifestDigests, 1);
+		const placedBytes = changes.length * after.bytes;
+		assert.ok(contentBytes >= placedBytes && contentBytes <= 2 * placedBytes, `read ${contentBytes} bytes for ${placedBytes} placed`);
+		t.diagnostic(`1,000-file apply: ${elapsed.toFixed(0)} ms, ${manifestDigests} manifest digest, ${contentBytes} content bytes`);
+		assert.ok(elapsed < 30_000, `apply took ${elapsed}ms`);
+		assert.equal(readFileSync(join(workspace, "batch/f999"), "utf8"), "candidate");
+	} finally { journal.close(); }
+});
+
+test("both size limits refuse before validation and report the five largest paths", () => {
+	const { workspace, content, journal } = fixture();
+	try {
+		const blob = content.retain(Buffer.from("small"));
+		for (const sizes of [Array.from({ length: 201 }, (_, i) => i), Array(6).fill(5_000_000)]) {
+			const changes = sizes.map((bytes, i) => ({ path: `batch/${i}`, mode: 0o644, after: { ...blob, bytes } }));
+			const input = { workspace, candidateId: "oversize", baseRevision: "home", changes, ownedPaths: ["batch"], gitChecks: false, overrideReason: "sibling override only" };
+			let validated = false;
+			assert.throws(() => journal.prepare(input, () => { validated = true; }), (error: Error) => {
+				assert.ok(error.message.includes(`${changes.length} entries, ${sizes.reduce((a,b) => a+b,0)} bytes`));
+				for (const change of [...changes].sort((a,b) => b.after.bytes - a.after.bytes).slice(0,5)) assert.ok(error.message.includes(`${change.path} (${change.after.bytes})`));
+				return true;
+			});
+			assert.equal(validated, false);
+		}
+	} finally { journal.close(); }
+});
+
 test("prepare retains preimages without writes and reserves the workspace across reopen", () => {
 	const { workspace, content, journal, dbPath } = fixture();
 	const changes = [{ path: "a.txt", after: content.retain(Buffer.from("after-a")), mode: 0o644 }];

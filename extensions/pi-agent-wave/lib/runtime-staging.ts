@@ -60,8 +60,24 @@ function snapshotDigest(path: string): string {
 	} finally { closeSync(fd); }
 }
 
+function ignoredHomePaths(workspace: string, paths: readonly string[]): Set<string> {
+	if (!paths.length) return new Set();
+	const options = { cwd: workspace, encoding: "utf8" as const, timeout: 10_000, env: { ...process.env, LC_ALL: "C" } };
+	const repo = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], options);
+	if (repo.error) throw repo.error;
+	if (repo.status === 128 && repo.stderr.includes("not a git repository") || repo.status === 0 && repo.stdout.trim() === "false") {
+		const dirs = new Set([".venv", ".local", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"]);
+		return new Set(paths.filter(path => path.endsWith(".pyc") || path.split("/").slice(0, -1).some(part => dirs.has(part))));
+	}
+	if (repo.status !== 0) throw new Error(`cannot determine workspace ignore rules: ${repo.stderr}`);
+	const input = paths.join("\0") + "\0";
+	const result = spawnSync("git", ["check-ignore", "--stdin", "-z"], { ...options, input, maxBuffer: Math.max(1024 * 1024, Buffer.byteLength(input)) });
+	if (result.error || result.status !== 0 && result.status !== 1) throw new Error(`cannot check workspace ignore rules: ${result.error?.message ?? result.stderr}`);
+	return new Set(result.stdout.split("\0").filter(Boolean));
+}
+
 /** Reads an audited, closed AgentFS snapshot into private content storage; never exports host files. */
-export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: RuntimeContentStore): { manifest: RuntimeContent; files: readonly RuntimeContent[]; changes: readonly { readonly path: string; readonly after: RuntimeContent | null; readonly mode: number }[] } {
+export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: RuntimeContentStore): { manifest: RuntimeContent; files: readonly RuntimeContent[]; droppedPaths: readonly string[]; changes: readonly { readonly path: string; readonly after: RuntimeContent | null; readonly mode: number }[] } {
 	if (!input.attemptKey.trim() || !input.baseRevision.trim()) throw new Error("staging requires attempt and base identity");
 	const workspace = realpathSync(input.baseDir);
 	const before = snapshotDigest(input.snapshotPath);
@@ -83,7 +99,9 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 		const files: RuntimeContent[] = [];
 		// Container directories carry no content of their own: an owned file's parents are created when it
 		// is applied, so staging the container would only ask integration for a change Git does not model.
-		const changes = (input.readOnly ? [] : audit.owned).filter((change) => change.kind !== "directory" && staged(change.path)).map((change) => {
+		const eligible = (input.readOnly ? [] : audit.owned).filter((change) => change.kind !== "directory" && staged(change.path));
+		const dropped = ownWholeBase ? ignoredHomePaths(workspace, eligible.map(change => change.path)) : new Set<string>();
+		const changes = eligible.filter(change => !dropped.has(change.path)).map((change) => {
 			let after: RuntimeContent | null = null;
 			if (change.kind === "file") {
 				const result = spawnSync(input.agentFsExecutable, ["fs", workingSnapshot, "cat", `/${change.path}`], { shell: false, encoding: null, maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
@@ -98,6 +116,6 @@ export function stageRuntimeAgentFs(input: RuntimeStagingInput, content: Runtime
 			// The whole base has no relative spelling, so a home run's manifest owns exactly the paths it staged.
 			ownedPaths: ownWholeBase ? changes.map((change) => change.path) : ownedPaths.map((path) => relative(workspace, path)), changes, readOnly: input.readOnly,
 		})));
-		return { manifest, files, changes };
+		return { manifest, files, changes, droppedPaths: [...dropped].sort() };
 	} finally { rmSync(scratch, { recursive: true, force: true }); }
 }

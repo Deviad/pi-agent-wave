@@ -153,9 +153,12 @@ describe("staging a home workspace", () => {
 		const base = join(root, "home");
 		mkdirSync(join(base, "repo", ".git"), { recursive: true });
 		mkdirSync(join(base, "graph"), { recursive: true });
+		execFileSync("git", ["init", "-q", base]);
+		writeFileSync(join(base, ".gitignore"), "ignored-output/\n");
 		writeFileSync(join(base, "existing.txt"), "before");
 		const dbPath = mountedWorker(root, base, "home-stage", [
 			"printf top > top.txt",
+			"mkdir -p ignored-output && printf cache > ignored-output/data",
 			"printf edited > existing.txt",
 			"mkdir -p .config/newapp && printf 'key = 1' > .config/newapp/config.toml",
 			"printf ref > repo/.git/ORIG_HEAD",
@@ -173,6 +176,7 @@ describe("staging a home workspace", () => {
 		assert.deepEqual(paths, [".config/newapp/config.toml", "existing.txt", "top.txt"]);
 		const manifest = parseRuntimeStagingManifest(JSON.parse(content.read(staged.manifest, 1024 * 1024).toString("utf8")));
 		assert.deepEqual([...manifest.ownedPaths].sort(), paths);
+		assert.deepEqual(staged.droppedPaths, ["ignored-output/data"]);
 		assert.equal(readFileSync(join(base, "existing.txt"), "utf8"), "before", "staging never writes the host");
 	});
 });
@@ -240,7 +244,7 @@ function allFiles(dir: string, prefix = ""): string[] {
 }
 
 describe("end to end: a home run places changes and undoes them after the run ended", () => {
-	test("settle with whole-base ownership, integrate without Git checks, end the run, then undo", () => withHome((home) => {
+	for (const scenario of ["cancel after one file", "resume interrupted undo"]) test(scenario, () => withHome((home) => {
 		const root = scratch("home-e2e-");
 		writeFileSync(join(home, "existing.txt"), "before");
 		const graphHome = join(root, "graph");
@@ -252,7 +256,7 @@ describe("end to end: a home run places changes and undoes them after the run en
 			assert.ok(renderStatus(store, run.runId).split("\n")[0]!.endsWith(` | workspace=home:${home}`), "status names the home root");
 			const identity = createHeadlessAcpxAttemptIdentity({ runId: run.runId, operationId: operation.id, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: MODEL, agent: "codex" });
 			store.beginRuntimeAttempt({ identity, sessionId: "dg-session", requestId: null, policyDigest: store.policy(run.runId).digest });
-			const delta = mountedWorker(root, home, "home-e2e", "printf edited > existing.txt\nmkdir -p .config/newapp && printf 'key = 1' > .config/newapp/config.toml");
+			const delta = mountedWorker(root, home, "home-e2e", "printf edited > existing.txt\nmkdir -p .local && printf cache > .local/cache\nmkdir -p .config/newapp && printf 'key = 1' > .config/newapp/config.toml");
 			const snapshotPath = join(root, "snapshot.db");
 			snapshotAgentFsDb(delta, snapshotPath);
 			const attemptDir = join(root, "attempt");
@@ -263,9 +267,29 @@ describe("end to end: a home run places changes and undoes them after the run en
 				evidencePath: join(attemptDir, "runtime-settlement.json"), dbPath: store.dbPath, ownWholeBase: true,
 			}));
 			assert.equal(evidence.candidate?.kind, "coding");
-			store.settleRuntimeAttempt({ attemptKey: identity.attemptKey, outcome: evidence.outcome, candidate: evidence.candidate ?? undefined, observation: evidence.observation });
+			store.settleRuntimeAttempt({ attemptKey: identity.attemptKey, outcome: evidence.outcome, candidate: evidence.candidate ?? undefined, observation: evidence.observation, droppedPaths: evidence.droppedPaths });
+			const settled = store.events(run.runId).find(event => event.type === "runtime_attempt_settled");
+			assert.deepEqual(JSON.parse(settled!.payload_json).droppedPaths, [".local/cache"]);
 			const manifest = evidence.observation.manifest!;
 
+			const steps = store.runtimeIntegrationSteps(identity.attemptKey, manifest, "apply");
+			if (scenario === "cancel after one file") {
+				const first = steps.next();
+				assert.equal(first.done, false);
+				store.cancelRunningOperations(run.runId, "stop before the second file");
+				assert.throws(() => steps.next(), /integration unavailable: cancelled/);
+				assert.equal(readFileSync(join(home, "existing.txt"), "utf8"), first.value.path === "existing.txt" ? "edited" : "before");
+				assert.equal(existsSync(join(home, ".config/newapp/config.toml")), first.value.path === ".config/newapp/config.toml");
+				assert.equal(store.applyRuntimeIntegration(identity.attemptKey, manifest, "rollback").state, "rolled_back");
+				assert.equal(readFileSync(join(home, "existing.txt"), "utf8"), "before");
+				assert.equal(existsSync(join(home, ".config/newapp/config.toml")), false);
+				assert.equal(store.events(run.runId).some(event => event.type === "integration_undone"), false);
+				return;
+			}
+			const progress = [...steps];
+			assert.deepEqual(progress.map(step => step.index), [1, 2]);
+			assert.ok(progress.every(step => step.total === 2));
+			assert.deepEqual(progress.map(step => step.path).sort(), [".config/newapp/config.toml", "existing.txt"]);
 			assert.equal(store.applyRuntimeIntegration(identity.attemptKey, manifest, "apply").state, "applied");
 			assert.equal(readFileSync(join(home, "existing.txt"), "utf8"), "edited");
 			assert.equal(readFileSync(join(home, ".config/newapp/config.toml"), "utf8"), "key = 1");
@@ -273,11 +297,18 @@ describe("end to end: a home run places changes and undoes them after the run en
 
 			store.cancelRunningOperations(run.runId, "the operator ended the run");
 			assert.equal(store.getRun(run.runId).status, "cancelled");
-			const undone = store.applyRuntimeIntegration(identity.attemptKey, manifest, "rollback");
-			assert.equal(undone.state, "rolled_back");
+			const partial = store.runtimeIntegrationSteps(identity.attemptKey, manifest, "rollback");
+			assert.equal(partial.next().done, false);
+			assert.throws(() => partial.throw(new Error("interrupted")), /interrupted/);
+			const reopened = new GraphStore({ dbPath: store.dbPath });
+			try {
+				const undone = reopened.applyRuntimeIntegration(identity.attemptKey, manifest, "rollback");
+				assert.equal(undone.state, "rolled_back");
+				assert.deepEqual(reopened.applyRuntimeIntegration(identity.attemptKey, manifest, "rollback"), undone);
+			} finally { reopened.close(); }
 			assert.equal(readFileSync(join(home, "existing.txt"), "utf8"), "before");
 			assert.equal(existsSync(join(home, ".config/newapp/config.toml")), false);
-			assert.ok(store.events(run.runId, 200).some((event) => event.type === "integration_undone"), "the undo is recorded");
+			assert.equal(store.events(run.runId, 200).filter(event => event.type === "integration_undone").length, 1);
 		} finally { store.close(); }
 	}));
 });

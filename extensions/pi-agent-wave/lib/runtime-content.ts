@@ -18,11 +18,12 @@ export class RuntimeContentStore {
 		this.root = join(resolved, "runtime-content");
 	}
 
-	private directory(): void {
-		mkdirSync(this.root, { recursive: true, mode: 0o700 });
+	private directory(create = false): void {
+		if (create) mkdirSync(this.root, { recursive: true, mode: 0o700 });
 		const stat = lstatSync(this.root);
 		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("runtime content directory must be a regular directory");
 		if ((stat.mode & 0o077) !== 0) throw new Error("runtime content directory must be private");
+		if (!create) return;
 		const parentFd = openSync(dirname(this.root), constants.O_RDONLY);
 		try { fsyncSync(parentFd); } finally { closeSync(parentFd); }
 	}
@@ -106,7 +107,7 @@ export class RuntimeContentStore {
 	}
 
 	retain(bytes: Uint8Array): RuntimeContent {
-		this.directory();
+		this.directory(true);
 		const reference = { sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.byteLength };
 		const temporary = join(this.root, `.pending-${randomUUID()}`);
 		const fd = openSync(temporary, "wx", 0o600);

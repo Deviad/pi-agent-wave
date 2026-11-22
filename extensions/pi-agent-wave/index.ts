@@ -8,6 +8,7 @@ import { liveViewFor, refreshLiveView, streamRunDirectory } from "./lib/live-str
 import { paneLines } from "./lib/pane-read.ts";
 import { RuntimeContentStore } from "./lib/runtime-content.ts";
 import { RuntimeIntegration } from "./lib/runtime-integration.ts";
+import { executeIntegration } from "./lib/integration-executor.ts";
 import { prepareWorkspace, WorkspacePreparationError, type PreparationGuard } from "./lib/workspace-preparation.ts";
 import { captureRunInputs, INPUT_FILE_LIMIT } from "./lib/run-inputs.ts";
 import { taskPathIssues, TaskPreparationError } from "./lib/task-host-paths.ts";
@@ -223,6 +224,7 @@ const GraphParams = Type.Object({
 	decision: Type.Optional(Type.Union([Type.Literal("retry"), Type.Literal("defer"), Type.Literal("abort"), Type.Literal("escalate"), Type.Literal("accepted"), Type.Literal("rejected")])),
 	reason: Type.Optional(Type.String({ minLength: 1 })),
 	overrideRunningSiblings: Type.Optional(Type.Literal(true)),
+	overrideLargeCandidate: Type.Optional(Type.Literal(true)),
 	deferredUntil: Type.Optional(Type.String({ minLength: 1 })),
 	status: Type.Optional(Type.Literal("cancelled")),
 	verdict: Type.Optional(Type.String()),
@@ -651,6 +653,7 @@ function settlementFromEvidence(attemptKey: string, evidencePath: string): Runti
 	return {
 		attemptKey,
 		outcome: parseRuntimeOutcome(evidence.outcome),
+		...(Array.isArray(evidence.droppedPaths) && evidence.droppedPaths.every(path => typeof path === "string") ? { droppedPaths: evidence.droppedPaths } : {}),
 		candidate: evidence.candidate === null || evidence.candidate === undefined ? undefined : parseRuntimeCandidate(evidence.candidate),
 		observation: evidence.observation === null || evidence.observation === undefined ? undefined : parseRuntimeObservation(evidence.observation),
 	};
@@ -1178,7 +1181,8 @@ export default function delegateGraphExtension(pi: ExtensionAPI): void {
 					// The override is the operator's statement that a still-running sibling is dead; it is never inferred
 					// from the reason a decision carries, so it is only read when explicitly supplied.
 					const overrideReason = params.overrideRunningSiblings === undefined ? undefined : required(params.reason, "reason");
-					const status = graphStore.applyRuntimeIntegration(attempt.attemptKey, manifest, direction, overrideReason);
+					const largeReason = params.overrideLargeCandidate ? required(params.reason, "reason") : undefined;
+					const status = await executeIntegration(graphStore.dbPath, [attempt.attemptKey, manifest, direction, overrideReason, largeReason], _signal, step => progress("runtime_integration_step", { runId, operationId, direction, ...step }));
 					progress("runtime_integration", { runId, operationId, attemptKey: attempt.attemptKey, direction, state: status.state, overrideReason: status.overrideReason });
 					return textResult({ runId, operationId, attemptKey: attempt.attemptKey, integration: status });
 				}

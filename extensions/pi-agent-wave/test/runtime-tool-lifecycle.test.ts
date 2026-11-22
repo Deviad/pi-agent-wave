@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { Database } from "../sqlite.ts";
+import { realpathSync, readFileSync, existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GraphStore } from "../store.ts";
 import { createHeadlessAcpxAttemptIdentity } from "../lib/acpx-types.ts";
@@ -34,6 +36,49 @@ async function harness(dir: string, calls: string[][]): Promise<{ tool: Record<s
 	} as unknown as ExtensionAPI);
 	return { tool };
 }
+
+test("public integration services supervisor timers before the first placement and on recovery", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "integration-tool-")); dirs.push(dir);
+	const originalEnv = { ...process.env };
+	try {
+		const { tool } = await harness(dir, []);
+		const ctx = { cwd: dir };
+		const init = parsed(await tool.execute("init", { op: "init", story: "integration", graph: "build", task: "Implement", modelPolicy: { kind: "model", model: "openai-codex/gpt-5.6-sol", reason: "fixture" } }, undefined, undefined, ctx));
+		const runId = init.state.runId, operationId = init.next.operations[0].id;
+		const workspace = realpathSync(mkdtempSync(join(dir, "workspace-")));
+		const git = (...args: string[]) => execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8" }).trim();
+		git("init", "-q"); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "base");
+		const baseRevision = git("rev-parse", "HEAD");
+		const store = new GraphStore({ dbPath: join(dir, "graph.db") });
+		try {
+			const identity = createHeadlessAcpxAttemptIdentity({ runId, operationId, role: "thinker", modelAttempt: 0, transientAttempt: 0, selectedModel: "openai-codex/gpt-5.6-sol", agent: "codex" });
+			store.beginRuntimeAttempt({ identity, sessionId: identity.sessionName, requestId: null, policyDigest: store.policy(runId).digest });
+			const after = store.retainRuntimeContent(Buffer.from("placed"));
+			const paths = ["first", "second"];
+			const manifest = store.retainRuntimeContent(Buffer.from(JSON.stringify({ version: 1, attemptKey: identity.attemptKey, baseRevision, workspace, readOnly: false, snapshotDigest: "0".repeat(64), ownedPaths: paths, changes: paths.map(path => ({ path, after, mode: 0o644 })) })));
+			store.settleRuntimeAttempt({ attemptKey: identity.attemptKey, outcome: { kind: "exited", exitCode: 0 }, candidate: { kind: "coding", answer: null, artifacts: [manifest, after], baseRevision }, observation: { sessionId: identity.sessionName, requestId: null, sessionOrigin: null, captureStatus: "complete", manifest } });
+			for (const path of paths) {
+				const lock = new Database(store.dbPath);
+				const controller = new AbortController();
+				lock.exec("BEGIN IMMEDIATE");
+				const timer = setTimeout(() => lock.exec("COMMIT"), 100);
+				const progress: string[] = [];
+				try {
+					const result = parsed(await tool.execute("call", { op: "integrate", operationId, runId }, controller.signal, (update: unknown) => {
+						const event = parsed(update);
+						if (event.kind !== "runtime_integration_step") return;
+						progress.push(event.path);
+						if (path === "first") controller.abort(new Error("pause at checkpoint"));
+					}, ctx));
+					if (path === "first") { assert.match(String(result.error), /pause at checkpoint/); assert.equal(existsSync(join(workspace, "second")), false); }
+					else assert.equal(result.integration?.state, "applied", JSON.stringify(result));
+					assert.deepEqual(progress, [path]);
+					assert.equal(readFileSync(join(workspace, path), "utf8"), "placed");
+				} finally { clearTimeout(timer); lock.close(); }
+			}
+		} finally { store.close(); }
+	} finally { process.env = originalEnv; }
+});
 
 test("an enabled adapter lets a runtime-v1 run initialize, settle from durable evidence and advance only on an explicit decision", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "runtime-tool-")); dirs.push(dir);

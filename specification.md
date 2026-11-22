@@ -1114,6 +1114,14 @@ attempt `cancelled` (`store.ts:settleRuntimeAttempt`), and then calls
 
 ### 5.9 Integration journal
 
+The public integration tool executes preparation, recovery scans, and file checkpoints off the supervisor thread. After a checkpoint the executor waits for the supervisor before advancing; abort stops the executor and a retry reconciles from the journal. Content reads check the private directory but do not publish it again. A staging entry need not survive before rename; the staged file is synced before rename and both directories are synced afterwards, before the checkpoint is acknowledged.
+
+A committed run or operation cancellation prevents the next forward file checkpoint, including forward completion. The run-state check and placement share the journal write lock: cancellation does not undo a checkpoint that already won that lock. Rollback of an existing matching integration remains available after cancellation without creating a new integration. Starting undo of an applied non-Git placement durably distinguishes undo from ordinary partial rollback; retry after interruption or lost acknowledgement restores the remaining files and publishes `integration_undone` exactly once.
+
+Whole-workspace capture excludes Git-ignored files before retaining blobs (`git check-ignore --stdin -z`, tracked files preserved); outside a work tree it excludes `.venv`, `.local`, `node_modules`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache` directories and `*.pyc`. Settlement records dropped paths. New preparations above 200 changes or 25,000,000 after-image bytes require `overrideLargeCandidate: true` and a nonblank `reason`, independently of the sibling guard. Refusal reports count, bytes and the five largest paths. Existing rows remain recoverable without a new override.
+
+Staging names hash `{manifestId, path}`; recovery cleans matching legacy names in the private staging directory. Immutable manifest identity is verified once per journal instance. Before the first mutation or recovery, check all workspace images and retained content. Recheck the current path before replacing it, verify the bytes being placed, and verify all workspace images before declaring completion. A cursor is an in-memory optimization, not evidence of placement. The supervisor reports index, total and path after each file checkpoint and yields between checkpoints; cancellation leaves the journal resumable.
+
 `lib/runtime-integration.ts:RuntimeIntegration` stores an immutable manifest whose id is
 `runtimeDigest(manifest)` (sha256 of the canonical manifest) and journals state
 `prepared|applying|applied|rolled_back|needs_reconciliation` with the partial unique index and
@@ -1143,9 +1151,7 @@ manifest-immutability trigger described in §1.4. `prepare` takes a `validate` c
   the digest two identical candidates share), and writes the manifest.
 
 `advance` commits the recovery direction in one transaction before any filesystem mutation, then, in
-one transaction per step, verifies the base revision and every content reference, snapshots each
-path and requires it to equal either the preimage or the new image (otherwise
-`needs_reconciliation`), finds the first not-yet-applied (or not-yet-reverted) entry, replaces it
+one transaction per step, verifies the base revision. It checks all content references and paths on entry or recovery, then rechecks the next path before writing: it must equal either the preimage or the new image (otherwise `needs_reconciliation`). It replaces the next not-yet-applied (or not-yet-reverted) entry
 via a private staging file and `renameSync`, creating missing parents with `mkdirSync` first, and
 records `applying`. When every entry matches the target it records `applied` or `rolled_back`; before
 `rolled_back` it removes each `newDirectories` entry that is still empty, deepest first, keeps one that
